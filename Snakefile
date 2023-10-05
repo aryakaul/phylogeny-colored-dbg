@@ -38,24 +38,24 @@ samples = [os.path.basename(acc) for acc in sample_dirs]
 # RULE ALL
 # -----------------------------------------------------------------------------
 
-
-def enumerate_allsplits(samples, outputdir):
+def enumerate_all_phylogenycDBGs(samples, outputdir, kmersize):
     number_of_possible_splits = len(samples) * 2 - 3
-    parts = ["1", "2"]
     possiblesplits = list(range(0, number_of_possible_splits))
     return expand(
-        os.path.join(outputdir, "unitigs_in_split{SPLITNO}_part{PART}.txt"),
+        os.path.join(outputdir, f"split{{SPLITNO}}_k{kmersize}_bifrost.gfa.gz"),
         SPLITNO=possiblesplits,
-        PART=parts,
     )
 
 
 rule all:
     input:
-        #allsplits=enumerate_allsplits(samples, main_dir("trees/phylogenetic_splits")),
         cdbg=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_bifrost.gfa.gz"),
         binarymatrix = main_dir("unitig_sample_matrix/unitigs.colors.tsv"),
-        unitig_presence_absencesplits=enumerate_allsplits(samples, main_dir(f"present_unitigs_at_frequency_{FREQUENCYTHRESH}"))
+        phylogeny_cdbgs=enumerate_all_phylogenycDBGs(
+            samples,
+            main_dir(f"phylogenyColoredDeBruijnGraphs/gfas"),
+            KMERSIZE
+        )
 
 
 # RULE: Make colored, compacted de bruijn graph using Bifrost
@@ -89,11 +89,22 @@ rule run_bifrost:
 # -----------------------------------------------------------------------------
 
 
+def enumerate_allsplitsandparts(samples, outputdir):
+    number_of_possible_splits = len(samples) * 2 - 3
+    parts = ["1", "2"]
+    possiblesplits = list(range(0, number_of_possible_splits))
+    return expand(
+        os.path.join(outputdir, "unitigs_in_split{SPLITNO}_part{PART}.txt"),
+        SPLITNO=possiblesplits,
+        PART=parts,
+    )
+
+
 rule split_tree:
     input:
         tree=main_dir("trees/sample_phylogeny.nwk"),
     output:
-        enumerate_allsplits(samples, main_dir("trees/phylogenetic_splits")),
+        enumerate_allsplitsandparts(samples, main_dir("trees/phylogenetic_splits")),
     params:
         outputdir=main_dir("trees/phylogenetic_splits"),
     conda:
@@ -115,6 +126,7 @@ rule unitig_sample_matrix:
         cdbg=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_bifrost.gfa.gz"),
         colors=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_bifrost.color.bfg")
     output:
+        allunitigs_fasta = main_dir("unitig_sample_matrix/allunitigs.fasta"),
         binarymatrix = main_dir("unitig_sample_matrix/unitigs.colors.tsv")
     params:
         outputdir=main_dir("unitig_sample_matrix"),
@@ -125,7 +137,7 @@ rule unitig_sample_matrix:
         mkdir -p {params.outputdir}
         zcat {input.cdbg} | \
                 awk '{{if ($1=="S") {{print ">" $2 "\\n" $3}}}}' \
-                > {params.outputdir}/allunitigs.fasta
+                > {output.allunitigs_fasta}
 
         Bifrost query \
                 -v \
@@ -160,4 +172,55 @@ rule unitig_splits_presenceabsence:
             {input.split_considered} \
             {params.freq} \
             {output.unitigs_present}
+        """
+
+# RULE: For each part of each split make a fasta file containing only the
+## unitigs present there. ### Concern --> this is going to increase memory 
+## requirements substantially?
+# -----------------------------------------------------------------------------
+
+rule generate_fasta_splitpart:
+    input:
+        unitigs_present = main_dir(f"present_unitigs_at_frequency_{FREQUENCYTHRESH}/unitigs_in_split{{SPLITNO}}_part{{PART}}.txt"),
+        allunitigs_fasta = main_dir("unitig_sample_matrix/allunitigs.fasta")
+    output:
+        fasta_splitpart = main_dir(f"phylogencyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/fastas/split{{SPLITNO}}_part{{PART}}.fasta")
+    params:
+        freq = FREQUENCYTHRESH
+    conda:
+        "./envs/seqkit.yml"
+    threads:
+        12
+    shell:
+        """
+        mkdir -p $(dirname {output.fasta_splitpart})
+        cat {input.unitigs_present} | \
+                parallel -j {threads} --no-notice seqkit grep -n -p {{}} {input.allunitigs_fasta} \
+                > {output}
+        """
+
+rule create_gfas_withbifrost:
+    input:
+        fasta_splitpart1 = main_dir(f"phylogencyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/fastas/split{{SPLITNO}}_part1.fasta"),
+        fasta_splitpart2 = main_dir(f"phylogencyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/fastas/split{{SPLITNO}}_part2.fasta")
+    output:
+        pcdbg=main_dir(f"phylogenyColoredDeBruijnGraphs/gfas/split{{SPLITNO}}_k{KMERSIZE}_bifrost.gfa.gz"),
+        colors=main_dir(f"phylogenyColoredDeBruijnGraphs/gfas/split{{SPLITNO}}_k{KMERSIZE}_bifrost.color.bfg")
+    params:
+        kmersize=KMERSIZE,
+    conda:
+        "./envs/bifrost.yml"
+    threads:
+        12
+    shell:
+        """
+        OUTPUTDIR=$(dirname {output.pcdbg})
+        mkdir -p $OUTPUTDIR
+        Bifrost build \
+                -t {threads} \
+                -k {params.kmersize} \
+                -c \
+                -r {input.fasta_splitpart1} \
+                -r {input.fasta_splitpart2} \
+                -o $OUTPUTDIR/$(basename {output.pcdbg} .gfa.gz)
         """

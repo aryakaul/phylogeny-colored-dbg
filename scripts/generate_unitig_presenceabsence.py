@@ -9,6 +9,7 @@ outputpath = sys.argv[4]
 
 unitig_color_mtx = pd.read_csv(unitig_colors_mtx_path, delim_whitespace=True)
 unitig_color_mtx = unitig_color_mtx.set_index('query_name')
+unitig_color_mtx.columns = unitig_color_mtx.columns.map(lambda x: os.path.basename(x))
 unitig_color_mtx.columns = unitig_color_mtx.columns.map(lambda x: '.'.join(x.rsplit('.', 1)[:-1]))
 
 with open(split_path, 'r') as file:
