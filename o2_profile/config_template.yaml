@@ -28,6 +28,11 @@ cores: 14
 
 groups:
   - unitig_splits_presenceabsence=group_unitig_splits_presenceabsence
+  - unitig_split_matrix=group_unitig_split_matrix
+  - unitig_split_matrix=group_unitig_split_matrix
+  - add_color_gfatag=group_color_gfatag
     
 group-components:
   - group_unitig_splits_presenceabsence=100
+  - group_unitig_split_matrix=100
+  - group_color_gfatag=100
