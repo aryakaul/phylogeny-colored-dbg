@@ -38,13 +38,24 @@ samples = [os.path.basename(acc) for acc in sample_dirs]
 # RULE ALL
 # -----------------------------------------------------------------------------
 
+def enumerate_all_splits(samples, outputdir, kmersize):
+    number_of_possible_splits = len(samples) * 2 - 3
+    possiblesplits = list(range(0, number_of_possible_splits))
+    parts=["1", "2"]
+    return expand(
+        os.path.join(
+            outputdir, f"unitigs_in_split{{SPLITNO}}_part{{PART}}.txt"
+        ),
+        SPLITNO=possiblesplits,
+        PART=parts
+    )
 
 def enumerate_all_phylogenycDBGs(samples, outputdir, kmersize):
     number_of_possible_splits = len(samples) * 2 - 3
     possiblesplits = list(range(0, number_of_possible_splits))
     return expand(
         os.path.join(
-            outputdir, f"split{{SPLITNO}}_k{kmersize}_bifrost_colorsadded.gfa.gz"
+            outputdir, f"split{{SPLITNO}}_k{kmersize}_cuttlefish.gfa1"
         ),
         SPLITNO=possiblesplits,
     )
@@ -52,43 +63,45 @@ def enumerate_all_phylogenycDBGs(samples, outputdir, kmersize):
 
 rule all:
     input:
-        cdbg=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_bifrost.gfa.gz"),
+        seqfile=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_cuttlefish.cf_seq"),
         binarymatrix=main_dir("unitig_sample_matrix/unitigs.colors.tsv"),
-        phylogeny_cdbgs=enumerate_all_phylogenycDBGs(
-            samples,
-            main_dir(
-                f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/gfas"
-            ),
-            KMERSIZE,
-        ),
+        phylogenyCdbgs=enumerate_all_phylogenycDBGs(
+                samples,
+                main_dir(f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/gfas"),
+                KMERSIZE
+        )
 
 
-# RULE: Make colored, compacted de bruijn graph using Bifrost
+# RULE: Make colored, compacted de bruijn graph using Cuttlefish
 # -----------------------------------------------------------------------------
 
 
-rule run_bifrost:
+rule run_cuttlefish:
     output:
-        cdbg=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_bifrost.gfa.gz"),
-        colors=main_dir(
-            f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_bifrost.color.bfg"
-        ),
+        seqfile=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_cuttlefish.cf_seq"),
+        segfile=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_cuttlefish.cf_seg"),
     params:
         kmersize=KMERSIZE,
+        tempdir="/n/scratch3/users/a/ak586/cuttlefish/tmp"
     conda:
-        "./envs/bifrost.yml"
+        "./envs/cuttlefish.yml"
     threads: 32
+    resources:
+        mem_gb=50
     shell:
         """
-        OUTPUTDIR=$(dirname {output.cdbg})
+        ulimit -n 2048
+        OUTPUTDIR=$(dirname {output.seqfile})
         mkdir -p $OUTPUTDIR
         find $OUTPUTDIR/../assemblies -type f > $OUTPUTDIR/list_of_files.txt
-        Bifrost build \
+        cuttlefish build \
+                -l $OUTPUTDIR/list_of_files.txt \
                 -t {threads} \
                 -k {params.kmersize} \
-                -c \
-                -r $OUTPUTDIR/list_of_files.txt \
-                -o $OUTPUTDIR/$(basename {output.cdbg} .gfa.gz)
+                -f 3 \
+                -m 45 \
+                -w {params.tempdir} \
+                -o $OUTPUTDIR/colored_dbg_k{params.kmersize}_cuttlefish
         """
 
 
@@ -131,32 +144,18 @@ rule split_tree:
 
 rule unitig_sample_matrix:
     input:
-        cdbg=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_bifrost.gfa.gz"),
-        colors=main_dir(
-            f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_bifrost.color.bfg"
-        ),
+        seqfile=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_cuttlefish.cf_seq"),
+        segfile=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_cuttlefish.cf_seg"),
     output:
-        allunitigs_fasta=main_dir("unitig_sample_matrix/allunitigs.fasta"),
         binarymatrix=main_dir("unitig_sample_matrix/unitigs.colors.tsv"),
-    params:
-        outputdir=main_dir("unitig_sample_matrix"),
     conda:
-        "./envs/bifrost.yml"
+        "./envs/pandas.yml"
     shell:
         """
-        mkdir -p {params.outputdir}
-        zcat {input.cdbg} | \
-                awk '{{if ($1=="S") {{print ">" $2 "\\n" $3}}}}' \
-                > {output.allunitigs_fasta}
-
-        Bifrost query \
-                -v \
-                -t {threads} \
-                -e 1.0 \
-                -g {input.cdbg} \
-                -C {input.colors} \
-                -q {output.allunitigs_fasta} \
-                -o {params.outputdir}/unitigs.colors
+        python ./scripts/generate_unitig_colormatrix_cuttlefish.py \
+                {input.segfile} \
+                {input.seqfile} \
+                {output}
         """
 
 
@@ -181,12 +180,15 @@ rule unitig_splits_presenceabsence:
         "./envs/pandas.yml"
     shell:
         """
-        mkdir -p $(dirname {output.unitigs_present})
-        python scripts/generate_unitig_presenceabsence.py \
+        OUTPUTDIR=$(dirname {output.unitigs_present})
+        mkdir -p $OUTPUTDIR
+
+        python scripts/generate_unitig_presenceabsence_cuttlefish.py \
             {input.binarymatrix} \
             {input.split_considered} \
             {params.freq} \
-            {output.unitigs_present}
+            {output.unitigs_present} \
+            $(find $OUTPUTDIR/../assemblies -type f | tr "\\n" " " )
         """
 
 
@@ -201,7 +203,7 @@ rule generate_fasta_splitpart:
         unitigs_present=main_dir(
             f"present_unitigs_at_frequency_{FREQUENCYTHRESH}/unitigs_in_split{{SPLITNO}}_part{{PART}}.txt"
         ),
-        allunitigs_fasta=main_dir("unitig_sample_matrix/allunitigs.fasta"),
+        segfile=main_dir(f"colored-debruijngraph/colored_dbg_k{KMERSIZE}_cuttlefish.cf_seg"),
     output:
         fasta_splitpart=main_dir(
             f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/fastas/split{{SPLITNO}}_part{{PART}}.fasta"
@@ -215,16 +217,17 @@ rule generate_fasta_splitpart:
         """
         mkdir -p $(dirname {output.fasta_splitpart})
         cat {input.unitigs_present} | \
-                parallel -j {threads} --no-notice seqkit grep -n -p {{}} {input.allunitigs_fasta} \
+                parallel -j {threads} --no-notice grep -w {{}} {input.segfile} | \
+                awk '{{printf ">%s\\n%s\\n", $1, $2}}'  \
                 > {output}
         """
 
 
-# RULE: Rerun Bifrost for these fasta files!
+# RULE: Rerun Cuttlefish for these fasta files!
 # -----------------------------------------------------------------------------
 
 
-rule create_gfas_withbifrost:
+rule create_gfas_withcuttlefish:
     input:
         fasta_splitpart1=main_dir(
             f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/fastas/split{{SPLITNO}}_part1.fasta"
@@ -233,28 +236,32 @@ rule create_gfas_withbifrost:
             f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/fastas/split{{SPLITNO}}_part2.fasta"
         ),
     output:
-        pcdbg=main_dir(
-            f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/gfas/split{{SPLITNO}}_k{KMERSIZE}_bifrost.gfa.gz"
-        ),
-        colors=main_dir(
-            f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/gfas/split{{SPLITNO}}_k{KMERSIZE}_bifrost.color.bfg"
-        ),
+        gfa=main_dir(f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/gfas/split{{SPLITNO}}_k{KMERSIZE}_cuttlefish.gfa1"),
+        json=main_dir(f"phylogenyColoredDeBruijnGraphs/frequency_{FREQUENCYTHRESH}/gfas/split{{SPLITNO}}_k{KMERSIZE}_cuttlefish.json"),
     params:
         kmersize=KMERSIZE,
+        tempdir = "/n/scratch3/users/a/ak586/tmp_cuttlefish"
     conda:
-        "./envs/bifrost.yml"
-    threads: 12
+        "./envs/cuttlefish.yml"
+    threads: 32
+    resources:
+        mem_gb=30
     shell:
         """
-        OUTPUTDIR=$(dirname {output.pcdbg})
+        ulimit -n 2048
+        OUTPUTDIR=$(dirname {output.gfa})
         mkdir -p $OUTPUTDIR
-        Bifrost build \
+        mkdir -p {params.tempdir}
+        OUTPUT=$OUTPUTDIR/$(basename {output.gfa} .gfa1)
+        cuttlefish build \
+                -s {input.fasta_splitpart1} \
+                -s {input.fasta_splitpart2} \
                 -t {threads} \
                 -k {params.kmersize} \
-                -c \
-                -r {input.fasta_splitpart1} \
-                -r {input.fasta_splitpart2} \
-                -o $OUTPUTDIR/$(basename {output.pcdbg} .gfa.gz)
+                -m 28 \
+                -f 1 \
+                -w {params.tempdir} \
+                -o $OUTPUT
         """
 
 

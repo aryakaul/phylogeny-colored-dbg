@@ -1,0 +1,17 @@
+name: cuttlefish
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - _libgcc_mutex=0.1=conda_forge
+  - _openmp_mutex=4.5=2_gnu
+  - bzip2=1.0.8=h7f98852_4
+  - cuttlefish=2.2.0=h6a68c12_2
+  - libgcc-ng=13.2.0=h807b86a_2
+  - libgomp=13.2.0=h807b86a_2
+  - libjemalloc=5.3.0=hcb278e6_0
+  - libstdcxx-ng=13.2.0=h7e041cc_2
+  - libzlib=1.2.13=hd590300_5
+  - zlib=1.2.13=hd590300_5
+prefix: /n/data1/hms/dbmi/baym/arya/miniconda/envs/cuttlefish
