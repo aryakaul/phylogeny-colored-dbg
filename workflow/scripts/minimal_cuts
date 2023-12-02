@@ -179,7 +179,6 @@ def process_chunk(tree, chunk_data, all_leaf_coloring):
     for num, target_leaves in enumerate(chunk_data):
         logger.debug("Processing leaf set - %s" % num)
         logger.debug("Target leaves are %s" % target_leaves)
-
         start_time = time.time()
         (
             root_red_cost,
@@ -198,6 +197,8 @@ def process_chunk(tree, chunk_data, all_leaf_coloring):
         else:
             best_cuts = (root_red_cuts, root_blue_cuts)
             root_decision = "ambiguous"
+
+        if best_cuts == []: best_cuts = ["Root"]
 
         results.append(best_cuts)
 
@@ -250,56 +251,6 @@ def minimal_cuts_for_all_sets(tree,
     pool.join()
 
     return results, colors_info if all_leaf_coloring else results
-
-
-#    for chunk in read_target_leaves(leaves_file_path, chunk_size):
-#        for num, target_leaves in enumerate(chunk):
-#            logger.info("Processing leaf set - %s" % num)
-#            logger.debug("Target leaves are %s" % target_leaves)
-#
-#            start_time = time.time()
-#            (
-#                root_red_cost,
-#                root_blue_cost,
-#                root_red_cuts,
-#                root_blue_cuts,
-#            ) = compute_costs(tree, target_leaves, all_leaf_coloring)
-#
-#            # Determine the optimal color for the root
-#            if root_red_cost[0] < root_blue_cost[0]:
-#                best_cuts = root_red_cuts
-#                root_decision = "red"
-#            elif root_blue_cost[0] < root_red_cost[0]:
-#                best_cuts = root_blue_cuts
-#                root_decision = "blue"
-#            else:
-#                best_cuts = (root_red_cuts, root_blue_cuts)
-#                root_decision = "ambiguous"
-#
-#            results.append(best_cuts)
-#
-#            if all_leaf_coloring:
-#                logger.info("Backtracking to color internal nodes...")
-#                # Call the backtracking function
-#                if root_decision != "ambiguous":
-#                    optimal_colors = backtrack_and_recolor(
-#                        root_decision, tree, best_cuts
-#                    )
-#                else:
-#                    optimal_colors_red = backtrack_and_recolor("red", tree, best_cuts[0])
-#                    optimal_colors_blue = backtrack_and_recolor("blue", tree, best_cuts[1])
-#                    optimal_colors = (optimal_colors_red, optimal_colors_blue)
-#
-#                # Store a tuple with the set number, the chosen color for the set, and the color mapping
-#                colors_info.append((num, root_decision, optimal_colors))
-#
-#            end_time = time.time()
-#            elapsed_time = end_time - start_time
-#
-#            logger.info("Took {:.2f} seconds.", elapsed_time)
-#
-#    return results, colors_info if all_leaf_coloring else results
-
 
 def write_output(data, output_file=None):
     if output_file:
@@ -454,7 +405,7 @@ def main():
         logger.add(sys.stderr, level="DEBUG")
 
     tree = Tree(args.tree_file, format=1)
-    tree = autocomplete_internal_node_names(tree, args.tree)
+    # tree = autocomplete_internal_node_names(tree, args.tree)
 
     # all_target_leaves = read_target_leaves(args.leaves_file)
     results, colors = minimal_cuts_for_all_sets(tree, args.leaves_file,

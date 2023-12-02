@@ -6,12 +6,14 @@ redundant_colors_file = sys.argv[1]
 minimal_cuts_file = sys.argv[2]
 output = sys.argv[3]
 
-# Read OUTPUT2 and OUTPUT3
 with open(redundant_colors_file, 'r') as f:
     redundant_colors = f.read().strip().split('\n')
 
 with open(minimal_cuts_file, 'r') as f:
     minimal_cuts = f.read().strip().split('\n')
+
+# print(len(redundant_colors))
+# print(len(minimal_cuts))
 
 # Create a mapping from the unique vectors to minimal_cuts output
 vector_to_cutsoutput = {

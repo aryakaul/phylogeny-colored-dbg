@@ -54,9 +54,8 @@ help: ## Print help messages
 conda: ## Create the conda environments
 	snakemake -p -j -d .test $(CONDA_PARAMS) --conda-create-envs-only
 
-clean: ## Clean all output archives and files with statistics
-	rm -fvr output/* intermediate/stats/*
-	find intermediate -name '*.gfa' -or -name '*.hist'  | xargs rm -fv
+clean: ## Clean all output archives and intermediate files
+	rm -fvr output/* intermediate/*
 	@if [ -d ".test" ]; then \
 		$(MAKE) -C .test clean; \
 	fi
