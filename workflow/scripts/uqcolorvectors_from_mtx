@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+
+import os
+import pandas as pd
+import sys
+
+# Load the TSV file in chunks (example: chunksize=10000)
+file_path = sys.argv[1]
+chunksize = 10000
+uniquevectors = sys.argv[2]
+mergedvectors_id = sys.argv[3]
+
+
+# Function to process each chunk
+def process_chunk(chunk):
+    # Optimize column names
+    chunk.columns = [
+        os.path.splitext(os.path.basename(col))[0] for col in chunk.columns
+    ]
+
+    # Dictionary for unique vectors
+    unique_vectors = {}
+
+    for index, row in chunk.iterrows():
+        vector = '\t'.join(row[row == 1].index.tolist())
+        if vector in unique_vectors:
+            unique_vectors[vector].append(index)
+        else:
+            unique_vectors[vector] = [index]
+
+    return unique_vectors
+
+
+# Initialize final result dictionaries
+final_unique_vectors = {}
+
+for chunk in pd.read_csv(file_path,
+                         delimiter='\t',
+                         index_col=0,
+                         chunksize=chunksize):
+    chunk_unique_vectors = process_chunk(chunk)
+
+    # Merge chunk results into final results
+    for vector, ids in chunk_unique_vectors.items():
+        if vector in final_unique_vectors:
+            final_unique_vectors[vector].extend(ids)
+        else:
+            final_unique_vectors[vector] = ids
+
+# Write OUTPUT1 (unique vectors) and OUTPUT2 (identifiers)
+with open(uniquevectors, 'w') as out1, open(mergedvectors_id, 'w') as out2:
+    for vector, identifiers in final_unique_vectors.items():
+        out1.write(vector + '\n')
+        out2.write(','.join(map(str, identifiers)) + '\n')
