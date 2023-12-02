@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+
+import sqlite3
+from functools import lru_cache, partial
+import argparse
+from loguru import logger
+import sys
+
+
+def create_unitig_database():
+    conn = sqlite3.connect(":memory:")
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE unitigs (
+            unitig_id TEXT PRIMARY KEY,
+            length INTEGER,
+            colors TEXT,
+            sequence TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE adjacency (
+            unitig_id TEXT,
+            unitig_direction TEXT,
+            neighbor_id TEXT,
+            neighbor_direction TEXT,
+            PRIMARY KEY (unitig_id, unitig_direction, neighbor_id, neighbor_direction),
+            FOREIGN KEY(unitig_id) REFERENCES unitigs(unitig_id)
+        )
+    """)
+
+    conn.commit()
+    return conn
+
+
+def insert_unitig_length(conn, unitig_id, length):
+    """
+    Inserts or updates the length of a unitig.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO unitigs (unitig_id, length) VALUES (?, ?)
+        ON CONFLICT(unitig_id) DO UPDATE SET length=excluded.length
+    """,
+        (unitig_id, length),
+    )
+    conn.commit()
+
+
+def insert_unitig_sequence(conn, unitig_id, sequence):
+    """
+    Inserts or updates the sequence of a unitig.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO unitigs (unitig_id, sequence) VALUES (?, ?)
+        ON CONFLICT(unitig_id) DO UPDATE SET sequence=excluded.sequence
+        """,
+        (unitig_id, sequence),
+    )
+    conn.commit()
+
+
+def insert_unitig_colors(conn, unitig_id, colors):
+    """
+    Inserts or updates the colors of a unitig.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO unitigs (unitig_id, colors) VALUES (?, ?)
+        ON CONFLICT(unitig_id) DO UPDATE SET colors=excluded.colors
+    """,
+        (unitig_id, colors),
+    )
+    conn.commit()
+
+
+def insert_adjacency(conn, unitig_id, unitig_dir, neighbor_id, neighbor_dir):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO adjacency (unitig_id, unitig_direction, neighbor_id, neighbor_direction)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(unitig_id, unitig_direction, neighbor_id, neighbor_direction) DO NOTHING
+    """,
+        (unitig_id, unitig_dir, neighbor_id, neighbor_dir),
+    )
+    conn.commit()
+
+
+def index_gfa(file_path, unitigdb):
+    line_count = 0
+
+    logger.debug("Processing GFA file...")
+    with open(file_path, "r") as file:
+        for line in file:
+            line_count += 1
+            line = line.rstrip().split()
+
+            if line[0] == "S":
+                unitig_id = line[1]
+                unitig_length = int(line[3].split(":")[-1])
+                unitig_sequence = line[2]
+                insert_unitig_length(unitigdb, unitig_id, unitig_length)
+                insert_unitig_sequence(unitigdb, unitig_id, unitig_sequence)
+            elif line[0] == "L":
+                unitig_id = line[1]
+                unitig_dir = line[2]
+                neighbor_id = line[3]
+                neighbor_dir = line[4]
+                insert_adjacency(unitigdb, unitig_id, unitig_dir, neighbor_id,
+                                 neighbor_dir)
+
+            if line_count % 1000000 == 0:
+                logger.debug(f"Processed {line_count} lines.")
+
+    logger.debug(
+        f"Finished processing GFA. Total lines processed: {line_count}")
+
+
+def index_colors(file_path, unitigdb):
+    line_count = 0
+    logger.debug(f"Processing unitig_to_cuts file...")
+    with open(file_path, "r") as f:
+        for line in f:
+            line_count += 1
+            parts = line.strip().split()
+            unitig_id = parts[0].strip()
+            if len(parts) == 1:
+                color_sets = "None"
+            else:
+                color_sets = parts[1].strip()
+            insert_unitig_colors(unitigdb, unitig_id, color_sets)
+            if line_count % 1000000 == 0:
+                logger.debug(f"Processed {line_count} lines.")
+
+    logger.debug(f"Finished processing. Total lines processed: {line_count}")
+
+
+def create_indexes(conn):
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_unitig_id ON adjacency(unitig_id);")
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_neighbor_id ON adjacency(neighbor_id);"
+    )
+    conn.commit()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Read GFA file & smallparsimony to on-disk SQL db")
+
+    parser.add_argument(
+        "-g",
+        "--gfa",
+        type=str,
+        required=True,
+        help="File path to the GFA file",
+        metavar="FILE",
+    )
+
+    parser.add_argument(
+        "-s",
+        "--smallparsimony",
+        type=str,
+        required=True,
+        help="The file path for the output of the smallparsimony script.",
+        metavar="FILE",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        required=True,
+        help="The file path for the outputted SQL db.",
+        metavar="FILE",
+    )
+
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help=
+        "Increase verbosity level. Can be specified multiple times for more detailed logs.",
+    )
+
+    args = parser.parse_args()
+
+    if args.verbose == 0:
+        logger.remove()
+    elif args.verbose == 1:
+        logger.remove()
+        logger.add(sys.stderr, level="INFO")
+    elif args.verbose >= 2:
+        logger.remove()
+        logger.add(sys.stderr, level="DEBUG")
+
+    logger.info("Generating SQL db for reading...")
+    unitigdb = create_unitig_database()
+    index_gfa(args.gfa, unitigdb)
+    index_colors(args.smallparsimony, unitigdb)
+    create_indexes(unitigdb)
+    logger.debug("Built & indexed SQL db")
+
+    # Copy data from memory to disk
+    logger.debug("Saving db to disk")
+    disk_db_conn = sqlite3.connect(args.output)
+    with disk_db_conn:
+        unitigdb.backup(disk_db_conn)
+    disk_db_conn.close()
+    unitigdb.close()
+    logger.info(f"SQL db saved to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

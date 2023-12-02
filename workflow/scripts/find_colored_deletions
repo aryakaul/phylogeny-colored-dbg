@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+
+import json
+import pandas as pd
+import time
+import argparse
+import os
+from loguru import logger
+import sys
+import sqlite3
+import multiprocessing
+from functools import lru_cache, partial
+from sql_utils import lookup_unitigs_batch
+
+
+def read_bubbles(file_path):
+    """
+    Reads the bubbles.json file and yields bubble objects.
+    """
+    with open(file_path, "r") as f:
+        bubbles = json.load(f)
+        for chain_id, chain_data in bubbles.items():
+            for bubble in chain_data["bubbles"]:
+                yield bubble
+
+
+def fetch_adjacency_data(conn, allowed_unitigs):
+    adjacency_dict = {}
+    allowed_set = set(allowed_unitigs)
+    placeholders = ", ".join(["?"] * len(allowed_set))
+
+    cur = conn.cursor()
+    query = f"""
+    SELECT unitig_id, unitig_direction, neighbor_id, neighbor_direction
+    FROM adjacency
+    WHERE unitig_id IN ({placeholders})
+    AND neighbor_id IN ({placeholders})
+    """
+    cur.execute(query,
+                tuple(allowed_set) * 2)  # Tuple unpacking for each IN clause
+    for unitig_id, unitig_dir, neighbor_id, neighbor_dir in cur:
+        if unitig_id not in adjacency_dict:
+            adjacency_dict[unitig_id] = {"+": set(), "-": set()}
+        if neighbor_id not in adjacency_dict:
+            adjacency_dict[neighbor_id] = {"+": set(), "-": set()}
+
+        adjacency_dict[unitig_id][unitig_dir].add((neighbor_id, neighbor_dir))
+
+    return adjacency_dict
+
+
+def find_paths_with_allowed_unitigs(
+    bubbleid,
+    adjacency_dict,
+    start,
+    end,
+    path=None,
+    path_set=None,
+    path_count=[0],
+    max_paths=10000,
+    start_time=None,
+    timeout=[0, 60],
+):
+    start_unitig = start[:-1]
+    start_dir = start[-1]
+    if path is None:
+        path = []
+    if path_set is None:
+        path_set = set()
+    if start_time is None:
+        start_time = time.time()  # Set the start time only in the first call
+
+    # Function to check if time limit has been exceeded
+    def has_timed_out():
+        return time.time() - start_time > timeout[
+            1]  # 1800 seconds = 30 minutes
+
+    if has_timed_out():
+        if timeout[0] == 0:
+            logger.warning(
+                f"Timed out - Finding all paths for bubble {bubbleid} took longer than {timeout[1]} seconds"
+            )
+            timeout[0] = 1
+        return  # Stop the execution if time limit is exceeded
+
+    # logger.info(f"Starting node: {start}")
+    path.append(start)
+    path_set.add(start)
+    # logger.info(f"Current Path: {path}")
+    # logger.info(f"Current Path_set: {path_set}")
+
+    if start == end:
+        # logger.info(f"Start == End node!")
+        # Existing logic to handle the path
+        yield path[:]
+        if max_paths != 0:
+            path_count[0] += 1
+            if path_count[0] >= max_paths:
+                return
+    else:
+        for neighbor_tup in adjacency_dict[start_unitig][start_dir]:
+            neighbor = neighbor_tup[0] + neighbor_tup[1]
+            # logger.info(f"Neighbor: {neighbor}")
+            if neighbor not in path_set:
+                # logger.info(f"Neighbor not in path_set!")
+                yield from find_paths_with_allowed_unitigs(
+                    bubbleid,
+                    adjacency_dict,
+                    neighbor,
+                    end,
+                    path,
+                    path_set,
+                    path_count,
+                    max_paths,
+                    start_time,
+                    timeout=timeout,
+                )
+
+    path.pop()
+    path_set.remove(start)
+
+
+def filter_paths_by_criteria(conn,
+                             all_paths,
+                             start,
+                             end,
+                             smallpath_maxlen=100,
+                             bigpath_minlen=1000):
+    valid_pairs = []
+
+    logger.debug("Getting unitig ids")
+    # Collect all unique unitig IDs from all paths
+    all_unitig_ids = set(unitig_id[:-1] for path in all_paths
+                         for unitig_id in path[1:-1])
+
+    # Fetch unitig information in batch
+    logger.debug("Looking up unitigs")
+    unitig_info = lookup_unitigs_batch(conn, list(all_unitig_ids))
+
+    # Modified to use cached parsed colors (if applicable)
+    logger.debug("Finding colors of unitigs")
+    for unitig_id in unitig_info:
+        unitig_info[unitig_id]["parsed_colors"] = parse_colors(
+            unitig_info[unitig_id]["colors"])
+
+    # Pre-calculate path info (lengths and shared colors) and store them
+    logger.debug("Getting lengths and shared colors of paths")
+    path_info = []
+    for path in all_paths:
+        inner_path = path[1:-1]
+        lengths = [
+            unitig_info[unitig_id[:-1]]["length"] for unitig_id in inner_path
+        ]
+        color_sets = [
+            unitig_info[unitig_id[:-1]]["parsed_colors"]
+            for unitig_id in inner_path
+        ]
+        total_length = sum(lengths)
+        shared_colors = get_shared_colors(color_sets)
+        path_info.append([total_length, shared_colors])
+
+    logger.debug("Segmenting into small and large paths")
+    small_paths = [
+        i for i, info in enumerate(path_info) if info[0] < smallpath_maxlen
+    ]
+    large_paths = [
+        i for i, info in enumerate(path_info) if info[0] > bigpath_minlen
+    ]
+
+    logger.debug("Going through small and big path pairs")
+    for i in small_paths:
+        for j in large_paths:
+            if path_info[i][1] & path_info[j][1]:
+                valid_pairs.append((all_paths[i], all_paths[j]))
+    logger.debug("Finished identifying valid pairs")
+    return valid_pairs
+
+
+def process_one_bubble(bubble, db_filepath, smallpath_maxlen, bigpath_minlen,
+                       max_paths, timeout):
+    unitigdb = sqlite3.connect(
+        db_filepath)  # Create a new connection for the chunk
+    start, end = bubble["ends"]
+    allowed_unitigs = bubble["inside"]
+    allowed_unitigs.extend(bubble["ends"])
+    logger.debug(f"Processing {bubble['id']}")
+    logger.debug("Finding adj. dict...")
+    adjacency_dict = fetch_adjacency_data(unitigdb, allowed_unitigs)
+    logger.debug(f"Adjacency Dict: {adjacency_dict}")
+    logger.debug(f"Finding possible paths for {bubble['id']}")
+    poss_paths_start_pos_end_neg = list(
+        find_paths_with_allowed_unitigs(
+            bubble["id"],
+            adjacency_dict,
+            start + "+",
+            end + "-",
+            path_count=[0],
+            max_paths=max_paths,
+            timeout=[0, timeout],
+        ))
+    poss_paths_start_neg_end_neg = list(
+        find_paths_with_allowed_unitigs(
+            bubble["id"],
+            adjacency_dict,
+            start + "-",
+            end + "-",
+            path_count=[0],
+            max_paths=max_paths,
+            timeout=[0, timeout],
+        ))
+    poss_paths_start_pos_end_pos = list(
+        find_paths_with_allowed_unitigs(
+            bubble["id"],
+            adjacency_dict,
+            start + "+",
+            end + "+",
+            path_count=[0],
+            max_paths=max_paths,
+            timeout=[0, timeout],
+        ))
+    poss_paths_start_neg_end_pos = list(
+        find_paths_with_allowed_unitigs(
+            bubble["id"],
+            adjacency_dict,
+            start + "-",
+            end + "+",
+            path_count=[0],
+            max_paths=max_paths,
+            timeout=[0, timeout],
+        ))
+    poss_paths_end_pos_start_neg = list(
+        find_paths_with_allowed_unitigs(
+            bubble["id"],
+            adjacency_dict,
+            end + "+",
+            start + "-",
+            path_count=[0],
+            max_paths=max_paths,
+            timeout=[0, timeout],
+        ))
+    poss_paths_end_pos_start_pos = list(
+        find_paths_with_allowed_unitigs(
+            bubble["id"],
+            adjacency_dict,
+            end + "+",
+            start + "+",
+            path_count=[0],
+            max_paths=max_paths,
+            timeout=[0, timeout],
+        ))
+    poss_paths_end_neg_start_pos = list(
+        find_paths_with_allowed_unitigs(
+            bubble["id"],
+            adjacency_dict,
+            end + "-",
+            start + "+",
+            path_count=[0],
+            max_paths=max_paths,
+            timeout=[0, timeout],
+        ))
+    poss_paths_end_neg_start_neg = list(
+        find_paths_with_allowed_unitigs(
+            bubble["id"],
+            adjacency_dict,
+            end + "-",
+            start + "-",
+            path_count=[0],
+            max_paths=max_paths,
+            timeout=[0, timeout],
+        ))
+    poss_paths = (poss_paths_start_pos_end_neg + poss_paths_start_pos_end_pos +
+                  poss_paths_start_neg_end_pos + poss_paths_start_neg_end_neg +
+                  poss_paths_end_pos_start_neg + poss_paths_end_pos_start_pos +
+                  poss_paths_end_neg_start_pos + poss_paths_end_neg_start_neg)
+    logger.debug(f"Found {len(poss_paths)} possible paths for {bubble['id']}")
+    if len(poss_paths) == max_paths:
+        logger.warning(
+            f"Did not find all paths for bubble {bubble['id']}. Exited after finding {max_paths} possible paths."
+        )
+    logger.debug(f"Filtering possible paths for {bubble['id']}")
+    filtered_paths = filter_paths_by_criteria(unitigdb, poss_paths, start, end,
+                                              smallpath_maxlen, bigpath_minlen)
+    unitigdb.close()  # Close the connection after processing the chunk
+
+    # Add valid path pairs to the bubble object if any are found
+    if filtered_paths:
+        logger.info(
+            f"{bubble['id']} identified as candidate with {len(filtered_paths)} possible path pairs"
+        )
+        bubble["valid_path_pairs"] = [([unitig for unitig in path_a],
+                                       [unitig for unitig in path_b])
+                                      for path_a, path_b in filtered_paths]
+        return bubble
+    else:
+        return None
+
+
+def filter_bubbles(
+    bubble_path,
+    db_filepath,
+    smallpath_maxlen,
+    bigpath_minlen,
+    threads,
+    maxpaths,
+    timeout,
+):
+    passing_bubbles = []
+    bubbles = read_bubbles(
+        bubble_path)  # Assuming this returns an iterable of bubbles
+
+    process_bubble_with_args = partial(
+        process_one_bubble,
+        db_filepath=db_filepath,
+        smallpath_maxlen=smallpath_maxlen,
+        bigpath_minlen=bigpath_minlen,
+        max_paths=maxpaths,
+        timeout=timeout,
+    )
+
+    with multiprocessing.Pool(processes=threads) as pool:
+        # Process each bubble in parallel using the partial function
+        for result in pool.map(process_bubble_with_args, bubbles):
+            if result is not None:
+                passing_bubbles.append(result)
+
+    logger.info(f"Total number of passing bubbles: {len(passing_bubbles)}")
+    return passing_bubbles
+
+
+@lru_cache(maxsize=1024)
+def parse_colors(color_string):
+    color_options = color_string.split(" OR ")
+    return [set(option.split(",")) for option in color_options]
+
+
+def get_shared_colors(list_of_color_options, shared_color_threshold=90):
+    color_counts = {}
+    total_unitigs = len(list_of_color_options)
+
+    for color_options in list_of_color_options:
+        for color_set in color_options:
+            for color in color_set:
+                color_counts[color] = color_counts.get(color, 0) + 1
+
+    threshold_count = (shared_color_threshold / 100.0) * total_unitigs
+    return {
+        color
+        for color, count in color_counts.items() if count >= threshold_count
+    }
+
+
+def get_shared_colors_exact(list_of_color_options):
+    """
+    Finds a set of colors that is present in the `shared_color_threshold`
+    percent of color options of each unitig in the path. Each unitig could
+    have multiple sets of colors, represented as a list of sets.
+    """
+    # Initialize shared colors as None
+    shared_colors = None
+
+    # Iterate through each unitig's color options
+    for color_options in list_of_color_options:
+        # Calculate the intersection of color options for the current unitig
+        current_shared = set.union(*color_options) if color_options else set()
+
+        # If it's the first unitig, set its colors as the initial shared colors
+        if shared_colors is None:
+            shared_colors = current_shared
+        else:
+            # Otherwise, intersect with the shared colors found so far
+            shared_colors = shared_colors.intersection(current_shared)
+
+        # If at any point there are no shared colors, return an empty set
+        if not shared_colors:
+            return set()
+
+    return shared_colors
+
+
+def dump_matching_bubbles(output_json_path, matching_bubbles):
+    with open(output_json_path, "w") as outfile:
+        json.dump(matching_bubbles, outfile, indent=4)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Process minimal_cuts and BubbleGun output")
+
+    parser.add_argument(
+        "-b",
+        "--bubblegun",
+        type=str,
+        required=True,
+        help="The file path for the output of BubbleGun's JSON file.",
+        metavar="FILE",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        required=True,
+        help="The file path for the output file.",
+        metavar="FILE",
+    )
+
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help=
+        "Increase verbosity level. Can be specified multiple times for more detailed logs.",
+    )
+
+    parser.add_argument(
+        "-d",
+        "--db",
+        type=str,
+        required=True,
+        help=
+        "Path to store unitig SQL3 database. Preferably on a filesystem with quick read/write access.",
+    )
+
+    parser.add_argument(
+        "--predeletionsize",
+        type=int,
+        default=1000,
+        help="Minimum size of the longer path (pre-deletion)",
+    )
+
+    parser.add_argument(
+        "--postdeletionsize",
+        type=int,
+        default=100,
+        help="Maximum size of the shorter path (post-deletion)",
+    )
+
+    parser.add_argument(
+        "-m",
+        "--maxpaths",
+        type=int,
+        default=100000,
+        help="Max number of paths to find in each bubble. Default is 100,000",
+    )
+
+    parser.add_argument(
+        "-to",
+        "--timeout",
+        type=int,
+        default=3600,
+        help=
+        "Max time to try and find all paths in a bubble. Default is 3600 seconds (1 hour)",
+    )
+
+    parser.add_argument(
+        "-j",
+        "--threads",
+        type=int,
+        default=multiprocessing.cpu_count(),
+        help=
+        "Number of threads to use to analyze bubbles. Default is all available.",
+    )
+
+    # Parse the arguments
+    args = parser.parse_args()
+
+    if args.verbose == 0:
+        logger.remove()
+    elif args.verbose == 1:
+        logger.remove()
+        logger.add(sys.stderr, level="INFO")
+    elif args.verbose >= 2:
+        logger.remove()
+        logger.add(sys.stderr, level="DEBUG")
+
+    # Check if the input files exist
+    if not os.path.isfile(args.bubblegun):
+        logger.error(
+            f"Error: The JSON file '{args.bubblegun}' does not exist.")
+        return
+
+    logger.info("Filtering bubbles...")
+    matching_bubbles = filter_bubbles(
+        args.bubblegun,
+        args.db,
+        args.postdeletionsize,
+        args.predeletionsize,
+        args.threads,
+        args.maxpaths,
+        args.timeout,
+    )
+    dump_matching_bubbles(args.output, matching_bubbles)
+    logger.info("Filtered bubbles dumped to {}", args.output)
+
+
+if __name__ == "__main__":
+    main()
