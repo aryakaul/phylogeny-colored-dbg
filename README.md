@@ -182,7 +182,7 @@ See [Releases](https://github.com/aryakaul/phylogeny-colored-dbg/releases).
 
 ## 8. License
 
-[GPL3](https://github.com/aryakaul/phylogeny-colored-dbg/blob/master/LICENSE)
+[GPL3](https://github.com/aryakaul/phylogeny-colored-dbg/blob/main/LICENSE)
 
 
 
