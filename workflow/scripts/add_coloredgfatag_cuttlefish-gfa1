@@ -16,18 +16,15 @@ def process_cuts_and_generate_palette(cutsperunitig, max_colors):
     with open(cutsperunitig, "r") as file:
         for line in file:
             parts = line.strip().split("\t")
-            if len(parts) > 1 and parts[1]:
-                if " OR " in parts[1]:
-                    both_soln = parts[1].split(" OR ")
-                    values = ",".join(sorted(both_soln[0].split(",")))
-                else:
-                    values = ",".join(sorted(parts[1].split(",")))
+            if " OR " in parts[1]:
+                both_soln = parts[1].split(" OR ")
+                values = ",".join(sorted(both_soln[0].split(",")))
             else:
-                values = ""
-
-            if values != "":
+                values = ",".join(sorted(parts[1].split(",")))
+            if values != "Root":
                 cut_countdict[values] = cut_countdict.get(values, 0) + 1
 
+    logger.debug(cut_countdict)
     logger.info("Generating color palette...")
     palette = cc.glasbey[:max_colors]
     most_common_cuts = sorted(cut_countdict.items(),
@@ -35,9 +32,11 @@ def process_cuts_and_generate_palette(cutsperunitig, max_colors):
                               reverse=True)[:max_colors]
     most_common_cuts_list = [key for key, _ in most_common_cuts]
     cut_to_colors = {
-        cuts: palette[i] if i < len(palette) else "#808080"
+        cuts: palette[i]
         for i, cuts in enumerate(most_common_cuts_list)
     }
+    cut_to_colors['Root'] = "#000000"
+    logger.debug(cut_to_colors)
 
     return cut_to_colors
 
@@ -56,9 +55,11 @@ def modify_gfa_with_colors(gfa_filename, sqldb, cut_colors, outpath):
                 if line.startswith("S"):
                     parts = line.split()
                     segment_id = parts[1]
+                    logger.debug(f"Parsing {segment_id}")
                     cutstring = lookup_unitigs_batch(
                         db, [segment_id],
                         output_neighbors=False)[segment_id]['colors']
+                    logger.debug(f"Cutstring to parse: {cutstring}")
                     if " OR " in cutstring:
                         both_soln = cutstring.split(" OR ")
                         logger.warning(
@@ -66,11 +67,12 @@ def modify_gfa_with_colors(gfa_filename, sqldb, cut_colors, outpath):
                         )
                         cuts = ",".join(sorted(both_soln[0].split(",")))
                     else:
-                        cuts = ",".join(sorted(cutstring[1].split(",")))
-                    color = cut_colors.get(cuts, "#000000")
-                    cuts_label = cutstring if cutstring else "Root"
+                        cuts = ",".join(sorted(cutstring.split(",")))
+                    logger.debug(f"Cutstring parsed to {cuts}")
+                    color = cut_colors.get(cuts, "#808080")
+                    logger.debug(f"Corresponding color: {color}")
                     out_file.writelines(line.strip() +
-                                        f"\tCB:Z:{color}\tLB:Z:{cuts_label}\n")
+                                        f"\tCB:Z:{color}\tLB:Z:{cutstring}\n")
                 elif line.startswith("P"):
                     continue
                 else:

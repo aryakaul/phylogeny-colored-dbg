@@ -10,6 +10,8 @@ configfile: "config.yaml"
 
 
 ##### load config and sample sheets #####
+
+
 def dir_input():
     return Path(config["input_dir"])
 
@@ -53,6 +55,7 @@ for x in res:
     ), f"\nERROR: No newick tree found for batch: {batch}. Should be: {dir_input()}/{batch}.nwk\n"
 
     BATCHES_FN[batch] = {}
+    # BATCHES_FN[batch]["tree"] = f"{dir_input()}/{batch}.nwk"
     with open(x) as f:
         for y in f:
             sample_fn = y.strip()

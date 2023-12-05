@@ -3,7 +3,7 @@ rule run_cuttlefish:
         gfa=fn_cuttlefish_out(_batch="{batch}", _ext="gfa1"),
         json=fn_cuttlefish_out(_batch="{batch}", _ext="json"),
     input:
-        fof=f"{dir_input()}/{batch}.txt",
+        fof=f"{dir_input()}" + "/{batch}.txt",
     conda:
         "../envs/cuttlefish.yml"
     params:
@@ -26,7 +26,7 @@ rule unitig_sample_matrix_gfa1:
         binarymatrix=fn_colormtx(_batch="{batch}"),
     input:
         gfa=fn_cuttlefish_out(_batch="{batch}", _ext="gfa1"),
-        fof=f"{dir_input()}/{batch}.txt",
+        fof=f"{dir_input()}" + "/{batch}.txt",
     params:
         script=snakemake.workflow.srcdir(
             "../scripts/generate_unitig_colormatrix_cuttlefish_gfa1"
