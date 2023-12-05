@@ -1,6 +1,5 @@
 channels:
-  - conda-forge
   - bioconda
-  - defaults
+  - conda-forge
 dependencies:
-  - cuttlefish=2.2.0
+  - cuttlefish
