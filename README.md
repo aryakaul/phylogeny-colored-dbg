@@ -8,13 +8,12 @@ pcDBG first generates the classical compacted colored-de Bruijn graph with
 cuttlefishv1 and then calculates the parsimonious explanation of each unitig
 given a phylogeny of the user-provided samples.
 
-For more information,
-see the <a href="LOLSOON">associated paper</a>.
+<!--For more information, see the <a href="LOLSOON">associated paper</a>.-->
 </p><br/>
 
-[![Paper DOI](ZENODOLINK)](DOI4PAPER)
+<!--[![Paper DOI](ZENODOLINK)](DOI4PAPER)-->
 <!--[![MOF-Compress test](https://github.com/karel-brinda/mof-compress/actions/workflows/main.yaml/badge.svg)](https://github.com/karel-brinda/mof-compress/actions/)-->
-[![GitHub release](https://img.shields.io/github/release/aryakaul/pcdbg.svg)](https://github.com/aryakaul/pcdbg/releases/)
+[![GitHub release](https://img.shields.io/github/release/aryakaul/phylogeny-colored-dbg.svg)](https://github.com/aryakaul/phylogeny-colored-dbg/releases/)
 
 <h2>Contents</h2>
 
@@ -22,15 +21,12 @@ see the <a href="LOLSOON">associated paper</a>.
 
 * [1. Introduction](#1-introduction)
 * [2. Dependencies](#2-dependencies)
-    * [2a. Essential dependencies](#2a-essential-dependencies)
-    * [2b. Protocol-specific dependencies](#2b-protocol-specific-dependencies)
 * [3. Installation](#3-installation)
 * [4. Usage](#4-usage)
     * [4a. Basic example](#4a-basic-example)
     * [4b. Adjusting configuration](#4b-adjusting-configuration)
-    * [4c. List of implemented protocols](#4c-list-of-implemented-protocols)
-    * [4d. List of workflow commands](#4d-list-of-workflow-commands)
-    * [4e. Troubleshooting](#4e-troubleshooting)
+    * [4c. List of workflow commands](#4d-list-of-workflow-commands)
+    * [4d. Troubleshooting](#4e-troubleshooting)
 * [5. Citation](#5-citation)
 * [6. Issues](#6-issues)
 * [7. Changelog](#7-changelog)
@@ -42,57 +38,36 @@ see the <a href="LOLSOON">associated paper</a>.
 
 ## 1. Introduction
 
-The user provides files of files for individual batches
-in the `input/` directory
-and specifies the requested k-mer length in the
-[configuration file](config.yaml).
-Upon the execution by `make`,
-pcDBG builds a phylogeny colored de Bruijn graph of the assemblies from
-each list of files file in `input/`. This GFA file is outputted in
-`output/` and will have the same basename as the list of files file
-in `input/`.
+The user provides files of files for individual batches in the `input/` directory and specifies the requested k-mer length in the
+[configuration file](config.yaml). By running `make`, the pipeline builds a phylogeny-colored de Bruijn graph for each list of files
+in `input/`. The GFA file is outputted in `output/` and will have the same basename as the input list of files file.
 
-In addition, the minimal cuts corresponding to each unitig in the
-compacted de Bruijn graph will also be outputted in `output/`.
+In addition, the minimal cuts corresponding to each unitig in the compacted de Bruijn graph will be outputted in `output/`.
 
 
 ## 2. Dependencies
-
-### 2a. Essential dependencies
 
 * [Conda](https://docs.conda.io/en/latest/miniconda.html) (unless the use of Conda is switched off in the configuration) and ideally also [Mamba](https://mamba.readthedocs.io/) (>= 0.20.0)
 * [GNU Make](https://www.gnu.org/software/make/)
 * [Python](https://www.python.org/) (>=3.7)
 * [Snakemake](https://snakemake.github.io) (>=6.2.0)
-* [XZ](https://tukaani.org/xz/)
 
-and can be installed by Conda by
+These can be installed by Conda by
 ```bash
 bash conda install -c conda-forge -c bioconda -c defaults \
   make "python>=3.7" "snakemake>=6.2.0" "mamba>=0.20.0"
 ```
 
-### 2b. Protocol-specific dependencies
-
-These are installed automatically by
-Snakemake when they are requested;
-for instance, ProPhyle is not installed unless Protocol 3 is used.
-The specifications of individual environments
-can be found in [`workflow/envs/`](workflow/envs/),
+Other dependencies are installed automatically by
+Snakemake when they are requested. The specifications of individual environments can be found in [`workflow/envs/`](workflow/envs/),
 and they contain:
-[ETE 3](http://etetoolkit.org/),
-[SeqTK](https://github.com/lh3/seqtk),
-[xopen](https://pypi.org/project/xopen/),
-[Pandas](https://pandas.pydata.org/),
-[Jellyfish 2](https://github.com/gmarcais/Jellyfish),
-[Mashtree](https://github.com/lskatz/mashtree),
-[ProphAsm](https://github.com/prophyle/prophasm),
-and [ProPhyle](https://prophyle.github.io).
+- [ETE 3](http://etetoolkit.org/),
+- [Pandas](https://pandas.pydata.org/),
+- [Mashtree](https://github.com/lskatz/mashtree),
 
 
-All non-essential dependencies across all protocols can also be
+All dependencies across all protocols can also be
 installed at once by `make conda`.
-
 
 
 ## 3. Installation
@@ -100,15 +75,15 @@ installed at once by `make conda`.
 Clone and enter the repository by
 
 ```bash
-git clone https://github.com/karel-brinda/mof-compress
-cd mof-compress
+git clone https://github.com/aryakaul/phylogeny-colored-dbg
+cd phylogeny-colored-dbg
 ```
 
 Alternatively, the repository can also be installed using cURL by
 ```bash
-mkdir mof-compress
-cd mof-compress
-curl -L https://github.com/karel-brinda/mof-compress/tarball/main \
+mkdir phylogeny-colored-dbg
+cd phylogeny-colored-dbg
+curl -L https://github.com/aryakaul/phylogeny-colored-dbg/tarball/main \
     | tar xvf - --strip-components=1
 ```
 
@@ -128,121 +103,34 @@ curl -L https://github.com/karel-brinda/mof-compress/tarball/main \
   ```
   The supported input file formats include FASTA and FASTQ (possibly compressed by GZip).
 
-* ***Step 2 (optional): Provide corresponding phylogenies.*** \
-  Instead of estimating phylogenies by MashTree,
-  it is possible to supply custom phylogenies in the Newick format.
-  The tree files should be named `input/{batch_name}.nw`,
+* ***Step 2: Provide corresponding phylogenies.*** \
+  The tree files should be named `input/{batch_name}.nwk`,
   and the leave names inside should correspond
   to FASTA filenames (without FASTA suffixes).
 
 * ***Step 3 (optional): Adjust configuration.*** \
   By editing [`config.yaml`](config.yaml) it is possible to specify
-  compression protocols, data analyzes,
-  and low-level parameters (see below).
+  value of `k` and other parameters.
 
 * ***Step 4: Run the pipeline.*** \
-  Run the pipeline by `make`; this is run
+  Run the pipeline by `make`; this is run by
   Snakemake with the corresponding parameters.
 
 * ***Step 5: Retrieve the output files.*** \
   All output files will be located in `output/`.
-
+  
 
 ### 4b. Adjusting configuration
 
 The workflow can be configured via the [`config.yaml`](./config.yaml) file, and
 all options are documented directly there. The configurable functionality includes:
 * switching off Conda,
-* protocols to use (asm, dGSs, dBGs with propagation),
-* analyzes to include (sequence and *k*-mer statistics),
-* *k* for de Bruijn graph and *k*-mer counting,
-* Mashtree parameters (phylogeny estimation),
-* XZ parameters (low-level compression), or
-* JellyFish parameters (*k*-mer counting).
+* *k* for de Bruijn graph 
 
 
-### 4c. List of implemented protocols
+### 4c. List of workflow commands
 
-<table>
-
-<thead>
-  <td>Protocol
-  <td>Representation
-  <td>Description
-  <td>Product
-
-
-<tr>
-
-  <td>
-    <b>Protocol&nbsp;1<br />
-    (default)</b>
-
-  <td>
-    Assemblies
-
-  <td>
-    Left-to-right reordering of the assemblies according to the phylogeny
-
-  <td>
-    <code>output/asm/{batch}.tar.xz</code><br/>
-    original assemblies in FASTA <sup><b>(1)</b></sup>
-
-
-<tr>
-
-  <td>
-    <b>Protocol&nbsp;2</b><br />
-    (optional)
-
-  <td>
-    de Bruijn graphs
-
-  <td>
-    <a href="https://doi.org/10.1186/s13059-021-02297-z">Simplitigs</a>
-    from individual assemblies, left-to-right reordering of their files
-
-  <td>
-    <code>output/pre/{batch}.tar.xz</code><br/>
-    with simplitig text files,
-    representing individual de Bruijn graphs
-
-
-<tr>
-
-  <td>
-    <b>Protocol&nbsp;3</b><br />
-    (optional)
-
-  <td>
-    de Bruijn graphs
-
-  <td>
-    Bottom-up <i>k</i>-mer propagation using <a href="http://prophyle.github.io">ProPhyle</a>,
-    <a href="https://doi.org/10.1186/s13059-021-02297-z">simplitigs</a>
-    at individual nodes of the tree, and left-to-right re-ordering of the obtained files
-
-  <td>
-    <code>output/post/{batch}.tar.xz</code><br/>
-    <code>output/post/{batch}.nw</code><br/>
-    simplitig text files per individual nodes of the tree <sup><b>(2)</b></sup>
-
-</table>
-
-
-<small>
-  <sup><b>(1)</b></sup> In FASTA 1-line format and all sequences converted to uppercase
-  (unless switche off in the configuration).
-  <br />
-  <sup><b>(2)</b></sup> The original de Bruijn graphs can
-  be obtained by merging <i>k</i>-mer sets along
-  the respetive root-to-leaf paths.
-</small>
-
-
-### 4d. List of workflow commands
-
-MOF-Compress is executed via [GNU Make](https://www.gnu.org/software/make/), which handles all parameters and passes them to Snakemake.
+phylogeny-colored-dbg is executed via [GNU Make](https://www.gnu.org/software/make/), which handles all parameters and passes them to Snakemake.
 Here's a list of all implemented commands (to be executed as `make {command}`):
 
 
@@ -270,49 +158,41 @@ Here's a list of all implemented commands (to be executed as `make {command}`):
 ```
 
 
-### 4e. Troubleshooting
+### 4d. Troubleshooting
 
 Tests can be run by `make test`.
 
 
 ## 5. Citation
 
-> K. Brinda, L. Lima, S. Pignotti, N. Quinones-Olvera, K. Salikhov, R. Chikhi, G. Kucherov, Z. Iqbal, and M. Baym. **[Efficient and Robust Search of Microbial Genomes via Phylogenetic Compression](https://doi.org/10.1101/2023.04.15.536996).** *bioRxiv* 2023.04.15.536996, 2023. https://doi.org/10.1101/2023.04.15.536996
-
-```bibtex
-@article {PhylogeneticCompression,
-   author  = {Karel B{\v r}inda and Leandro Lima and Simone Pignotti
-               and Natalia Quinones-Olvera and Kamil Salikhov and Rayan Chikhi
-               and Gregory Kucherov and Zamin Iqbal and Michael Baym},
-   title   = {Efficient and Robust Search of Microbial Genomes via Phylogenetic Compression},
-   journal = {bioRxiv},
-   elocation-id = {2023.04.15.536996},
-   year    = {2023},
-   doi     = {10.1101/2023.04.15.536996},
-   url     = {https://www.biorxiv.org/content/early/2023/04/16/2023.04.15.536996}
-}
-```
+TODO
 
 
 ## 6. Issues
 
-Please use [Github issues](https://github.com/karel-brinda/mof-compress/issues).
+Please use [Github issues](https://github.com/aryakaul/phylogeny-colored-dbg/issues).
 
 
 
 ## 7. Changelog
 
-See [Releases](https://github.com/karel-brinda/mof-compress/releases).
+See [Releases](https://github.com/aryakaul/phylogeny-colored-dbg/releases).
 
 
 
 ## 8. License
 
-[MIT](https://github.com/karel-brinda/mof-search/blob/master/LICENSE)
+[GPL3](https://github.com/aryakaul/phylogeny-colored-dbg/blob/main/LICENSE)
 
 
 
 ## 9. Contacts
 
+* [Arya Kaul](https://arya.casa) \<arya_kaul@g.harvard.edu\>
 * [Karel Brinda](http://karel-brinda.github.io) \<karel.brinda@inria.fr\>
-* [Leandro Lima](https://github.com/leoisl) \<leandro@ebi.ac.uk\>
+
+
+## 10. Acknowledgements
+
+Structure and format for this pipeline, documentation, and some code was heavily inspired 
+and modeled after [Miniphy](https://github.com/karel-brinda/Miniphy)! Check it out!
