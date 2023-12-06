@@ -19,9 +19,11 @@ use_conda:            True # build conda environments automatically by Snakemake
 #     - kmer length defines k for dBGs 
 #     - if trees_required is true, then the workflow will insist on user-provided trees
 #     - max_colors is the number of hexadecimal color codes to include in the dbg
+#     - tmp_dir is the path to a temp directory on your system.  
 kmer_length:          31
 trees_required:       True
 max_colors:           70
+tmp_dir:              /n/scratch3/users/a/ak586
   
 
 # (2) Mashtree parameters; notes:

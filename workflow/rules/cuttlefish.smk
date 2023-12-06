@@ -8,17 +8,18 @@ rule run_cuttlefish:
         "../envs/cuttlefish.yml"
     params:
         k=config["kmer_length"],
-        temp=f"{dir_intermediate()}" + "/{batch}_cuttlefish/tmp",
+        temp=f"{config['tmp_dir']}" + "/{batch}_cuttlefish",
     shell:
         """
         ulimit -n 2048
-        mkdir -p {params.temp}
         OUTPUTDIR=$(dirname {output.gfa})
+        mkdir -p {params.temp}
         mkdir -p $OUTPUTDIR
         cuttlefish build \
                 -l {input} \
                 -k {params.k} \
                 -f 1 \
+                --unrestrict-memory \
                 -w {params.temp} \
                 -o $(dirname {output.gfa})/$(basename {output.gfa} .gfa1)
         rm -r {params.temp}

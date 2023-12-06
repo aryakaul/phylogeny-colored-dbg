@@ -81,7 +81,7 @@ def get_batches():
 
 
 def fn_cuttlefish_out(_batch, _ext):
-    return f"{dir_intermediate()}/cuttlefish/{_batch}_compcoloreddbg_k{config['kmer_length']}.{_ext}"
+    return f"{dir_intermediate()}/cuttlefish/{_batch}/{_batch}_compcoloreddbg_k{config['kmer_length']}.{_ext}"
 
 
 def fn_colormtx(_batch):
