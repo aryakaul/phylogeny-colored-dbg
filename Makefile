@@ -1,4 +1,4 @@
-.PHONY: all help clean cleanall cleanallall test reports format edit conda viewconf
+.PHONY: all help clean cleanall cleanallall test reports format edit conda viewconf cluster
 
 SHELL=/usr/bin/env bash -eo pipefail
 
@@ -45,6 +45,9 @@ endif
 
 all: ## Run everything
 	snakemake -j $(CONDA_PARAMS) -p --rerun-incomplete $(SNAKEMAKE_PARAM_DIR)
+
+cluster: ## Run everything on the cluster
+	snakemake --cores 9999 -j $(CONDA_PARAMS) -p --rerun-incomplete --latency-wait 60 --restart-times 0 --cluster 'sbatch -c 1 -p short --mem=40GB -t 0-00:10:00'
 
 help: ## Print help messages
 	@printf "$$(grep -hE '^\S*(:.*)?##' $(MAKEFILE_LIST) \
