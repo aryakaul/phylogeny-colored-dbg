@@ -30,6 +30,7 @@ given a phylogeny of the user-provided samples.
 * [7. Changelog](#7-changelog)
 * [8. License](#8-license)
 * [9. Contacts](#9-contacts)
+* [10. Acknowledgements](#10-acknowledgements)
 
 <!-- vim-markdown-toc -->
 
