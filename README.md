@@ -5,7 +5,7 @@ Workflow for building phylogeny-colored de Bruijn graphs (pcDBGs)
 from microbial genomes.
 
 pcDBG first generates the classical compacted colored-de Bruijn graph with
-cuttlefishv1 and then calculates the parsimonious explanation of each unitig
+`Cuttlefish` and then calculates the parsimonious explanation of each unitig
 given a phylogeny of the user-provided samples.
 
 <!--For more information, see the <a href="LOLSOON">associated paper</a>.-->
@@ -25,8 +25,6 @@ given a phylogeny of the user-provided samples.
 * [4. Usage](#4-usage)
     * [4a. Basic example](#4a-basic-example)
     * [4b. Adjusting configuration](#4b-adjusting-configuration)
-    * [4c. List of workflow commands](#4d-list-of-workflow-commands)
-    * [4d. Troubleshooting](#4e-troubleshooting)
 * [5. Citation](#5-citation)
 * [6. Issues](#6-issues)
 * [7. Changelog](#7-changelog)
@@ -63,7 +61,8 @@ Snakemake when they are requested. The specifications of individual environments
 and they contain:
 - [ETE 3](http://etetoolkit.org/),
 - [Pandas](https://pandas.pydata.org/),
-- [Mashtree](https://github.com/lskatz/mashtree),
+- [Cuttlefish](https://github.com/COMBINE-lab/cuttlefish),
+- [BubbleGun](https://github.com/fawaz-dabbaghieh/bubble_gun),
 
 
 All dependencies across all protocols can also be
