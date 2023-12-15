@@ -14,7 +14,7 @@ given a phylogeny of the user-provided samples.
 <!--[![Paper DOI](ZENODOLINK)](DOI4PAPER)-->
 <!--[![MOF-Compress test](https://github.com/karel-brinda/mof-compress/actions/workflows/main.yaml/badge.svg)](https://github.com/karel-brinda/mof-compress/actions/)-->
 [![GitHub release](https://img.shields.io/github/release/aryakaul/phylogeny-colored-dbg.svg)](https://github.com/aryakaul/phylogeny-colored-dbg/releases/)
-
+[![Tests](https://github.com/aryakaul/phylogeny-colored-dbg/actions/workflows/main.yaml/badge.svg)](https://github.com/aryakaul/phylogeny-colored-dbg/actions/workflows/main.yaml)
 <h2>Contents</h2>
 
 <!-- vim-markdown-toc GFM -->
