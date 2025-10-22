@@ -24,6 +24,7 @@ kmer_length:          31
 trees_required:       True
 max_colors:           70
 tmp_dir:              /n/scratch/users/a/ak586
+produce_colored_deletions: True
   
 
 # (2) Mashtree parameters; notes:
