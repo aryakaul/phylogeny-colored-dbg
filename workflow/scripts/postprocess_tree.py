@@ -1,11 +1,11 @@
 #! /usr/bin/env python3
 
 import argparse
-import collections
-import ete3
 import os
 import re
 import sys
+
+import ete4
 
 sys.setrecursionlimit(500000)
 
@@ -46,14 +46,19 @@ def load_and_process_tree(
     ladderize,
     name_internals,
 ):
-    t = ete3.Tree(in_tree_fn, format=1)
+    with open(in_tree_fn, "r") as handle:
+        t = ete4.Tree(handle, parser=1)
 
     if standardize:
         info("Standardizing the tree")
         t.standardize()
     if midpoint_outgroup:
         info("Setting a midpoint outgroup")
-        R = t.get_midpoint_outgroup()
+        try:
+            R = t.get_midpoint_outgroup()
+        except TypeError:
+            # Fallback for trees lacking branch lengths under ETE4.
+            R = t.get_midpoint_outgroup(topological=True)
         t.set_outgroup(R)
     if ladderize:
         info("Ladderizing")
@@ -86,7 +91,14 @@ def run(in_tree_fn, out_tree_fn, standardize, midpoint_outgroup,
         ladderize=ladderize,
         name_internals=name_internals,
     )
-    t.write(outfile=out_tree_fn, format=3)
+    missing_dist = False
+    for node in t.traverse():
+        if node.dist is None:
+            node.dist = 0.0
+            missing_dist = True
+    if missing_dist:
+        info("Assigned zero-length branches to nodes missing distance metadata")
+    t.write(outfile=out_tree_fn, parser=3)
     if leaves_fn:
         print_nodes(t, leaves_fn, only_leaves=True)
     if nodes_fn:
