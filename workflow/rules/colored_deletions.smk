@@ -1,3 +1,9 @@
+from pathlib import Path
+
+
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+
+
 rule find_colored_deletions:
     output:
         deletionbubbles=fn_deletionbubbles(_batch="{batch}"),
@@ -5,7 +11,7 @@ rule find_colored_deletions:
         bubblejson=fn_bubblejson(_batch="{batch}"),
         sql=fn_sqldb(_batch="{batch}"),
     params:
-        script=snakemake.workflow.srcdir("../scripts/find_colored_deletions"),
+        script=str(SCRIPTS_DIR / "find_colored_deletions"),
         predeletionsize=1000,
         postdeletionsize=100,
         maxpaths=100000,
@@ -22,7 +28,7 @@ rule find_colored_deletions:
             --maxpaths {params.maxpaths} \\
             -to {params.timeout} \\
             --predeletionsize {params.predeletionsize} \\
-            --postdeletionsize {params.postdeletionsize} \\
+            --postdeletionsize {params.postdeletionsize}
         """
 
 
@@ -33,7 +39,7 @@ checkpoint find_paths_for_deletions:
         sql=fn_sqldb(_batch="{batch}"),
         deletionbubbles=fn_deletionbubbles(_batch="{batch}"),
     params:
-        script=snakemake.workflow.srcdir("../scripts/paths_to_seqs"),
+        script=str(SCRIPTS_DIR / "paths_to_seqs"),
         kmer_length=config["kmer_length"],
     conda:
         "../envs/pandas.yml"
