@@ -165,7 +165,11 @@ def index_colors(
             parts = raw.rstrip().split("\t", maxsplit=1)
             if not parts:
                 continue
-            unitig_id = parts[0]
+            raw_id = parts[0]
+            if raw_id and raw_id[-1] in "+-":
+                unitig_id = raw_id[:-1]
+            else:
+                unitig_id = raw_id
             colors = parts[1] if len(parts) > 1 else "None"
             color_rows.append((unitig_id, colors))
             if len(color_rows) >= batch_size:
