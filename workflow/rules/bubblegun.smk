@@ -8,10 +8,10 @@ rule run_bubblegun:
         "../envs/bubblegun.yml"
     shell:
         """
-        mkdir -p $(dirname {output})
+        mkdir -p $(dirname {output.bubblejson})
         BubbleGun \\
             -g {input.gfa} \\
             --log_file {output.bubblelog} \\
             bchains \\
-            --bubble_json {output.bubblejson} \\
+            --bubble_json {output.bubblejson}
         """

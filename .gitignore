@@ -1,3 +1,7 @@
 .snakemake/
 .idea
 slurm-*
+AGENT*.md
+AGENTS.md
+.test/.conda/
+.test/.snakemake/

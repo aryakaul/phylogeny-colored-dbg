@@ -35,7 +35,7 @@ endif
 CONDA_DIR_ADJ = $(TOPDIR)/$(CONDA_DIR)
 
 ifeq ($(strip $(USE_CONDA)),True)
-	CONDA_PARAMS  =	--use-conda --conda-prefix="$(CONDA_DIR_ADJ)"
+	CONDA_PARAMS  =	8 --use-conda --conda-prefix="$(CONDA_DIR_ADJ)"
 endif
 
 
@@ -99,10 +99,10 @@ reports: ## Create html report
 ####################
 
 test: ## Run the workflow on test data
-	#snakemake -d .test -j $(CONDA_PARAMS) -p --show-failed-logs --rerun-incomplete
-	@if [ -d ".test" ]; then \
-		$(MAKE) -C .test; \
-	fi
+	snakemake -d .test -j $(CONDA_PARAMS) -p --show-failed-logs --rerun-incomplete
+	#@if [ -d ".test" ]; then \
+		#$(MAKE) -C .test; \
+	#fi
 
 format: ## Reformat all source code
 	snakefmt workflow
