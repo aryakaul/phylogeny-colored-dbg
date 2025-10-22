@@ -218,6 +218,8 @@ def process_chunk(tree, chunk_data, all_leaf_coloring):
             # Store a tuple with the set number, the chosen color for the set, and the color mapping
             colors_info.append((num, root_decision, optimal_colors))
 
+        print(colors_info)
+
         end_time = time.time()
         elapsed_time = end_time - start_time
 
@@ -433,6 +435,7 @@ def main():
         logger.info("Outputting all node coloring to to {}", args.colors)
         with open(args.colors, "w") as out_colors:
             for color in colors:
+                print(color)
                 colordict = color[2]
                 if isinstance(colordict, tuple):
                     if args.all_solutions:
