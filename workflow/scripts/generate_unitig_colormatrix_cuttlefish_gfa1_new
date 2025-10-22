@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+
+import pandas as pd
+import sys
+from loguru import logger
+from scipy.sparse import dok_matrix
+from collections import defaultdict
+
+gfa1 = sys.argv[1]
+fof = sys.argv[2]
+output = sys.argv[3]
+
+# Function to read file line by line
+def read_file_line_by_line(filename):
+    with open(filename, "r") as file:
+        for line in file:
+            yield line.strip()
+
+# Read file of files using generator
+idx_to_filepath = {index: line for index, line in enumerate(read_file_line_by_line(fof))}
+logger.debug("Read in {} files", len(idx_to_filepath))
+
+# Initialize a dictionary using defaultdict
+sample_to_unitigs = defaultdict(set)
+
+# Read GFA file and gather unitigs for each sample
+for line in read_file_line_by_line(gfa1):
+    parts = line.split()
+    if parts[0] == "P":
+        ref_seq_idx = parts[1].split("_")[0].split(":")[1]
+        ref_seq = idx_to_filepath[int(ref_seq_idx) - 1]
+        unitigs = set(parts[2].replace("+", "").replace("-", "").split(","))
+        sample_to_unitigs[ref_seq].update(unitigs)
+
+logger.debug("Read in unitigs")
+
+# Create a sparse DataFrame (using Dictionary of Keys matrix)
+unitig_set = {u for unitigs in sample_to_unitigs.values() for u in unitigs}
+row_idx = {u: i for i, u in enumerate(unitig_set)}
+num_rows = len(unitig_set)
+num_cols = len(idx_to_filepath)
+
+sparse_df = dok_matrix((num_rows, num_cols), dtype=int)
+
+for col_idx, (sample, unitigs) in enumerate(sample_to_unitigs.items()):
+    rows = [row_idx[u] for u in unitigs]
+    sparse_df[rows, col_idx] = 1
+
+logger.debug("Created sparse unitig matrix")
+
+# Convert to DataFrame and output
+df = pd.DataFrame.sparse.from_spmatrix(sparse_df, index=unitig_set, columns=idx_to_filepath.values())
+df.to_csv(output, sep="\t")
+
+logger.debug("Outputted to {}", output)
+
