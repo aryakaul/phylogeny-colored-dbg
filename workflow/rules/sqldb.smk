@@ -1,3 +1,9 @@
+from pathlib import Path
+
+
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+
+
 rule build_sqldb:
     output:
         sqldb=fn_sqldb(_batch="{batch}"),
@@ -7,7 +13,7 @@ rule build_sqldb:
     conda:
         "../envs/pandas.yml"
     params:
-        script=snakemake.workflow.srcdir("../scripts/gfa_to_sql"),
+        script=str(SCRIPTS_DIR / "gfa_to_sql"),
     shell:
         """
         mkdir -p $(dirname {output})

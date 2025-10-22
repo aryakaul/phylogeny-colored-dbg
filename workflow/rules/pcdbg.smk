@@ -1,3 +1,9 @@
+from pathlib import Path
+
+
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+
+
 rule add_colorinfo_to_gfa:
     input:
         sqldb=fn_sqldb(_batch="{batch}"),
@@ -6,7 +12,7 @@ rule add_colorinfo_to_gfa:
     output:
         pcdbg=fn_pcdbg(_batch="{batch}"),
     params:
-        script=snakemake.workflow.srcdir("../scripts/add_coloredgfatag_cuttlefish-gfa1"),
+        script=str(SCRIPTS_DIR / "add_coloredgfatag_cuttlefish-gfa1"),
         maxcolors=70,
     conda:
         "../envs/pandas.yml"

@@ -145,7 +145,7 @@ rule minimal_cuts_percolorset:
         plotdir=main_dir("minimal_cuts_output/plots"),
         chunksize=5000,
     conda:
-        "./envs/ete3.yml"
+        "./envs/ete4.yml"
     resources:
         partition="medium",
         time="2-00:00",
@@ -364,7 +364,7 @@ rule weight_phylogeny_by_cuts:
     output:
         weighted_tree=main_dir("trees/weighted_phylogeny.nwk"),
     conda:
-        "./envs/ete3.yml"
+        "./envs/ete4.yml"
     resources:
         time="0-03:00",
         mem_gb=30,

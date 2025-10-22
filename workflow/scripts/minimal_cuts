@@ -2,8 +2,8 @@
 
 import json
 import argparse
-from ete3 import Tree
-import ete3
+from ete4 import Tree
+import ete4
 import os
 import sys
 from loguru import logger
@@ -17,7 +17,7 @@ import multiprocessing
 def compute_costs(node, target_leaves, all_leaf_coloring=False):
     logger.debug("Processing node: {}", node.name)
 
-    if node.is_leaf():
+    if node.is_leaf:
         logger.debug("Node {} is a leaf", node.name)
 
         if node.name in target_leaves:
@@ -146,7 +146,7 @@ def autocomplete_internal_node_names(tree, newtreefile):
 
     renamed_nodes = False
     for n in tree.traverse("postorder"):
-        if len(n.children) == 0:
+        if n.is_leaf:
             assert hasattr(n, "name")
         else:
             for x in n.children:
@@ -168,7 +168,7 @@ def autocomplete_internal_node_names(tree, newtreefile):
     if renamed_nodes:
         logger.info("Renamed internal nodes! Outputting new tree to {}",
                     newtreefile)
-        tree.write(format=1, outfile=newtreefile)
+        tree.write(parser=1, outfile=newtreefile)
     return tree
 
 
@@ -218,6 +218,8 @@ def process_chunk(tree, chunk_data, all_leaf_coloring):
             # Store a tuple with the set number, the chosen color for the set, and the color mapping
             colors_info.append((num, root_decision, optimal_colors))
 
+        print(colors_info)
+
         end_time = time.time()
         elapsed_time = end_time - start_time
 
@@ -265,7 +267,7 @@ def plot_tree_and_colors(tree, color_dict, output):
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     logger.debug("Saving tree to {}", output)
 
-    ts = ete3.TreeStyle()
+    ts = ete4.TreeStyle()
 
     def label_nodes(node, color_dict):
         # Set default color to black
@@ -283,18 +285,18 @@ def plot_tree_and_colors(tree, color_dict, output):
         node.img_style["hz_line_color"] = node_color
         node.img_style["vt_line_color"] = node_color
 
-        if node.is_leaf():
+        if node.is_leaf:
             if hasattr(node, "color_face"):
                 # Update the existing face's color
                 node.color_face.bgcolor = node_color
                 node.color_face.fgcolor = node_color
             else:
-                name_face = ete3.faces.TextFace(node.name,
+                name_face = ete4.faces.TextFace(node.name,
                                                 tight_text=False,
                                                 fsize=10)
                 node.add_face(name_face, column=0, position="aligned")
                 # Create a new face if it doesn't exist
-                rect_face = ete3.faces.RectFace(width=10,
+                rect_face = ete4.faces.RectFace(width=10,
                                                 height=10,
                                                 fgcolor=node_color,
                                                 bgcolor=node_color)
@@ -368,7 +370,7 @@ def main():
         dest="plot",
         type=str,
         default=None,
-        help="Plot solutions using ete3 and save plots to specified directory.",
+        help="Plot solutions using ete4 and save plots to specified directory.",
     )
     parser.add_argument(
         "-j",
@@ -405,7 +407,8 @@ def main():
         logger.remove()
         logger.add(sys.stderr, level="DEBUG")
 
-    tree = Tree(args.tree_file, format=1)
+    with open(args.tree_file, "r") as handle:
+        tree = Tree(handle, parser=1)
     # tree = autocomplete_internal_node_names(tree, args.tree)
 
     # all_target_leaves = read_target_leaves(args.leaves_file)
@@ -432,6 +435,7 @@ def main():
         logger.info("Outputting all node coloring to to {}", args.colors)
         with open(args.colors, "w") as out_colors:
             for color in colors:
+                print(color)
                 colordict = color[2]
                 if isinstance(colordict, tuple):
                     if args.all_solutions:

@@ -35,7 +35,7 @@ endif
 CONDA_DIR_ADJ = $(TOPDIR)/$(CONDA_DIR)
 
 ifeq ($(strip $(USE_CONDA)),True)
-	CONDA_PARAMS  =	--use-conda --conda-prefix="$(CONDA_DIR_ADJ)"
+	CONDA_PARAMS  =	8 --use-conda --conda-prefix="$(CONDA_DIR_ADJ)"
 endif
 
 
@@ -47,7 +47,7 @@ all: ## Run everything
 	snakemake -j $(CONDA_PARAMS) -p --rerun-incomplete $(SNAKEMAKE_PARAM_DIR)
 
 cluster: ## Run everything on the cluster
-	snakemake --cores 9999 -j $(CONDA_PARAMS) -p --rerun-incomplete --latency-wait 60 --restart-times 0 --cluster 'sbatch -c 1 -p short --mem=40GB -t 0-01:50:00'
+	snakemake --cores 9999 -j $(CONDA_PARAMS) -p --rerun-incomplete --latency-wait 60 --restart-times 0 --cluster 'sbatch -c 1 -p short --mem=30GB -t 0-10:00:00'
 
 help: ## Print help messages
 	@printf "$$(grep -hE '^\S*(:.*)?##' $(MAKEFILE_LIST) \
@@ -99,10 +99,10 @@ reports: ## Create html report
 ####################
 
 test: ## Run the workflow on test data
-	#snakemake -d .test -j $(CONDA_PARAMS) -p --show-failed-logs --rerun-incomplete
-	@if [ -d ".test" ]; then \
-		$(MAKE) -C .test; \
-	fi
+	snakemake -d .test -j $(CONDA_PARAMS) -p --show-failed-logs --rerun-incomplete
+	#@if [ -d ".test" ]; then \
+		#$(MAKE) -C .test; \
+	#fi
 
 format: ## Reformat all source code
 	snakefmt workflow

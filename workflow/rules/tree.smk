@@ -2,6 +2,10 @@
 ## Tree inference
 ##
 import os.path
+from pathlib import Path
+
+
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 
 
 rule tree_postprocessing:
@@ -15,9 +19,9 @@ rule tree_postprocessing:
     input:
         nwk=fn_tree_dirty(_batch="{batch}"),
     params:
-        script=snakemake.workflow.srcdir("../scripts/postprocess_tree.py"),
+        script=str(SCRIPTS_DIR / "postprocess_tree.py"),
     conda:
-        "../envs/ete3.yml"
+        "../envs/ete4.yml"
     shell:
         """
         {params.script} \\

@@ -1,3 +1,9 @@
+from pathlib import Path
+
+
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+
+
 rule minimal_cuts_percolorset:
     output:
         cuts=fn_minimalcuts(_batch="{batch}"),
@@ -5,11 +11,11 @@ rule minimal_cuts_percolorset:
         tree=fn_tree_sorted(_batch="{batch}"),
         uqcolors=fn_uqcolors(_batch="{batch}"),
     params:
-        script=snakemake.workflow.srcdir("../scripts/minimal_cuts"),
+        script=str(SCRIPTS_DIR / "minimal_cuts"),
         plotdir=fn_minimalcuts_plotdir(_batch="{batch}"),
         chunksize=5000,
     conda:
-        "../envs/ete3.yml"
+        "../envs/ete4.yml"
     shell:
         """
         mkdir -p $(dirname {output})
@@ -30,7 +36,7 @@ rule decompose_redundant_colors:
         cuts=fn_minimalcuts(_batch="{batch}"),
         redundantcolors=fn_redundantcolors(_batch="{batch}"),
     params:
-        script=snakemake.workflow.srcdir("../scripts/map_unitigs-to-cuts"),
+        script=str(SCRIPTS_DIR / "map_unitigs-to-cuts"),
     conda:
         "../envs/pandas.yml"
     shell:

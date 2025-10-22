@@ -1,3 +1,9 @@
+from pathlib import Path
+
+
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+
+
 rule run_cuttlefish:
     output:
         gfa=fn_cuttlefish_out(_batch="{batch}", _ext="gfa1"),
@@ -8,7 +14,7 @@ rule run_cuttlefish:
         "../envs/cuttlefish.yml"
     params:
         k=config["kmer_length"],
-        temp=f"{config['tmp_dir']}" + "/{batch}_cuttlefish",
+        temp=f"{config.get('tmp_dir', 'tmp')}" + "/{batch}_cuttlefish",
     shell:
         """
         ulimit -n 2048
@@ -33,9 +39,7 @@ rule unitig_sample_matrix_gfa1:
         gfa=fn_cuttlefish_out(_batch="{batch}", _ext="gfa1"),
         fof=f"{dir_input()}" + "/{batch}.txt",
     params:
-        script=snakemake.workflow.srcdir(
-            "../scripts/generate_unitig_colormatrix_cuttlefish_gfa1"
-        ),
+        script=str(SCRIPTS_DIR / "generate_unitig_colormatrix_cuttlefish_gfa1"),
     conda:
         "../envs/pandas.yml"
     shell:
@@ -54,7 +58,7 @@ rule mergeredundantcolors:
     input:
         binarymatrix=fn_colormtx(_batch="{batch}"),
     params:
-        script=snakemake.workflow.srcdir("../scripts/uqcolorvectors_from_mtx"),
+        script=str(SCRIPTS_DIR / "uqcolorvectors_from_mtx"),
     conda:
         "../envs/pandas.yml"
     shell:
