@@ -1,223 +1,264 @@
 #!/usr/bin/env python3
+"""Create the pcDBG SQLite cache from a cuttlefish GFA and minimal-cut output."""
 
-import sqlite3
-from functools import lru_cache, partial
+from __future__ import annotations
+
 import argparse
-from loguru import logger
+import sqlite3
 import sys
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
+from loguru import logger
+
+BULK_INSERT_BATCH = 50_000
 
 
-def create_unitig_database():
+def create_unitig_database() -> sqlite3.Connection:
+    """Initialise the in-memory SQLite schema used throughout the workflow."""
+
     conn = sqlite3.connect(":memory:")
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE unitigs (
+    conn.execute("PRAGMA journal_mode=OFF;")
+    conn.execute("PRAGMA synchronous=OFF;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS unitigs (
             unitig_id TEXT PRIMARY KEY,
             length INTEGER,
             colors TEXT,
             sequence TEXT
-        )
-    """)
+        );
 
-    cur.execute("""
-        CREATE TABLE adjacency (
-            unitig_id TEXT,
-            unitig_direction TEXT,
-            neighbor_id TEXT,
-            neighbor_direction TEXT,
+        CREATE TABLE IF NOT EXISTS adjacency (
+            unitig_id TEXT NOT NULL,
+            unitig_direction TEXT NOT NULL,
+            neighbor_id TEXT NOT NULL,
+            neighbor_direction TEXT NOT NULL,
             PRIMARY KEY (unitig_id, unitig_direction, neighbor_id, neighbor_direction),
             FOREIGN KEY(unitig_id) REFERENCES unitigs(unitig_id)
-        )
-    """)
-
-    conn.commit()
+        );
+        """
+    )
     return conn
 
 
-def insert_unitig_length(conn, unitig_id, length):
-    """
-    Inserts or updates the length of a unitig.
-    """
-    cur = conn.cursor()
-    cur.execute(
+def _flush_unitigs(
+    conn: sqlite3.Connection, rows: List[Tuple[str, int, str]]
+) -> None:
+    if not rows:
+        return
+    conn.executemany(
         """
-        INSERT INTO unitigs (unitig_id, length) VALUES (?, ?)
-        ON CONFLICT(unitig_id) DO UPDATE SET length=excluded.length
-    """,
-        (unitig_id, length),
-    )
-    conn.commit()
-
-
-def insert_unitig_sequence(conn, unitig_id, sequence):
-    """
-    Inserts or updates the sequence of a unitig.
-    """
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO unitigs (unitig_id, sequence) VALUES (?, ?)
-        ON CONFLICT(unitig_id) DO UPDATE SET sequence=excluded.sequence
+        INSERT INTO unitigs (unitig_id, length, sequence)
+        VALUES (?, ?, ?)
+        ON CONFLICT(unitig_id) DO UPDATE SET
+            length=excluded.length,
+            sequence=excluded.sequence
         """,
-        (unitig_id, sequence),
+        rows,
     )
-    conn.commit()
 
 
-def insert_unitig_colors(conn, unitig_id, colors):
-    """
-    Inserts or updates the colors of a unitig.
-    """
-    cur = conn.cursor()
-    cur.execute(
+def _flush_colors(conn: sqlite3.Connection, rows: List[Tuple[str, str]]) -> None:
+    if not rows:
+        return
+    conn.executemany(
         """
-        INSERT INTO unitigs (unitig_id, colors) VALUES (?, ?)
-        ON CONFLICT(unitig_id) DO UPDATE SET colors=excluded.colors
-    """,
-        (unitig_id, colors),
+        INSERT INTO unitigs (unitig_id, colors)
+        VALUES (?, ?)
+        ON CONFLICT(unitig_id) DO UPDATE SET
+            colors=excluded.colors
+        """,
+        rows,
     )
-    conn.commit()
 
 
-def insert_adjacency(conn, unitig_id, unitig_dir, neighbor_id, neighbor_dir):
-    cur = conn.cursor()
-    cur.execute(
+def _flush_adjacency(
+    conn: sqlite3.Connection, rows: List[Tuple[str, str, str, str]]
+) -> None:
+    if not rows:
+        return
+    conn.executemany(
         """
-        INSERT INTO adjacency (unitig_id, unitig_direction, neighbor_id, neighbor_direction)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(unitig_id, unitig_direction, neighbor_id, neighbor_direction) DO NOTHING
-    """,
-        (unitig_id, unitig_dir, neighbor_id, neighbor_dir),
+        INSERT INTO adjacency (
+            unitig_id,
+            unitig_direction,
+            neighbor_id,
+            neighbor_direction
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(unitig_id, unitig_direction, neighbor_id, neighbor_direction)
+        DO NOTHING
+        """,
+        rows,
+    )
+
+
+def _parse_segment_length(fields: Sequence[str]) -> int:
+    for field in fields:
+        if field.startswith("LN:"):
+            try:
+                return int(field.split(":", maxsplit=2)[-1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid length tag '{field}'") from exc
+    raise ValueError("Segment record missing LN tag")
+
+
+def index_gfa(
+    gfa_path: Path,
+    conn: sqlite3.Connection,
+    batch_size: int = BULK_INSERT_BATCH,
+) -> None:
+    """Populate ``unitigs`` and ``adjacency`` tables from a GFA1 graph."""
+
+    unitig_rows: List[Tuple[str, int, str]] = []
+    adjacency_rows: List[Tuple[str, str, str, str]] = []
+    logger.info("Processing GFA file {}", gfa_path)
+
+    line_number = 0
+    with gfa_path.open("r") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            if not raw or raw.startswith("#"):
+                continue
+            parts = raw.rstrip().split()
+            record_type = parts[0]
+
+            if record_type == "S":  # segment
+                unitig_id = parts[1]
+                sequence = parts[2]
+                length = _parse_segment_length(parts[3:])
+                unitig_rows.append((unitig_id, length, sequence))
+                if len(unitig_rows) >= batch_size:
+                    _flush_unitigs(conn, unitig_rows)
+                    unitig_rows.clear()
+
+            elif record_type == "L":  # link
+                adjacency_rows.append(
+                    (parts[1], parts[2], parts[3], parts[4])
+                )
+                if len(adjacency_rows) >= batch_size:
+                    _flush_adjacency(conn, adjacency_rows)
+                    adjacency_rows.clear()
+
+            if line_number % 1_000_000 == 0:
+                logger.info("Processed {:,} GFA records", line_number)
+
+    _flush_unitigs(conn, unitig_rows)
+    _flush_adjacency(conn, adjacency_rows)
+    conn.commit()
+    logger.info("Finished indexing GFA ({} lines processed)", line_number)
+
+
+def index_colors(
+    unitig_to_cuts_path: Path,
+    conn: sqlite3.Connection,
+    batch_size: int = BULK_INSERT_BATCH,
+) -> None:
+    """Populate ``colors`` column from the minimal cut assignments."""
+
+    color_rows: List[Tuple[str, str]] = []
+    logger.info("Processing minimal cut assignments {}", unitig_to_cuts_path)
+
+    line_number = 0
+    with unitig_to_cuts_path.open("r") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            parts = raw.rstrip().split("\t", maxsplit=1)
+            if not parts:
+                continue
+            unitig_id = parts[0]
+            colors = parts[1] if len(parts) > 1 else "None"
+            color_rows.append((unitig_id, colors))
+            if len(color_rows) >= batch_size:
+                _flush_colors(conn, color_rows)
+                color_rows.clear()
+
+            if line_number % 1_000_000 == 0:
+                logger.info("Processed {:,} minimal cut records", line_number)
+
+    _flush_colors(conn, color_rows)
+    conn.commit()
+    logger.info("Finished indexing minimal cuts ({} lines processed)", line_number)
+
+
+def create_indexes(conn: sqlite3.Connection) -> None:
+    """Add lookup indexes to accelerate downstream SQL queries."""
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_adjacency_unitig ON adjacency(unitig_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_adjacency_neighbor ON adjacency(neighbor_id)"
     )
     conn.commit()
 
 
-def index_gfa(file_path, unitigdb):
-    line_count = 0
-
-    logger.debug("Processing GFA file...")
-    with open(file_path, "r") as file:
-        for line in file:
-            line_count += 1
-            line = line.rstrip().split()
-
-            if line[0] == "S":
-                unitig_id = line[1]
-                unitig_length = int(line[3].split(":")[-1])
-                unitig_sequence = line[2]
-                insert_unitig_length(unitigdb, unitig_id, unitig_length)
-                insert_unitig_sequence(unitigdb, unitig_id, unitig_sequence)
-            elif line[0] == "L":
-                unitig_id = line[1]
-                unitig_dir = line[2]
-                neighbor_id = line[3]
-                neighbor_dir = line[4]
-                insert_adjacency(unitigdb, unitig_id, unitig_dir, neighbor_id,
-                                 neighbor_dir)
-
-            if line_count % 1000000 == 0:
-                logger.debug(f"Processed {line_count} lines.")
-
-    logger.debug(
-        f"Finished processing GFA. Total lines processed: {line_count}")
-
-
-def index_colors(file_path, unitigdb):
-    line_count = 0
-    logger.debug(f"Processing unitig_to_cuts file...")
-    with open(file_path, "r") as f:
-        for line in f:
-            line_count += 1
-            parts = line.strip().split()
-            unitig_id = parts[0].strip()
-            if len(parts) == 1:
-                color_sets = "None"
-            else:
-                color_sets = parts[1].strip()
-            insert_unitig_colors(unitigdb, unitig_id, color_sets)
-            if line_count % 1000000 == 0:
-                logger.debug(f"Processed {line_count} lines.")
-
-    logger.debug(f"Finished processing. Total lines processed: {line_count}")
-
-
-def create_indexes(conn):
-    cur = conn.cursor()
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS idx_unitig_id ON adjacency(unitig_id);")
-    cur.execute(
-        "CREATE INDEX IF NOT EXISTS idx_neighbor_id ON adjacency(neighbor_id);"
-    )
-    conn.commit()
-
-
-def main():
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read GFA file & smallparsimony to on-disk SQL db")
-
+        description="Materialise a pcDBG SQLite cache from GFA and minimal cuts."
+    )
     parser.add_argument(
         "-g",
         "--gfa",
-        type=str,
+        type=Path,
         required=True,
-        help="File path to the GFA file",
-        metavar="FILE",
+        help="Path to the cuttlefish GFA1 file.",
     )
-
     parser.add_argument(
         "-s",
         "--smallparsimony",
-        type=str,
+        type=Path,
         required=True,
-        help="The file path for the output of the smallparsimony script.",
-        metavar="FILE",
+        help="Path to the unitig-to-cut mapping produced by minimal_cuts.",
     )
-
     parser.add_argument(
         "-o",
         "--output",
-        type=str,
+        type=Path,
         required=True,
-        help="The file path for the outputted SQL db.",
-        metavar="FILE",
+        help="Destination SQLite database.",
     )
-
     parser.add_argument(
         "-v",
         "--verbose",
         action="count",
         default=0,
-        help=
-        "Increase verbosity level. Can be specified multiple times for more detailed logs.",
+        help="Increase logging verbosity (specify twice for DEBUG).",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=BULK_INSERT_BATCH,
+        help="Number of records to insert per bulk transaction (default: 50k).",
+    )
+    return parser.parse_args(argv)
 
-    args = parser.parse_args()
 
-    if args.verbose == 0:
+def configure_logging(verbosity: int) -> None:
+    if verbosity <= 0:
         logger.remove()
-    elif args.verbose == 1:
+    elif verbosity == 1:
         logger.remove()
         logger.add(sys.stderr, level="INFO")
-    elif args.verbose >= 2:
+    else:
         logger.remove()
         logger.add(sys.stderr, level="DEBUG")
 
-    logger.info("Generating SQL db for reading...")
-    unitigdb = create_unitig_database()
-    index_gfa(args.gfa, unitigdb)
-    index_colors(args.smallparsimony, unitigdb)
-    create_indexes(unitigdb)
-    logger.debug("Built & indexed SQL db")
 
-    # Copy data from memory to disk
-    logger.debug("Saving db to disk")
-    disk_db_conn = sqlite3.connect(args.output)
-    with disk_db_conn:
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    configure_logging(args.verbose)
+
+    logger.info("Creating pcDBG SQLite database at {}", args.output)
+    unitigdb = create_unitig_database()
+    index_gfa(args.gfa, unitigdb, batch_size=args.batch_size)
+    index_colors(args.smallparsimony, unitigdb, batch_size=args.batch_size)
+    create_indexes(unitigdb)
+
+    logger.info("Persisting in-memory database to disk")
+    with sqlite3.connect(args.output) as disk_db_conn:
         unitigdb.backup(disk_db_conn)
-    disk_db_conn.close()
     unitigdb.close()
-    logger.info(f"SQL db saved to {args.output}")
+    logger.info("SQLite database written to {}", args.output)
 
 
 if __name__ == "__main__":
