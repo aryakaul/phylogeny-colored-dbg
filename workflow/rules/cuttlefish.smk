@@ -34,7 +34,7 @@ rule unitig_sample_matrix_gfa1:
         fof=f"{dir_input()}" + "/{batch}.txt",
     params:
         script=snakemake.workflow.srcdir(
-            "../scripts/generate_unitig_colormatrix_cuttlefish_gfa1"
+            "../scripts/generate_unitig_colormatrix_cuttlefish_gfa1_new"
         ),
     conda:
         "../envs/pandas.yml"
