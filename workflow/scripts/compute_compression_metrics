@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Compute color compression metrics for pcDBG outputs."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from math import nan
+from pathlib import Path
+from typing import Set
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare unique color counts between the cuttlefish-colored DBG "
+            "and the phylogeny-colored pcDBG output."
+        )
+    )
+    parser.add_argument(
+        "--cuttlefish",
+        required=True,
+        type=Path,
+        help="Path to the unique color vectors generated from cuttlefish (TSV).",
+    )
+    parser.add_argument(
+        "--pcdbg",
+        required=True,
+        type=Path,
+        help="Path to the unitig-to-cuts mapping produced by pcDBG.",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="Destination TSV file for compression metrics.",
+    )
+    return parser.parse_args()
+
+
+def count_cuttlefish_unique(path: Path) -> int:
+    count = 0
+    with path.open("r") as handle:
+        for raw in handle:
+            if raw.strip():
+                count += 1
+    return count
+
+
+def _canonical_cutstring(raw: str) -> str:
+    primary = raw.split(" OR ")[0].strip()
+    if not primary:
+        return "None"
+    tokens = [token.strip() for token in primary.split(",") if token.strip()]
+    if not tokens:
+        return "None"
+    if len(tokens) == 1:
+        return tokens[0]
+    tokens.sort()
+    return ",".join(tokens)
+
+
+def count_pcdbg_unique(path: Path) -> int:
+    unique: Set[str] = set()
+    with path.open("r") as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            parts = raw.rstrip("\n").split("\t")
+            if len(parts) < 2:
+                continue
+            canonical = _canonical_cutstring(parts[1])
+            unique.add(canonical)
+    return len(unique)
+
+
+def write_metrics(output: Path, cuttlefish_count: int, pcdbg_count: int) -> None:
+    difference = cuttlefish_count - pcdbg_count
+    ratio = (
+        pcdbg_count / cuttlefish_count
+        if cuttlefish_count
+        else nan
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(
+            ("metric", "value", "description")
+        )
+        writer.writerow(
+            (
+                "cuttlefish_unique_colors",
+                cuttlefish_count,
+                "Distinct unitig presence/absence vectors from cuttlefish.",
+            )
+        )
+        writer.writerow(
+            (
+                "pcdbg_unique_colors",
+                pcdbg_count,
+                "Distinct internal-node color labels after pcDBG compression (first minimal solution).",
+            )
+        )
+        writer.writerow(
+            (
+                "absolute_difference",
+                difference,
+                "cuttlefish_unique_colors minus pcdbg_unique_colors; positive indicates lossy compression.",
+            )
+        )
+        writer.writerow(
+            (
+                "pcdbg_to_cuttlefish_ratio",
+                f"{ratio:.6f}" if cuttlefish_count else "NaN",
+                "Fraction of cuttlefish color sets preserved after pcDBG compression.",
+            )
+        )
+
+
+def main() -> None:
+    args = parse_args()
+    cuttlefish_count = count_cuttlefish_unique(args.cuttlefish)
+    pcdbg_count = count_pcdbg_unique(args.pcdbg)
+    write_metrics(args.output, cuttlefish_count, pcdbg_count)
+
+
+if __name__ == "__main__":
+    main()
