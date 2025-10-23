@@ -6,3 +6,4 @@ AGENT*
 .test/.snakemake/
 .test/intermediate/
 .test/output/
+.ipynb*
