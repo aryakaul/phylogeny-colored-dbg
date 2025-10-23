@@ -195,19 +195,28 @@ def fn_redundantcolors(batch: Optional[str] = None, _batch: Optional[str] = None
 
 def fn_minimalcuts(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_minimalcuts_k{KMER_LENGTH}")
+    label = parsimony_label()
+    return str(
+        _minimal_cuts_root(batch_id) /
+        f"{batch_id}_minimalcuts_{label}_k{KMER_LENGTH}")
 
 
 def fn_minimalcuts_plotdir(
     batch: Optional[str] = None, _batch: Optional[str] = None
 ) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_plots_k{KMER_LENGTH}")
+    label = parsimony_label()
+    return str(
+        _minimal_cuts_root(batch_id) /
+        f"{batch_id}_plots_{label}_k{KMER_LENGTH}")
 
 
 def fn_unitig2cuts(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_unitig2cuts_k{KMER_LENGTH}")
+    label = parsimony_label()
+    return str(
+        _minimal_cuts_root(batch_id) /
+        f"{batch_id}_unitig2cuts_{label}_k{KMER_LENGTH}")
 
 
 def fn_sqldb(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
