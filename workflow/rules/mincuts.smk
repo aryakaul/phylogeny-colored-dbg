@@ -14,10 +14,14 @@ rule minimal_cuts_percolorset:
         script=str(SCRIPTS_DIR / "minimal_cuts"),
         plotdir=fn_minimalcuts_plotdir(_batch="{batch}"),
         chunksize=5000,
+        mode=parsimony_mode(),
+        branch_penalty_flag=parsimony_branch_penalty_flag(),
     conda:
         "../envs/ete4.yml"
     shell:
         """
+
+        echo "{params.mode}"
         mkdir -p $(dirname {output})
         {params.script} \\
             {input.tree} \\
@@ -25,6 +29,8 @@ rule minimal_cuts_percolorset:
             -o {output} \\
             -v \\
             --all \\
+            --mode {params.mode} \\
+            {params.branch_penalty_flag} \\
             -cs {params.chunksize}
         """
 

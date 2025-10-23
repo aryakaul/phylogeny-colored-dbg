@@ -38,13 +38,20 @@ ifeq ($(strip $(USE_CONDA)),True)
 	CONDA_PARAMS  =	--use-conda --conda-prefix="$(CONDA_DIR_ADJ)"
 endif
 
+SNAKEMAKE_BASE_FLAGS = -p --rerun-incomplete \
+	--rerun-triggers mtime \
+	--rerun-triggers params \
+	--rerun-triggers input \
+	--rerun-triggers code \
+	$(SNAKEMAKE_PARAM_DIR)
+
 
 ######################
 ## General commands ##
 ######################
 
 all: ## Run everything
-	snakemake -j $(CONDA_PARAMS) -p --rerun-incomplete $(SNAKEMAKE_PARAM_DIR)
+	snakemake -j $(CONDA_PARAMS) $(SNAKEMAKE_BASE_FLAGS)
 
 help: ## Print help messages
 	@printf "$$(grep -hE '^\S*(:.*)?##' $(MAKEFILE_LIST) \
@@ -86,7 +93,7 @@ viewconf: ## View configuration without comments
 	@#| grep -Ev ^$$
 
 reports: ## Create html report
-	snakemake -j $(CONDA_PARAMS) -p --rerun-incomplete $(SNAKEMAKE_PARAM_DIR) --report report.html
+	snakemake -j $(CONDA_PARAMS) $(SNAKEMAKE_BASE_FLAGS) --report report.html
 	@if [ -d ".test" ]; then \
 		$(MAKE) -C .test reports; \
 	fi

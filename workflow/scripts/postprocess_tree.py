@@ -97,7 +97,8 @@ def run(in_tree_fn, out_tree_fn, standardize, midpoint_outgroup,
             node.dist = 0.0
             missing_dist = True
     if missing_dist:
-        info("Assigned zero-length branches to nodes missing distance metadata")
+        info(
+            "Assigned zero-length branches to nodes missing distance metadata")
     t.write(outfile=out_tree_fn, parser=3)
     if leaves_fn:
         print_nodes(t, leaves_fn, only_leaves=True)

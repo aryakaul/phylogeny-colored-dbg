@@ -144,6 +144,8 @@ rule minimal_cuts_percolorset:
     params:
         plotdir=main_dir("minimal_cuts_output/plots"),
         chunksize=5000,
+        mode="fitch",
+        branch_penalty_flag="",
     conda:
         "./envs/ete4.yml"
     resources:
@@ -161,6 +163,8 @@ rule minimal_cuts_percolorset:
                 -o {output} \
                 -v --all \
                 -j {threads} \
+                --mode {params.mode} \
+                {params.branch_penalty_flag} \
                 -cs {params.chunksize}
         """
 

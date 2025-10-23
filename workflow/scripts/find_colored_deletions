@@ -69,8 +69,8 @@ def read_bubbles(file_path: Path):
 
 
 def fetch_adjacency_data(
-    conn: sqlite3.Connection, allowed_unitigs: Sequence[str]
-) -> Dict[str, Dict[str, set]]:
+        conn: sqlite3.Connection,
+        allowed_unitigs: Sequence[str]) -> Dict[str, Dict[str, set]]:
     """Return adjacency information for a restricted set of unitigs."""
 
     allowed_set = {unitig for unitig in allowed_unitigs}
@@ -78,7 +78,11 @@ def fetch_adjacency_data(
         return {}
 
     adjacency_dict: Dict[str, Dict[str, set]] = {
-        unitig: {"+": set(), "-": set()} for unitig in allowed_set
+        unitig: {
+            "+": set(),
+            "-": set()
+        }
+        for unitig in allowed_set
     }
     metadata = lookup_unitigs_batch(conn, allowed_set, output_neighbors=True)
 
@@ -91,8 +95,7 @@ def fetch_adjacency_data(
             adjacency_dict[unitig_id][orientation].update(
                 (neighbor_id, neighbor_dir)
                 for neighbor_id, neighbor_dir in entries
-                if neighbor_id in allowed_set
-            )
+                if neighbor_id in allowed_set)
 
     return adjacency_dict
 
@@ -240,15 +243,12 @@ def process_one_bubble(
                             f"{source}{source_dir}",
                             f"{target}{target_dir}",
                             limits,
-                        )
-                    )
-                )
+                        )))
         if not limits.should_continue():
             break
 
-    logger.debug(
-        "Found {} potential paths for bubble {}", len(orientation_pairs), bubble["id"]
-    )
+    logger.debug("Found {} potential paths for bubble {}",
+                 len(orientation_pairs), bubble["id"])
     filtered_paths = filter_paths_by_criteria(
         unitigdb,
         orientation_pairs,
@@ -299,7 +299,8 @@ def filter_bubbles(
                 passing_bubbles.append(result)
     else:
         with multiprocessing.Pool(processes=threads) as pool:
-            for result in pool.imap_unordered(process_bubble_with_args, bubbles):
+            for result in pool.imap_unordered(process_bubble_with_args,
+                                              bubbles):
                 if result is not None:
                     passing_bubbles.append(result)
 

@@ -21,5 +21,5 @@ rule build_sqldb:
             -g {input.gfa} \\
             -s {input.unitigs_to_cuts} \\
             -o {output} \\
-            -vv
+            -v
         """

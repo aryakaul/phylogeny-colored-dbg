@@ -37,7 +37,12 @@ ifeq ($(filter True true,$(strip $(USE_CONDA))),True)
 endif
 
 SNAKEMAKE       ?= snakemake
-SNAKEMAKE_BASE_FLAGS := -p --rerun-incomplete $(SNAKEMAKE_PARAM_DIR) $(SNAKEMAKE_CONDA_FLAGS)
+SNAKEMAKE_BASE_FLAGS := -p --rerun-incomplete \
+	--rerun-triggers mtime \
+	--rerun-triggers params \
+	--rerun-triggers input \
+	--rerun-triggers code \
+	$(SNAKEMAKE_PARAM_DIR) $(SNAKEMAKE_CONDA_FLAGS)
 SNAKEMAKE_LOCAL_FLAGS := -j $(SNAKEMAKE_JOBS) $(SNAKEMAKE_BASE_FLAGS)
 SNAKEMAKE_CLUSTER_JOBS ?= $(SNAKEMAKE_JOBS)
 

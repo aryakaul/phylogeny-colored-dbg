@@ -21,8 +21,7 @@ def create_unitig_database() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=OFF;")
     conn.execute("PRAGMA synchronous=OFF;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS unitigs (
             unitig_id TEXT PRIMARY KEY,
             length INTEGER,
@@ -38,14 +37,12 @@ def create_unitig_database() -> sqlite3.Connection:
             PRIMARY KEY (unitig_id, unitig_direction, neighbor_id, neighbor_direction),
             FOREIGN KEY(unitig_id) REFERENCES unitigs(unitig_id)
         );
-        """
-    )
+        """)
     return conn
 
 
-def _flush_unitigs(
-    conn: sqlite3.Connection, rows: List[Tuple[str, int, str]]
-) -> None:
+def _flush_unitigs(conn: sqlite3.Connection, rows: List[Tuple[str, int,
+                                                              str]]) -> None:
     if not rows:
         return
     conn.executemany(
@@ -60,7 +57,8 @@ def _flush_unitigs(
     )
 
 
-def _flush_colors(conn: sqlite3.Connection, rows: List[Tuple[str, str]]) -> None:
+def _flush_colors(conn: sqlite3.Connection, rows: List[Tuple[str,
+                                                             str]]) -> None:
     if not rows:
         return
     conn.executemany(
@@ -74,9 +72,8 @@ def _flush_colors(conn: sqlite3.Connection, rows: List[Tuple[str, str]]) -> None
     )
 
 
-def _flush_adjacency(
-    conn: sqlite3.Connection, rows: List[Tuple[str, str, str, str]]
-) -> None:
+def _flush_adjacency(conn: sqlite3.Connection, rows: List[Tuple[str, str, str,
+                                                                str]]) -> None:
     if not rows:
         return
     conn.executemany(
@@ -133,9 +130,7 @@ def index_gfa(
                     unitig_rows.clear()
 
             elif record_type == "L":  # link
-                adjacency_rows.append(
-                    (parts[1], parts[2], parts[3], parts[4])
-                )
+                adjacency_rows.append((parts[1], parts[2], parts[3], parts[4]))
                 if len(adjacency_rows) >= batch_size:
                     _flush_adjacency(conn, adjacency_rows)
                     adjacency_rows.clear()
@@ -181,7 +176,8 @@ def index_colors(
 
     _flush_colors(conn, color_rows)
     conn.commit()
-    logger.info("Finished indexing minimal cuts ({} lines processed)", line_number)
+    logger.info("Finished indexing minimal cuts ({} lines processed)",
+                line_number)
 
 
 def create_indexes(conn: sqlite3.Connection) -> None:
@@ -198,8 +194,8 @@ def create_indexes(conn: sqlite3.Connection) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Materialise a pcDBG SQLite cache from GFA and minimal cuts."
-    )
+        description=
+        "Materialise a pcDBG SQLite cache from GFA and minimal cuts.")
     parser.add_argument(
         "-g",
         "--gfa",

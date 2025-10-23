@@ -56,9 +56,8 @@ def modify_gfa_with_colors(gfa_filename, sqldb, cut_colors, outpath):
                     parts = line.split()
                     segment_id = parts[1]
                     logger.debug(f"Parsing {segment_id}")
-                    unitig_meta = lookup_unitigs_batch(
-                        db, [segment_id], output_neighbors=False
-                    )
+                    unitig_meta = lookup_unitigs_batch(db, [segment_id],
+                                                       output_neighbors=False)
                     segment_info = unitig_meta.get(segment_id)
                     if not segment_info:
                         logger.warning(
