@@ -21,6 +21,7 @@ ALLOWED_FASTA_SUFFIXES = {"fa", "fasta", "fna", "ffa"}
 PARSIMONY_CONFIG = config.get("parsimony", {}) or {}
 PARSIMONY_MODE = PARSIMONY_CONFIG.get("mode", "fitch")
 SANKOFF_BRANCH_PENALTY = PARSIMONY_CONFIG.get("sankoff_branch_penalty")
+TREES_REQUIRED = bool(config.get("trees_required", True))
 
 
 def dir_input() -> Path:
@@ -96,7 +97,7 @@ def _load_batches() -> Dict[str, Dict[str, str]]:
     for manifest in manifests:
         batch = manifest.stem
         tree_path = INPUT_DIR / f"{batch}.nwk"
-        if not tree_path.exists():
+        if not tree_path.exists() and TREES_REQUIRED:
             raise FileNotFoundError(
                 f"Missing Newick tree for batch '{batch}'. Expected '{tree_path}'."
             )
@@ -248,6 +249,11 @@ def fn_tree_sorted(batch: Optional[str] = None, _batch: Optional[str] = None) ->
 def fn_tree_dirty(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
     return str(_tree_root() / f"{batch_id}.nwk_dirty")
+
+
+def fn_tree_distance(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_tree_root() / f"{batch_id}.distance.tsv")
 
 
 def fn_leaves_sorted(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
