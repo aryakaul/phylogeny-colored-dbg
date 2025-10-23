@@ -1,198 +1,224 @@
-# Phylogeny-Colored de Bruijn Graphs
+# Phylogeny-Colored de Bruijn Graphs
 
-<p>
-Workflow for building phylogeny-colored de Bruijn graphs (pcDBGs)
-from microbial genomes.
+Workflow for constructing phylogeny-colored compacted de Bruijn graphs (pcDBGs). 
+The pipeline couples classical colored DBG construction (via Cuttlefish) with 
+parsimony analysis on a provided phylogeny to recolor the DBG based on the 
+parsimonious presence/absence of individual unitigs.
 
-pcDBG first generates the classical compacted colored-de Bruijn graph with
-`Cuttlefish` and then calculates the parsimonious explanation of each unitig
-given a phylogeny of the user-provided samples.
+## Contents
 
-<!--For more information, see the <a href="LOLSOON">associated paper</a>.-->
-</p><br/>
+- [Overview](#overview)
+- [Key Features](#key-features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Preparing Inputs](#preparing-inputs)
+- [Configuration](#configuration)
+- [Running the Workflow](#running-the-workflow)
+- [Outputs](#outputs)
+- [Parsimony Modes](#parsimony-modes)
+- [Application Roadmap](#application-roadmap)
+- [Troubleshooting](#troubleshooting)
+- [Citation](#citation)
+- [Issues](#issues)
+- [Changelog](#changelog)
+- [License](#license)
+- [Contacts](#contacts)
+- [Acknowledgements](#acknowledgements)
 
-<!--[![Paper DOI](ZENODOLINK)](DOI4PAPER)-->
-<!--[![MOF-Compress test](https://github.com/karel-brinda/mof-compress/actions/workflows/main.yaml/badge.svg)](https://github.com/karel-brinda/mof-compress/actions/)-->
-[![GitHub release](https://img.shields.io/github/release/aryakaul/phylogeny-colored-dbg.svg)](https://github.com/aryakaul/phylogeny-colored-dbg/releases/)
-[![Tests](https://github.com/aryakaul/phylogeny-colored-dbg/actions/workflows/main.yaml/badge.svg)](https://github.com/aryakaul/phylogeny-colored-dbg/actions/workflows/main.yaml)
-<h2>Contents</h2>
+## Overview
 
-<!-- vim-markdown-toc GFM -->
+pcDBG accepts fasta sequences together with a matching Newick tree. For each 
+batch (fasta sequence pathlist & newick tree) the Snakemake workflow:
 
-* [1. Introduction](#1-introduction)
-* [2. Dependencies](#2-dependencies)
-* [3. Installation](#3-installation)
-* [4. Usage](#4-usage)
-    * [4a. Basic example](#4a-basic-example)
-    * [4b. Adjusting configuration](#4b-adjusting-configuration)
-* [5. Citation](#5-citation)
-* [6. Issues](#6-issues)
-* [7. Changelog](#7-changelog)
-* [8. License](#8-license)
-* [9. Contacts](#9-contacts)
-* [10. Acknowledgements](#10-acknowledgements)
+1. Builds a compacted colored DBG with Cuttlefish.
+2. Derives unitig presence/absence matrices and collapses redundant colour
+   vectors.
+3. Runs parsimony (Fitch by default, optional branch-length-weighted Sankoff)
+   across the supplied phylogeny to map unitigs onto internal nodes.
+4. Produces a phylogeny-coloured GFA, compression metrics comparing the 
+   original Cuttlefish colours with the lossy pcDBG coloring, and optionally
+   more!
 
-<!-- vim-markdown-toc -->
+## Key Features
 
+- Snakemake-driven, reproducible DAG with documented Makefile entry points.
+- Supports both Fitch and Sankoff parsimony models, with Sankoff penalties
+  configurable via `config.yaml`.
+- Generates minimal-cut decompositions and SQLite annotations for graph
+  post-processing.
+- Emits compression diagnostics
+  (`intermediate/metrics/*_compression_<mode>_k<k>.tsv`) summarising colour
+  reduction relative to Cuttlefish.
+- Optional BubbleGun analysis for (super)bubbles and colored bubble calls.
 
-## 1. Introduction
+## Requirements
 
-The user provides files of files for individual batches in the `input/` directory and specifies the requested k-mer length in the
-[configuration file](config.yaml). By running `make`, the pipeline builds a phylogeny-colored de Bruijn graph for each list of files
-in `input/`. The GFA file is outputted in `output/` and will have the same basename as the input list of files file.
+- GNU Make
+- Python ≥ 3.9
+- Snakemake ≥ 9.0
+- Conda or Mamba is recommended so Snakemake can create the per-rule
+  environments automatically
 
-In addition, the minimal cuts corresponding to each unitig in the compacted de Bruijn graph will be outputted in `output/`.
+The Snakemake environments under `workflow/envs/` install all other tools on
+demand, notably:
 
+- [Cuttlefish](https://github.com/COMBINE-lab/cuttlefish)
+- [ETE4](http://etetoolkit.org/)
+- [Pandas](https://pandas.pydata.org/)
+- [BubbleGun](https://github.com/fawaz-dabbaghieh/bubble_gun)
 
-## 2. Dependencies
+To provision the environments ahead of time:
 
-* [Conda](https://docs.conda.io/en/latest/miniconda.html) (unless the use of Conda is switched off in the configuration) and ideally also [Mamba](https://mamba.readthedocs.io/) (>= 0.20.0)
-* [GNU Make](https://www.gnu.org/software/make/)
-* [Python](https://www.python.org/) (>=3.7)
-* [Snakemake](https://snakemake.github.io) (>=6.2.0)
-
-These can be installed by Conda by
 ```bash
-bash conda install -c conda-forge -c bioconda -c defaults \
-  make "python>=3.7" "snakemake>=6.2.0" "mamba>=0.20.0"
+make conda
 ```
 
-Other dependencies are installed automatically by
-Snakemake when they are requested. The specifications of individual environments can be found in [`workflow/envs/`](workflow/envs/),
-and they contain:
-- [ETE 3](http://etetoolkit.org/),
-- [Pandas](https://pandas.pydata.org/),
-- [Cuttlefish](https://github.com/COMBINE-lab/cuttlefish),
-- [BubbleGun](https://github.com/fawaz-dabbaghieh/bubble_gun),
-
-
-All dependencies across all protocols can also be
-installed at once by `make conda`.
-
-
-## 3. Installation
-
-Clone and enter the repository by
+## Installation
 
 ```bash
-git clone https://github.com/aryakaul/phylogeny-colored-dbg
+git clone https://github.com/aryakaul/phylogeny-colored-dbg.git
 cd phylogeny-colored-dbg
 ```
 
-Alternatively, the repository can also be installed using cURL by
+Alternatively, download the archive:
+
 ```bash
 mkdir phylogeny-colored-dbg
 cd phylogeny-colored-dbg
 curl -L https://github.com/aryakaul/phylogeny-colored-dbg/tarball/main \
-    | tar xvf - --strip-components=1
+  | tar xvf - --strip-components=1
 ```
 
+## Preparing Inputs
 
-## 4. Usage
+Each batch corresponds to a manifest (`input/{batch}.txt`) listing assembly
+paths and a Newick tree (`input/{batch}.nwk`) whose leaf names match the FASTA
+basenames (minus suffix).
 
-### 4a. Basic example
+- Manifests may use absolute paths (recommended) or paths relative to the
+  repository root.
+- Supported genome file suffixes: `.fa`, `.fna`, `.fasta`, `.ffa` (optionally
+  gzip-compressed).
 
-* ***Step 1: Provide lists of input files.*** \
-  For every batch, create a txt list of input files in the `input/`
-  directory (i.e., as `input/{batch_name}.txt`. Use either absolute paths (recommended),
-  or paths relative to the root of the Github repository (not relative to the txt files).
+Example manifest:
 
-  Such a list can be generated, for instance, by `find` by
-  ```bash
-  find ~/dir_with_my_genomes -name '*.fa' > input/my_first_batch.txt
-  ```
-  The supported input file formats include FASTA and FASTQ (possibly compressed by GZip).
-
-* ***Step 2: Provide corresponding phylogenies.*** \
-  The tree files should be named `input/{batch_name}.nwk`,
-  and the leave names inside should correspond
-  to FASTA filenames (without FASTA suffixes).
-
-* ***Step 3 (optional): Adjust configuration.*** \
-  By editing [`config.yaml`](config.yaml) it is possible to specify
-  value of `k` and other parameters.
-
-* ***Step 4: Run the pipeline.*** \
-  Run the pipeline by `make`; this is run by
-  Snakemake with the corresponding parameters.
-
-* ***Step 5: Retrieve the output files.*** \
-  All output files will be located in `output/`.
-  
-
-### 4b. Adjusting configuration
-
-The workflow can be configured via the [`config.yaml`](./config.yaml) file, and
-all options are documented directly there. The configurable functionality includes:
-* switching off Conda,
-* *k* for de Bruijn graph 
-
-
-### 4c. List of workflow commands
-
-phylogeny-colored-dbg is executed via [GNU Make](https://www.gnu.org/software/make/), which handles all parameters and passes them to Snakemake.
-Here's a list of all implemented commands (to be executed as `make {command}`):
-
-
-```yaml
-######################
-## General commands ##
-######################
-    all                  Run everything
-    help                 Print help messages
-    conda                Create the conda environments
-    clean                Clean all output archives and files with statistics
-    cleanall             Clean everything but Conda, Snakemake, and input files
-    cleanallall          Clean completely everything
-###############
-## Reporting ##
-###############
-    viewconf             View configuration without comments
-    reports              Create html report
-####################
-## For developers ##
-####################
-    test                 Run the workflow on test data
-    format               Reformat all source code
-    checkformat          Check source code format
+```bash
+find /data/genomes -name '*.fa' > input/genomes.txt
 ```
 
+## Configuration
 
-### 4d. Troubleshooting
+All configuration lives in [`config.yaml`](config.yaml). Important fields:
 
-Tests can be run by `make test`.
+- `input_dir`, `intermediate_dir`, `output_dir` — rooted directories for each
+  stage. The defaults expect manifests in `input/`, intermediates in
+  `intermediate/`, and final products in `output/`.
+- `kmer_length` — k-mer size passed to Cuttlefish.
+- `tmp_dir` — scratch space for Cuttlefish; defaults to `tmp/` within the repo
+  if unspecified.
+- `parsimony.mode` — `fitch` (default) or `sankoff`.
+- `parsimony.sankoff_branch_penalty` — optional numeric multiplier for Sankoff
+  transitions; omit to auto-scale from mean branch lengths.
+- `produce_colored_deletions` — toggle BubbleGun and deletion-finding rules.
+- `use_conda` — if `False`, Snakemake assumes all tool dependencies are already
+  available.
+
+Any change to `config.yaml` automatically retriggers relevant workflow steps
+thanks to the configured Snakemake rerun triggers.
+
+## Running the Workflow
+
+Key Makefile targets:
+
+```bash
+make all        # Execute the full Snakemake DAG on all batches
+make test       # Run the workflow on bundled test data (lightweight sanity check)
+make clean      # Remove generated outputs (keeps environments)
+make cleanall   # Remove outputs and intermediates
+make help       # Show all available targets
+```
+
+During execution Snakemake maintains intermediates under `intermediate/` and
+final under `output/`. If you disable Conda, ensure the toolchain versions
+satisfy the `workflow/envs/` specifications.
+
+## Outputs
+
+For each batch `{batch}` and parsimony label `{mode_label}` (e.g., `fitch`,
+`sankoff-auto`, `sankoff-0p5`):
+
+- `output/{batch}/phylogenycolored_dbg_k{k}.gfa` — final phylogeny-coloured GFA.
+- `intermediate/cuttlefish/{batch}/{batch}_compcoloreddbg_k{k}.gfa1` — raw
+  Cuttlefish graph.
+- `intermediate/cuttlefish/{batch}_unitigcolors_k{k}.tsv` — unitig presence/
+  absence matrix (samples × unitigs).
+- `intermediate/cuttlefish/{batch}_uqcolors_k{k}.tsv` — deduplicated colour
+  vectors used for parsimony.
+- `intermediate/minimalcuts/{batch}_minimalcuts_{mode_label}_k{k}` — minimal
+  cuts per unique colour set (one line per set, `OR` when multiple solutions).
+- `intermediate/minimalcuts/{batch}_unitig2cuts_{mode_label}_k{k}` — mapping
+  from unitig IDs to assigned minimal cut solutions.
+- `intermediate/sqldb/{batch}_k{k}.sqldb` — SQLite database joining unitigs,
+  sequences, and colour metadata.
+- `intermediate/metrics/{batch}_compression_{mode_label}_k{k}.tsv` — compression
+  metrics comparing Cuttlefish unique colour counts with the pcDBG labels.
+- Optional BubbleGun outputs under `intermediate/bubblegun/` when enabled.
+
+The compression metrics TSV contains four numeric rows:
+
+| metric                     | description                                                     |
+|--------------------------- |-----------------------------------------------------------------|
+| `cuttlefish_unique_colors` | Number of distinct colour vectors before parsimony compression. |
+| `pcdbg_unique_colors`      | Distinct internal-node colour labels assigned by pcDBG.         |
+| `absolute_difference`      | `cuttlefish_unique_colors - pcdbg_unique_colors`.               |
+| `pcdbg_to_cuttlefish_ratio` | Fraction of colours retained (ratio in `[0,1]`).              |
 
 
-## 5. Citation
+## Parsimony Modes
 
-TODO
+- **Fitch (default):** unit-cost transitions for binary presence/absence,
+  suitable when branch lengths are unavailable or unreliable.
+- **Sankoff:** weighted by branch lengths with an optional penalty multiplier
+  from `config.yaml`. If no penalty is provided the workflow scales one from the
+  mean branch length.
 
+Outputs incorporate the parsimony label in their filenames so switching modes
+automatically triggers distinct Snakemake targets.
 
-## 6. Issues
+## Troubleshooting
 
-Please use [Github issues](https://github.com/aryakaul/phylogeny-colored-dbg/issues).
+- `make test` runs the pipeline on a lightweight dataset in `.test`; use it to check
+  installation
+- Snakemake reruns steps when inputs, parameters, code, or config change; no
+  manual `--force` is required for standard edits.
+- Inspect `.snakemake/log/` for per-rule logs if a job fails.
+- Ensure manifest filenames match the tree leaves; mismatches surface as early
+  validation errors in `workflow/rules/init.smk`.
 
+## Citation
 
+*In preparation.*
 
-## 7. Changelog
+## Issues
+
+Report problems or feature requests via
+[GitHub issues](https://github.com/aryakaul/phylogeny-colored-dbg/issues).
+
+## Changelog
 
 See [Releases](https://github.com/aryakaul/phylogeny-colored-dbg/releases).
 
+## License
 
+[GPL-3.0](LICENSE.md)
 
-## 8. License
+## Contacts
 
-[GPL3](https://github.com/aryakaul/phylogeny-colored-dbg/blob/main/LICENSE)
+- [Arya Kaul](https://arya.casa) — arya_kaul@g.harvard.edu
+- [Karel Brinda](http://karel-brinda.github.io) — karel.brinda@inria.fr
 
+## Acknowledgements
 
-
-## 9. Contacts
-
-* [Arya Kaul](https://arya.casa) \<arya_kaul@g.harvard.edu\>
-* [Karel Brinda](http://karel-brinda.github.io) \<karel.brinda@inria.fr\>
-
-
-## 10. Acknowledgements
-
-Structure and format for this pipeline, documentation, and some code was heavily inspired 
-and modeled after [Miniphy](https://github.com/karel-brinda/Miniphy)! Check it out!
+Project structure, documentation style, and several workflow concepts took
+inspiration from [Miniphy](https://github.com/karel-brinda/Miniphy). Check
+it out!
