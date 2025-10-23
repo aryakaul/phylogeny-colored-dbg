@@ -22,6 +22,14 @@ include: "rules/pcdbg.smk"
 include: "rules/bubblegun.smk"
 include: "rules/colored_deletions.smk"
 
+PRODUCE_COLORED_DELETIONS = config.get("produce_colored_deletions", True)
+
+pcdbg_targets = expand(fn_pcdbg(_batch="{batch}"), batch=get_batches())
+deletion_targets = (
+    expand(fn_deletionbubbles(_batch="{batch}"), batch=get_batches())
+    if PRODUCE_COLORED_DELETIONS
+    else []
+)
 
 ## WILDCARDS CONSTRAINS
 wildcard_constraints:
@@ -31,5 +39,4 @@ wildcard_constraints:
  
 rule all:
     input:
-        expand(fn_pcdbg(_batch="{batch}"), batch=get_batches()),
-        expand(fn_deletionbubbles(_batch="{batch}"), batch=get_batches()),
+        pcdbg_targets + deletion_targets

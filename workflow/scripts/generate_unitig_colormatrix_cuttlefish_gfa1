@@ -1,52 +1,145 @@
 #!/usr/bin/env python3
+"""Build a cuttlefish unitig presence/absence matrix for pcDBG."""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from pathlib import Path
+import sys
+from typing import Dict, Iterable, List, Sequence, Set
 
 import pandas as pd
-import sys
 from loguru import logger
-from collections import defaultdict
 
-gfa1 = sys.argv[1]
-fof = sys.argv[2]
-output = sys.argv[3]
 
-# Step 1: Read file of files
-with open(fof, "r") as f:
-    idx_to_filepath = {index: line.strip() for index, line in enumerate(f)}
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert cuttlefish GFA1 output to a unitig presence/absence matrix."
+    )
+    parser.add_argument(
+        "gfa",
+        type=Path,
+        help="Path to the cuttlefish-generated GFA1 file.",
+    )
+    parser.add_argument(
+        "fof",
+        type=Path,
+        help="File-of-filenames enumerating the assemblies used for cuttlefish.",
+    )
+    parser.add_argument(
+        "output",
+        type=Path,
+        help="Destination TSV file for the presence/absence matrix.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity (specify twice for DEBUG).",
+    )
+    return parser.parse_args(argv)
 
-logger.debug("Read in {} files", len(idx_to_filepath))
 
-# Initialize a dictionary using defaultdict
-data_dict = defaultdict(set)
+def configure_logging(verbosity: int) -> None:
+    if verbosity <= 0:
+        logger.remove()
+    elif verbosity == 1:
+        logger.remove()
+        logger.add(sys.stderr, level="INFO")
+    else:
+        logger.remove()
+        logger.add(sys.stderr, level="DEBUG")
 
-# Set to store all unique unitigs
-all_unitigs = set()
 
-# Read GFA file and gather unitigs for each sample
-with open(gfa1, "r") as file:
-    for line in file:
-        parts = line.strip().split()
-        if parts[0] == "P":
-            ref_seq_idx = parts[1].split("_")[0].split(":")[1]
-            ref_seq = idx_to_filepath[int(ref_seq_idx) - 1]
-            unitigs = set(parts[2].replace("+", "").replace("-",
-                                                            "").split(","))
-            data_dict[ref_seq].update(unitigs)
-            all_unitigs.update(unitigs)
+def load_sample_paths(fof_path: Path) -> List[str]:
+    samples: List[str] = []
+    with fof_path.open("r") as handle:
+        for raw in handle:
+            entry = raw.strip()
+            if entry:
+                samples.append(entry)
+    if not samples:
+        raise ValueError(f"File-of-filenames '{fof_path}' does not contain any entries")
+    logger.debug("Loaded {} assemblies from {}", len(samples), fof_path)
+    return samples
 
-logger.debug("Read in {} unitigs", len(all_unitigs))
 
-# Create a DataFrame with all zeros
-df = pd.DataFrame(0, index=list(all_unitigs), columns=idx_to_filepath.values())
+def parse_gfa_paths(gfa_path: Path, samples: Sequence[str]) -> Dict[str, Set[str]]:
+    sample_to_unitigs: Dict[str, Set[str]] = defaultdict(set)
 
-logger.debug("Created empty unitig matrix!")
+    with gfa_path.open("r") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            parts = raw.strip().split()
+            if not parts or parts[0] != "P":
+                continue
+            try:
+                ref_seq_idx = int(parts[1].split("_")[0].split(":")[1])
+            except (IndexError, ValueError) as exc:
+                raise ValueError(
+                    f"Failed to parse reference index from '{parts[1]}' on line {line_number}"
+                ) from exc
 
-# Update DataFrame with 1 where unitigs exist
-for sample, unitigs in data_dict.items():
-    df.loc[list(unitigs), sample] = 1
+            if not (1 <= ref_seq_idx <= len(samples)):
+                raise IndexError(
+                    f"GFA references sample index {ref_seq_idx}, "
+                    f"but only {len(samples)} assemblies were provided"
+                )
 
-logger.debug("Updated unitig matrix with present unitigs!")
+            sample = samples[ref_seq_idx - 1]
+            unitigs = {u.lstrip("+-") for u in parts[2].split(",") if u}
+            sample_to_unitigs[sample].update(unitigs)
 
-# Transpose and output the DataFrame
-df.to_csv(output, sep="\t")
+    for sample in samples:
+        sample_to_unitigs.setdefault(sample, set())
 
-logger.debug("Outputted to {}", output)
+    logger.debug(
+        "Parsed GFA path information for {} samples ({} total unitigs)",
+        len(sample_to_unitigs),
+        sum(len(unitigs) for unitigs in sample_to_unitigs.values()),
+    )
+    return sample_to_unitigs
+
+
+def build_presence_matrix(
+    sample_to_unitigs: Dict[str, Set[str]],
+    samples: Sequence[str],
+) -> pd.DataFrame:
+    all_unitigs = sorted({unitig for unitigs in sample_to_unitigs.values() for unitig in unitigs})
+    logger.debug("Constructing presence/absence matrix with {} unitigs", len(all_unitigs))
+
+    if not all_unitigs:
+        # No unitigs observed; return an empty frame with requested columns.
+        return pd.DataFrame(0, index=[], columns=list(samples), dtype=int)
+
+    df = pd.DataFrame(
+        0,
+        index=all_unitigs,
+        columns=list(samples),
+        dtype=int,
+    )
+
+    for sample, unitigs in sample_to_unitigs.items():
+        if not unitigs:
+            continue
+        df.loc[list(unitigs), sample] = 1
+
+    return df
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    configure_logging(args.verbose)
+
+    samples = load_sample_paths(args.fof)
+    sample_to_unitigs = parse_gfa_paths(args.gfa, samples)
+    matrix = build_presence_matrix(sample_to_unitigs, samples)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    matrix.to_csv(args.output, sep="\t")
+    logger.info("Wrote presence/absence matrix to {}", args.output)
+
+
+if __name__ == "__main__":
+    main()

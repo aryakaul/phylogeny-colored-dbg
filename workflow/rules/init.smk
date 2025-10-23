@@ -1,78 +1,98 @@
-from snakemake.utils import validate
-import collections
-import glob
-from pprint import pprint
-from pathlib import Path
+from __future__ import annotations
+
 import os
+from pathlib import Path
+from typing import Dict, Iterable, Optional
 
 
 configfile: "config.yaml"
 
 
-##### load config and sample sheets #####
+#########################################
+# Configuration helpers and directories #
+#########################################
 
 
-def dir_input():
-    return Path(config["input_dir"])
+INPUT_DIR = Path(config["input_dir"]).resolve()
+INTERMEDIATE_DIR = Path(config["intermediate_dir"]).resolve()
+OUTPUT_DIR = Path(config["output_dir"]).resolve()
+KMER_LENGTH = int(config["kmer_length"])
+ALLOWED_FASTA_SUFFIXES = {"fa", "fasta", "fna", "ffa"}
 
 
-def dir_intermediate():
-    return Path(config["intermediate_dir"])
+def dir_input() -> Path:
+    return INPUT_DIR
 
 
-def dir_output():
-    return config["output_dir"]
+def dir_intermediate() -> Path:
+    return INTERMEDIATE_DIR
 
 
-# extract sample name from a path
-def _get_sample_from_fn(x):
-    suffixes = ["fa", "fasta", "fna", "ffa"]
+def dir_output() -> Path:
+    return OUTPUT_DIR
 
-    b = os.path.basename(x)
-    if b.endswith(".gz"):
-        b = b[:-3]
-    sample, _, suffix = b.rpartition(".")
-    assert suffix in suffixes, f"Unknown suffix of source files ({suffix} in {x})"
+
+#############################################
+# Batch manifest parsing and cached lookups #
+#############################################
+
+
+def _sample_name_from_path(entry: str) -> str:
+    """Infer the logical sample name from a FASTA path."""
+    filename = Path(entry).name
+    if filename.endswith(".gz"):
+        filename = filename[:-3]
+    sample, dot, suffix = filename.rpartition(".")
+    if not dot:
+        raise ValueError(f"Unable to determine suffix for '{entry}'.")
+    if suffix not in ALLOWED_FASTA_SUFFIXES:
+        raise ValueError(
+            f"Unknown FASTA suffix '{suffix}' in '{entry}'. "
+            f"Expected one of {sorted(ALLOWED_FASTA_SUFFIXES)}."
+        )
     return sample
 
 
-# compute main dict for batches
-# TODO: if executed in cluster mode, every job will recompute this BATCHES_FN variable when submitted
-# TODO: this is because in cluster mode each job is ran as <get the actual snakemake command line if needed>
-# TODO: this makes us include this file and thus recompute BATCHES_FN
-# TODO: might be a good idea to serialise BATCHES_FN to disk and read from it, instead of recomputing it every time
-# TODO: it might hammer the disk in cluster envs, depending on the number of batches
-BATCHES_FN = {}
-res = dir_input().glob("*.txt")
-for x in res:
-    b = os.path.basename(x)
-    if not b.endswith(".txt"):
-        continue
-    batch = b[:-4]
+def _load_batches() -> Dict[str, Dict[str, str]]:
+    """Parse manifests in the input directory into a batch → sample map."""
 
-    assert os.path.exists(
-        f"{dir_input()}/{batch}.nwk"
-    ), f"\nERROR: No newick tree found for batch: {batch}. Should be: {dir_input()}/{batch}.nwk\n"
+    manifests = sorted(INPUT_DIR.glob("*.txt"))
+    if not manifests:
+        raise FileNotFoundError(
+            f"No manifests found in '{INPUT_DIR}'. Provide at least one '*.txt' file."
+        )
 
-    BATCHES_FN[batch] = {}
-    # BATCHES_FN[batch]["tree"] = f"{dir_input()}/{batch}.nwk"
-    with open(x) as f:
-        for y in f:
-            sample_fn = y.strip()
-            if sample_fn:
-                sample = _get_sample_from_fn(sample_fn)
-                BATCHES_FN[batch][sample] = sample_fn
+    batches: Dict[str, Dict[str, str]] = {}
+    for manifest in manifests:
+        batch = manifest.stem
+        tree_path = INPUT_DIR / f"{batch}.nwk"
+        if not tree_path.exists():
+            raise FileNotFoundError(
+                f"Missing Newick tree for batch '{batch}'. Expected '{tree_path}'."
+            )
 
-assert (
-    len(BATCHES_FN) != 0
-), f"\nERROR: No input files provided. Please provide at least one batch in '{dir_input()}/'.\n"
+        samples: Dict[str, str] = {}
+        with manifest.open() as handle:
+            for line_no, raw in enumerate(handle, start=1):
+                entry = raw.strip()
+                if not entry:
+                    continue
+                sample_name = _sample_name_from_path(entry)
+                samples[sample_name] = entry
+
+        if not samples:
+            raise ValueError(f"Manifest '{manifest}' contains no sample entries.")
+
+        batches[batch] = samples
+
+    return batches
 
 
-## BATCHES
+BATCH_SAMPLE_MAP = _load_batches()
 
 
-def get_batches():
-    return BATCHES_FN.keys()
+def get_batches() -> Iterable[str]:
+    return tuple(sorted(BATCH_SAMPLE_MAP))
 
 
 #####################################
@@ -80,111 +100,154 @@ def get_batches():
 #####################################
 
 
-def fn_cuttlefish_out(_batch, _ext):
-    return f"{dir_intermediate()}/cuttlefish/{_batch}/{_batch}_compcoloreddbg_k{config['kmer_length']}.{_ext}"
+def _cuttlefish_root(batch: str) -> Path:
+    return INTERMEDIATE_DIR / "cuttlefish" / batch
 
 
-def fn_colormtx(_batch):
-    return f"{dir_intermediate()}/cuttlefish/{_batch}_unitigcolors_k{config['kmer_length']}.tsv"
+def _minimal_cuts_root(batch: str) -> Path:
+    return INTERMEDIATE_DIR / "minimalcuts"
 
 
-def fn_uqcolors(_batch):
-    return f"{dir_intermediate()}/cuttlefish/{_batch}_uqcolors_k{config['kmer_length']}.tsv"
+def _tree_root() -> Path:
+    return INTERMEDIATE_DIR / "tree"
 
 
-def fn_redundantcolors(_batch):
-    return f"{dir_intermediate()}/cuttlefish/{_batch}_redundantcolors_k{config['kmer_length']}.csv"
+def _bubble_root() -> Path:
+    return INTERMEDIATE_DIR / "bubblegun"
 
 
-def fn_minimalcuts(_batch):
-    return f"{dir_intermediate()}/minimalcuts/{_batch}_minimalcuts_k{config['kmer_length']}"
+def _require_batch(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    value = batch if batch is not None else _batch
+    if value is None:
+        raise ValueError("Batch identifier is required.")
+    return value
 
 
-def fn_minimalcuts_plotdir(_batch):
-    return f"{dir_intermediate()}/minimalcuts/{_batch}_plots_k{config['kmer_length']}"
+def _require_ext(ext: Optional[str] = None, _ext: Optional[str] = None) -> str:
+    value = ext if ext is not None else _ext
+    if value is None:
+        raise ValueError("File extension is required.")
+    return value
 
 
-def fn_unitig2cuts(_batch):
-    return f"{dir_intermediate()}/minimalcuts/{_batch}_unitig2cuts_k{config['kmer_length']}"
+def fn_cuttlefish_out(*, batch: Optional[str] = None, _batch: Optional[str] = None, ext: Optional[str] = None, _ext: Optional[str] = None):
+    batch_id = _require_batch(batch, _batch)
+    extension = _require_ext(ext, _ext)
+    return str(_cuttlefish_root(batch_id) / f"{batch_id}_compcoloreddbg_k{KMER_LENGTH}.{extension}")
 
 
-def fn_sqldb(_batch):
-    return f"{dir_intermediate()}/sqldb/{_batch}_k{config['kmer_length']}.sqldb"
+def fn_colormtx(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(INTERMEDIATE_DIR / "cuttlefish" / f"{batch_id}_unitigcolors_k{KMER_LENGTH}.tsv")
 
 
-def fn_tree_clean(_batch):
-    return f"{dir_intermediate()}/tree/{_batch}.nwk"
+def fn_uqcolors(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(INTERMEDIATE_DIR / "cuttlefish" / f"{batch_id}_uqcolors_k{KMER_LENGTH}.tsv")
 
 
-def fn_tree_sorted(_batch):
-    return f"{dir_intermediate()}/tree/{_batch}.nwk"
+def fn_redundantcolors(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(INTERMEDIATE_DIR / "cuttlefish" / f"{batch_id}_redundantcolors_k{KMER_LENGTH}.csv")
 
 
-def fn_tree_dirty(_batch):
-    return f"{dir_intermediate()}/tree/{_batch}.nwk_dirty"
+def fn_minimalcuts(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_minimalcuts_k{KMER_LENGTH}")
 
 
-def fn_leaves_sorted(_batch):
-    return f"{dir_intermediate()}/tree/{_batch}.leaves"
+def fn_minimalcuts_plotdir(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_plots_k{KMER_LENGTH}")
 
 
-def fn_bubblejson(_batch):
-    return (
-        f"{dir_intermediate()}/bubblegun/{_batch}_k{config['kmer_length']}_bubbles.json"
-    )
+def fn_unitig2cuts(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_unitig2cuts_k{KMER_LENGTH}")
 
 
-def fn_bubblelog(_batch):
-    return (
-        f"{dir_intermediate()}/bubblegun/{_batch}_k{config['kmer_length']}_bubbles.log"
-    )
+def fn_sqldb(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(INTERMEDIATE_DIR / "sqldb" / f"{batch_id}_k{KMER_LENGTH}.sqldb")
 
 
-def fn_deletionbubbles(_batch):
-    return f"{dir_intermediate()}/bubblegun/{_batch}_k{config['kmer_length']}_deletion-bubbles.json"
+def fn_tree_clean(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_tree_root() / f"{batch_id}.nwk")
 
 
-def fn_deletionbubbles_chkpoint(_batch):
-    return f"{dir_intermediate()}/deletion-bubbles/{_batch}"
+def fn_tree_sorted(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    return fn_tree_clean(batch=batch, _batch=_batch)
 
 
-def fn_pcdbg(_batch):
-    return f"{dir_output()}/{_batch}_k{config['kmer_length']}_pcdbg.gfa"
+def fn_tree_dirty(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_tree_root() / f"{batch_id}.nwk_dirty")
 
 
-def fn_nodes_sorted(_batch):
-    return f"{dir_intermediate()}/tree/{_batch}.nodes"
+def fn_leaves_sorted(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_tree_root() / f"{batch_id}.leaves")
 
 
-## WILDCARD FUNCTIONS
+def fn_nodes_sorted(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_tree_root() / f"{batch_id}.nodes")
 
 
-# get source file path
+def fn_bubblejson(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_bubble_root() / f"{batch_id}_k{KMER_LENGTH}_bubbles.json")
+
+
+def fn_bubblelog(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_bubble_root() / f"{batch_id}_k{KMER_LENGTH}_bubbles.log")
+
+
+def fn_deletionbubbles(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(_bubble_root() / f"{batch_id}_k{KMER_LENGTH}_deletion-bubbles.json")
+
+
+def fn_deletionbubbles_chkpoint(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(INTERMEDIATE_DIR / "deletion-bubbles" / batch_id)
+
+
+def fn_pcdbg(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+    batch_id = _require_batch(batch, _batch)
+    return str(OUTPUT_DIR / f"{batch_id}_k{KMER_LENGTH}_pcdbg.gfa")
+
+
+#############################################
+# Wildcard helpers and common file rewrites #
+#############################################
+
+
 def w_sample_source(wildcards):
-    batch = wildcards["batch"]
-    sample = wildcards["sample"]
-    fn = BATCHES_FN[batch][sample]
-    return fn
+    return BATCH_SAMPLE_MAP[wildcards["batch"]][wildcards["sample"]]
 
 
-## OTHER FUNCTIONS
-
-
-# generate file list from a list of identifiers (e.g., leaf names -> assemblies names)
 def generate_file_list(input_list_fn, output_list_fn, filename_function):
-    with open(input_list_fn) as f:
-        with open(output_list_fn, "w") as g:
-            for x in f:
-                x = x.strip()
-                fn0 = filename_function(x)  # top-level path
-                fn = os.path.relpath(fn0, os.path.dirname(output_list_fn))
-                g.write(fn + "\n")
+    input_path = Path(input_list_fn)
+    output_path = Path(output_list_fn)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with input_path.open() as src, output_path.open("w") as dest:
+        for raw in src:
+            entry = raw.strip()
+            if not entry:
+                continue
+            target = filename_function(entry)
+            rel_path = os.path.relpath(target, output_path.parent)
+            dest.write(rel_path + "\n")
 
 
-def load_list(fn):
-    try:
-        with open(fn) as f:
-            return [x.strip() for x in f]
-    except FileNotFoundError:
+def load_list(fn) -> Iterable[str]:
+    path = Path(fn)
+    if not path.exists():
         print(f"File not found {fn}, using empty list")
         return []
+    with path.open() as handle:
+        return [line.strip() for line in handle]

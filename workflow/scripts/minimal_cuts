@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 
-import json
+from __future__ import annotations
+
 import argparse
-from ete4 import Tree
-import ete4
-import os
-import sys
-from loguru import logger
-import time
-import re
-from datetime import datetime
 import multiprocessing
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from typing import Iterable, Iterator, List, Sequence, Tuple
+
+import ete4
+from ete4 import Tree
+from loguru import logger
 
 
 # Recursive function to compute the optimal costs, cuts, and colors at each node
@@ -198,7 +201,8 @@ def process_chunk(tree, chunk_data, all_leaf_coloring):
             best_cuts = (root_red_cuts, root_blue_cuts)
             root_decision = "ambiguous"
 
-        if best_cuts == []: best_cuts = ["Root"]
+        if not best_cuts:
+            best_cuts = ["Root"]
 
         results.append(best_cuts)
 
@@ -218,8 +222,6 @@ def process_chunk(tree, chunk_data, all_leaf_coloring):
             # Store a tuple with the set number, the chosen color for the set, and the color mapping
             colors_info.append((num, root_decision, optimal_colors))
 
-        print(colors_info)
-
         end_time = time.time()
         elapsed_time = end_time - start_time
 
@@ -228,31 +230,40 @@ def process_chunk(tree, chunk_data, all_leaf_coloring):
     return results, colors_info
 
 
-def minimal_cuts_for_all_sets(tree,
-                              leaves_file_path,
-                              chunk_size,
-                              num_threads,
-                              all_leaf_coloring=False):
-    pool = multiprocessing.Pool(num_threads)
+def _process_chunk_from_args(args):
+    return process_chunk(*args)
+
+
+def minimal_cuts_for_all_sets(
+    tree,
+    leaves_file_path,
+    chunk_size,
+    num_threads,
+    all_leaf_coloring=False,
+):
     results = []
-    colors_info = [
-    ]  # To store the coloring information for each set of target leaves
+    colors_info = []
 
-    tasks = [(tree, chunk, all_leaf_coloring)
-             for chunk in read_target_leaves(leaves_file_path, chunk_size)]
+    def task_iter():
+        for chunk in read_target_leaves(leaves_file_path, chunk_size):
+            yield (tree, chunk, all_leaf_coloring)
 
-    # Map tasks to the pool of processes
-    processed_chunks = pool.starmap(process_chunk, tasks)
+    if num_threads <= 1:
+        iterator = (process_chunk(*task) for task in task_iter())
+        for chunk_results, chunk_colors in iterator:
+            results.extend(chunk_results)
+            if all_leaf_coloring:
+                colors_info.extend(chunk_colors)
+    else:
+        with multiprocessing.Pool(num_threads) as pool:
+            for chunk_results, chunk_colors in pool.imap_unordered(
+                _process_chunk_from_args, task_iter()
+            ):
+                results.extend(chunk_results)
+                if all_leaf_coloring:
+                    colors_info.extend(chunk_colors)
 
-    # Combine results from all chunks
-    for chunk_results, chunk_colors in processed_chunks:
-        results.extend(chunk_results)
-        colors_info.extend(chunk_colors)
-
-    pool.close()
-    pool.join()
-
-    return results, colors_info if all_leaf_coloring else results
+    return results, colors_info if all_leaf_coloring else []
 
 
 def write_output(data, output_file=None):
@@ -417,37 +428,44 @@ def main():
                                                 args.colors)
 
     # Write minimal cuts results to output or stdout
-    output_file = args.output if args.output else sys.stdout
-    logger.info("Outputting cuts to {}", output_file)
-    with open(output_file, "w") if args.output else sys.stdout as out:
+    logger.info("Outputting cuts to {}", args.output or "stdout")
+    if args.output:
+        out_handle = open(args.output, "w")
+    else:
+        out_handle = sys.stdout
+    try:
         for result in results:
             if isinstance(result,
                           tuple) and args.all_solutions:  # Two solutions exist
-                out.write(",".join(result[0]) + " OR " + ",".join(result[1]) +
-                          "\n")
+                out_handle.write(
+                    ",".join(result[0]) + " OR " + ",".join(result[1]) + "\n"
+                )
             elif isinstance(result, tuple):
-                out.write(",".join(result[0]) + "\n")
+                out_handle.write(",".join(result[0]) + "\n")
             else:
-                out.write(",".join(result) + "\n")
+                out_handle.write(",".join(result) + "\n")
+    finally:
+        if args.output:
+            out_handle.close()
 
     # Write coloring output also
     if args.colors:
-        logger.info("Outputting all node coloring to to {}", args.colors)
+        logger.info("Writing node colouring metadata to {}", args.colors)
         with open(args.colors, "w") as out_colors:
             for color in colors:
-                print(color)
                 colordict = color[2]
                 if isinstance(colordict, tuple):
                     if args.all_solutions:
                         out_colors.write(
-                            str(colordict[0]) + " OR " + str(colordict[1]) +
-                            "\n")
+                            f"{colordict[0]} OR {colordict[1]}\n"
+                        )
                     else:
-                        out_colors.write(str(colordict[0]) + "\n")
+                        out_colors.write(f"{colordict[0]}\n")
                 else:
-                    out_colors.write(str(colordict) + "\n")
+                    out_colors.write(f"{colordict}\n")
         # plot trees
         if args.plot:
+            os.makedirs(args.plot, exist_ok=True)
             for color in colors:
                 colordict = color[2]
                 if isinstance(colordict, tuple):

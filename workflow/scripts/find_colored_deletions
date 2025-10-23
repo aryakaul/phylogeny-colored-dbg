@@ -1,131 +1,148 @@
 #!/usr/bin/env python3
 
-import json
-import pandas as pd
-import time
+from __future__ import annotations
+
 import argparse
-import os
-from loguru import logger
-import sys
-import sqlite3
+import json
 import multiprocessing
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass, field
 from functools import lru_cache, partial
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
+
+from loguru import logger
+
 from sql_utils import lookup_unitigs_batch
 
 
-def read_bubbles(file_path):
+@dataclass
+class SearchLimits:
+    """Track recursion guardrails for path enumeration."""
+
+    bubble_id: str
+    max_paths: int
+    timeout_seconds: int | None
+    start_time: float = field(default_factory=time.monotonic)
+    emitted: int = 0
+    warned_timeout: bool = False
+    warned_cap: bool = False
+
+    def should_continue(self) -> bool:
+        if self.timeout_seconds is not None:
+            elapsed = time.monotonic() - self.start_time
+            if elapsed > self.timeout_seconds:
+                if not self.warned_timeout:
+                    logger.warning(
+                        "Timed out enumerating paths for bubble {} after {:.1f}s",
+                        self.bubble_id,
+                        elapsed,
+                    )
+                    self.warned_timeout = True
+                return False
+        if self.max_paths and self.emitted >= self.max_paths:
+            if not self.warned_cap:
+                logger.warning(
+                    "Reached max_paths={} while enumerating bubble {}",
+                    self.max_paths,
+                    self.bubble_id,
+                )
+                self.warned_cap = True
+            return False
+        return True
+
+    def record_emission(self) -> None:
+        self.emitted += 1
+
+
+def read_bubbles(file_path: Path):
     """
     Reads the bubbles.json file and yields bubble objects.
     """
-    with open(file_path, "r") as f:
+    with file_path.open("r") as f:
         bubbles = json.load(f)
         for chain_id, chain_data in bubbles.items():
             for bubble in chain_data["bubbles"]:
                 yield bubble
 
 
-def fetch_adjacency_data(conn, allowed_unitigs):
-    adjacency_dict = {}
-    allowed_set = set(allowed_unitigs)
-    placeholders = ", ".join(["?"] * len(allowed_set))
+def fetch_adjacency_data(
+    conn: sqlite3.Connection, allowed_unitigs: Sequence[str]
+) -> Dict[str, Dict[str, set]]:
+    """Return adjacency information for a restricted set of unitigs."""
 
-    cur = conn.cursor()
-    query = f"""
-    SELECT unitig_id, unitig_direction, neighbor_id, neighbor_direction
-    FROM adjacency
-    WHERE unitig_id IN ({placeholders})
-    AND neighbor_id IN ({placeholders})
-    """
-    cur.execute(query,
-                tuple(allowed_set) * 2)  # Tuple unpacking for each IN clause
-    for unitig_id, unitig_dir, neighbor_id, neighbor_dir in cur:
-        if unitig_id not in adjacency_dict:
-            adjacency_dict[unitig_id] = {"+": set(), "-": set()}
-        if neighbor_id not in adjacency_dict:
-            adjacency_dict[neighbor_id] = {"+": set(), "-": set()}
+    allowed_set = {unitig for unitig in allowed_unitigs}
+    if not allowed_set:
+        return {}
 
-        adjacency_dict[unitig_id][unitig_dir].add((neighbor_id, neighbor_dir))
+    adjacency_dict: Dict[str, Dict[str, set]] = {
+        unitig: {"+": set(), "-": set()} for unitig in allowed_set
+    }
+    metadata = lookup_unitigs_batch(conn, allowed_set, output_neighbors=True)
+
+    for unitig_id, meta in metadata.items():
+        neighbours = meta.get("neighbors", {})
+        for orientation, entries in neighbours.items():
+            if orientation not in ("+", "-"):
+                continue
+            adjacency_dict.setdefault(unitig_id, {"+": set(), "-": set()})
+            adjacency_dict[unitig_id][orientation].update(
+                (neighbor_id, neighbor_dir)
+                for neighbor_id, neighbor_dir in entries
+                if neighbor_id in allowed_set
+            )
 
     return adjacency_dict
 
 
 def find_paths_with_allowed_unitigs(
-    bubbleid,
-    adjacency_dict,
-    start,
-    end,
-    path=None,
-    path_set=None,
-    path_count=[0],
-    max_paths=10000,
-    start_time=None,
-    timeout=[0, 60],
-):
-    start_unitig = start[:-1]
-    start_dir = start[-1]
-    if path is None:
-        path = []
-    if path_set is None:
-        path_set = set()
-    if start_time is None:
-        start_time = time.time()  # Set the start time only in the first call
+    bubble_id: str,
+    adjacency_dict: Dict[str, Dict[str, Iterable[Tuple[str, str]]]],
+    start: str,
+    end: str,
+    limits: SearchLimits,
+) -> Iterator[List[str]]:
+    """Depth-first search that respects timeout and path-count limits."""
 
-    # Function to check if time limit has been exceeded
-    def has_timed_out():
-        return time.time() - start_time > timeout[
-            1]  # 1800 seconds = 30 minutes
+    visited: List[str] = []
+    seen: set[str] = set()
 
-    if has_timed_out():
-        if timeout[0] == 0:
-            logger.warning(
-                f"Timed out - Finding all paths for bubble {bubbleid} took longer than {timeout[1]} seconds"
-            )
-            timeout[0] = 1
-        return  # Stop the execution if time limit is exceeded
-
-    # logger.info(f"Starting node: {start}")
-    path.append(start)
-    path_set.add(start)
-    # logger.info(f"Current Path: {path}")
-    # logger.info(f"Current Path_set: {path_set}")
-
-    if start == end:
-        # logger.info(f"Start == End node!")
-        # Existing logic to handle the path
-        yield path[:]
-        if max_paths != 0:
-            path_count[0] += 1
-            if path_count[0] >= max_paths:
+    def dfs(node: str) -> Iterator[List[str]]:
+        if not limits.should_continue():
+            return
+        visited.append(node)
+        seen.add(node)
+        try:
+            if node == end:
+                limits.record_emission()
+                yield list(visited)
                 return
-    else:
-        for neighbor_tup in adjacency_dict[start_unitig][start_dir]:
-            neighbor = neighbor_tup[0] + neighbor_tup[1]
-            # logger.info(f"Neighbor: {neighbor}")
-            if neighbor not in path_set:
-                # logger.info(f"Neighbor not in path_set!")
-                yield from find_paths_with_allowed_unitigs(
-                    bubbleid,
-                    adjacency_dict,
-                    neighbor,
-                    end,
-                    path,
-                    path_set,
-                    path_count,
-                    max_paths,
-                    start_time,
-                    timeout=timeout,
-                )
 
-    path.pop()
-    path_set.remove(start)
+            unitig_id = node[:-1]
+            orientation = node[-1]
+            neighbors = adjacency_dict.get(unitig_id, {}).get(orientation, ())
+            for neighbor_id, neighbor_dir in neighbors:
+                next_node = f"{neighbor_id}{neighbor_dir}"
+                if next_node in seen:
+                    continue
+                yield from dfs(next_node)
+                if not limits.should_continue():
+                    return
+        finally:
+            seen.remove(node)
+            visited.pop()
+
+    return dfs(start)
 
 
-def filter_paths_by_criteria(conn,
-                             all_paths,
-                             start,
-                             end,
-                             smallpath_maxlen=100,
-                             bigpath_minlen=1000):
+def filter_paths_by_criteria(
+    conn,
+    all_paths,
+    smallpath_maxlen=100,
+    bigpath_minlen=1000,
+):
     valid_pairs = []
 
     logger.debug("Getting unitig ids")
@@ -148,13 +165,24 @@ def filter_paths_by_criteria(conn,
     path_info = []
     for path in all_paths:
         inner_path = path[1:-1]
-        lengths = [
-            unitig_info[unitig_id[:-1]]["length"] for unitig_id in inner_path
-        ]
-        color_sets = [
-            unitig_info[unitig_id[:-1]]["parsed_colors"]
-            for unitig_id in inner_path
-        ]
+        path_lengths = []
+        color_sets = []
+        missing_unitig = False
+        for unitig in inner_path:
+            metadata = unitig_info.get(unitig[:-1])
+            if metadata is None:
+                logger.debug(
+                    "Skipping path containing unitig {} absent from SQLite metadata",
+                    unitig,
+                )
+                missing_unitig = True
+                break
+            path_lengths.append(metadata["length"])
+            color_sets.append(metadata["parsed_colors"])
+        if missing_unitig:
+            path_info.append([0, set()])
+            continue
+        lengths = path_lengths
         total_length = sum(lengths)
         shared_colors = get_shared_colors(color_sets)
         path_info.append([total_length, shared_colors])
@@ -176,111 +204,58 @@ def filter_paths_by_criteria(conn,
     return valid_pairs
 
 
-def process_one_bubble(bubble, db_filepath, smallpath_maxlen, bigpath_minlen,
-                       max_paths, timeout):
-    unitigdb = sqlite3.connect(
-        db_filepath)  # Create a new connection for the chunk
+def process_one_bubble(
+    bubble: Dict[str, object],
+    db_filepath: Path,
+    smallpath_maxlen: int,
+    bigpath_minlen: int,
+    max_paths: int,
+    timeout: int,
+):
+    unitigdb = sqlite3.connect(str(db_filepath))
     start, end = bubble["ends"]
-    allowed_unitigs = bubble["inside"]
-    allowed_unitigs.extend(bubble["ends"])
-    logger.debug(f"Processing {bubble['id']}")
-    logger.debug("Finding adj. dict...")
+    allowed_unitigs = list(bubble["inside"]) + list(bubble["ends"])
+    logger.debug("Processing bubble {}", bubble["id"])
     adjacency_dict = fetch_adjacency_data(unitigdb, allowed_unitigs)
-    logger.debug(f"Adjacency Dict: {adjacency_dict}")
-    logger.debug(f"Finding possible paths for {bubble['id']}")
-    poss_paths_start_pos_end_neg = list(
-        find_paths_with_allowed_unitigs(
-            bubble["id"],
-            adjacency_dict,
-            start + "+",
-            end + "-",
-            path_count=[0],
-            max_paths=max_paths,
-            timeout=[0, timeout],
-        ))
-    poss_paths_start_neg_end_neg = list(
-        find_paths_with_allowed_unitigs(
-            bubble["id"],
-            adjacency_dict,
-            start + "-",
-            end + "-",
-            path_count=[0],
-            max_paths=max_paths,
-            timeout=[0, timeout],
-        ))
-    poss_paths_start_pos_end_pos = list(
-        find_paths_with_allowed_unitigs(
-            bubble["id"],
-            adjacency_dict,
-            start + "+",
-            end + "+",
-            path_count=[0],
-            max_paths=max_paths,
-            timeout=[0, timeout],
-        ))
-    poss_paths_start_neg_end_pos = list(
-        find_paths_with_allowed_unitigs(
-            bubble["id"],
-            adjacency_dict,
-            start + "-",
-            end + "+",
-            path_count=[0],
-            max_paths=max_paths,
-            timeout=[0, timeout],
-        ))
-    poss_paths_end_pos_start_neg = list(
-        find_paths_with_allowed_unitigs(
-            bubble["id"],
-            adjacency_dict,
-            end + "+",
-            start + "-",
-            path_count=[0],
-            max_paths=max_paths,
-            timeout=[0, timeout],
-        ))
-    poss_paths_end_pos_start_pos = list(
-        find_paths_with_allowed_unitigs(
-            bubble["id"],
-            adjacency_dict,
-            end + "+",
-            start + "+",
-            path_count=[0],
-            max_paths=max_paths,
-            timeout=[0, timeout],
-        ))
-    poss_paths_end_neg_start_pos = list(
-        find_paths_with_allowed_unitigs(
-            bubble["id"],
-            adjacency_dict,
-            end + "-",
-            start + "+",
-            path_count=[0],
-            max_paths=max_paths,
-            timeout=[0, timeout],
-        ))
-    poss_paths_end_neg_start_neg = list(
-        find_paths_with_allowed_unitigs(
-            bubble["id"],
-            adjacency_dict,
-            end + "-",
-            start + "-",
-            path_count=[0],
-            max_paths=max_paths,
-            timeout=[0, timeout],
-        ))
-    poss_paths = (poss_paths_start_pos_end_neg + poss_paths_start_pos_end_pos +
-                  poss_paths_start_neg_end_pos + poss_paths_start_neg_end_neg +
-                  poss_paths_end_pos_start_neg + poss_paths_end_pos_start_pos +
-                  poss_paths_end_neg_start_pos + poss_paths_end_neg_start_neg)
-    logger.debug(f"Found {len(poss_paths)} possible paths for {bubble['id']}")
-    if len(poss_paths) == max_paths:
-        logger.warning(
-            f"Did not find all paths for bubble {bubble['id']}. Exited after finding {max_paths} possible paths."
-        )
-    logger.debug(f"Filtering possible paths for {bubble['id']}")
-    filtered_paths = filter_paths_by_criteria(unitigdb, poss_paths, start, end,
-                                              smallpath_maxlen, bigpath_minlen)
-    unitigdb.close()  # Close the connection after processing the chunk
+    logger.debug("Enumerating candidate paths for bubble {}", bubble["id"])
+
+    limits = SearchLimits(
+        bubble_id=bubble["id"],
+        max_paths=max_paths,
+        timeout_seconds=timeout if timeout > 0 else None,
+    )
+    orientation_pairs = []
+    for source, target in ((start, end), (end, start)):
+        for source_dir in ("+", "-"):
+            if not limits.should_continue():
+                break
+            for target_dir in ("+", "-"):
+                if not limits.should_continue():
+                    break
+                orientation_pairs.extend(
+                    list(
+                        find_paths_with_allowed_unitigs(
+                            bubble["id"],
+                            adjacency_dict,
+                            f"{source}{source_dir}",
+                            f"{target}{target_dir}",
+                            limits,
+                        )
+                    )
+                )
+        if not limits.should_continue():
+            break
+
+    logger.debug(
+        "Found {} potential paths for bubble {}", len(orientation_pairs), bubble["id"]
+    )
+    filtered_paths = filter_paths_by_criteria(
+        unitigdb,
+        orientation_pairs,
+        smallpath_maxlen,
+        bigpath_minlen,
+    )
+    unitigdb.close()
 
     # Add valid path pairs to the bubble object if any are found
     if filtered_paths:
@@ -296,13 +271,13 @@ def process_one_bubble(bubble, db_filepath, smallpath_maxlen, bigpath_minlen,
 
 
 def filter_bubbles(
-    bubble_path,
-    db_filepath,
-    smallpath_maxlen,
-    bigpath_minlen,
-    threads,
-    maxpaths,
-    timeout,
+    bubble_path: Path,
+    db_filepath: Path,
+    smallpath_maxlen: int,
+    bigpath_minlen: int,
+    threads: int,
+    maxpaths: int,
+    timeout: int,
 ):
     passing_bubbles = []
     bubbles = read_bubbles(
@@ -317,11 +292,16 @@ def filter_bubbles(
         timeout=timeout,
     )
 
-    with multiprocessing.Pool(processes=threads) as pool:
-        # Process each bubble in parallel using the partial function
-        for result in pool.map(process_bubble_with_args, bubbles):
+    if threads <= 1:
+        for bubble in bubbles:
+            result = process_bubble_with_args(bubble)
             if result is not None:
                 passing_bubbles.append(result)
+    else:
+        with multiprocessing.Pool(processes=threads) as pool:
+            for result in pool.imap_unordered(process_bubble_with_args, bubbles):
+                if result is not None:
+                    passing_bubbles.append(result)
 
     logger.info(f"Total number of passing bubbles: {len(passing_bubbles)}")
     return passing_bubbles
@@ -329,8 +309,10 @@ def filter_bubbles(
 
 @lru_cache(maxsize=1024)
 def parse_colors(color_string):
+    if not color_string or color_string == "None":
+        return [set()]
     color_options = color_string.split(" OR ")
-    return [set(option.split(",")) for option in color_options]
+    return [set(filter(None, option.split(","))) for option in color_options]
 
 
 def get_shared_colors(list_of_color_options, shared_color_threshold=90):
@@ -377,8 +359,9 @@ def get_shared_colors_exact(list_of_color_options):
     return shared_colors
 
 
-def dump_matching_bubbles(output_json_path, matching_bubbles):
-    with open(output_json_path, "w") as outfile:
+def dump_matching_bubbles(output_json_path: Path, matching_bubbles) -> None:
+    output_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_json_path.open("w") as outfile:
         json.dump(matching_bubbles, outfile, indent=4)
 
 
@@ -470,28 +453,33 @@ def main():
     elif args.verbose == 1:
         logger.remove()
         logger.add(sys.stderr, level="INFO")
-    elif args.verbose >= 2:
+    else:
         logger.remove()
         logger.add(sys.stderr, level="DEBUG")
 
-    # Check if the input files exist
-    if not os.path.isfile(args.bubblegun):
-        logger.error(
-            f"Error: The JSON file '{args.bubblegun}' does not exist.")
+    bubble_path = Path(args.bubblegun)
+    db_path = Path(args.db)
+    output_path = Path(args.output)
+
+    if not bubble_path.is_file():
+        logger.error("BubbleGun JSON file '{}' does not exist.", bubble_path)
+        return
+    if not db_path.is_file():
+        logger.error("SQLite database '{}' does not exist.", db_path)
         return
 
-    logger.info("Filtering bubbles...")
+    logger.info("Filtering bubbles from {}", bubble_path)
     matching_bubbles = filter_bubbles(
-        args.bubblegun,
-        args.db,
+        bubble_path,
+        db_path,
         args.postdeletionsize,
         args.predeletionsize,
         args.threads,
         args.maxpaths,
         args.timeout,
     )
-    dump_matching_bubbles(args.output, matching_bubbles)
-    logger.info("Filtered bubbles dumped to {}", args.output)
+    dump_matching_bubbles(output_path, matching_bubbles)
+    logger.info("Filtered bubbles dumped to {}", output_path)
 
 
 if __name__ == "__main__":

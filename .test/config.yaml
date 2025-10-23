@@ -23,6 +23,7 @@ use_conda:            True # build conda environments automatically by Snakemake
 kmer_length:          19
 trees_required:       True
 max_colors:           70
+produce_colored_deletions: True
   
 
 # (2) Mashtree parameters; notes:
