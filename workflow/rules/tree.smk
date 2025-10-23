@@ -34,18 +34,6 @@ rule tree_postprocessing:
             {input.nwk} {output.nwk}
         """
 
-
-# rule cp_final_tree_for_post_output:
-#    output:
-#        nw=fn_post_output_tree(_batch="{batch}"),
-#    input:
-#        nw=fn_tree_sorted(_batch="{batch}"),
-#    shell:
-#        """
-#        cp "{input.nw}" "{output.nw}"
-#        """
-
-
 rule symlink_nwk_tree:
     """
     Symlink a phylogenetic tree if possible (nwk)
@@ -66,30 +54,26 @@ rule symlink_nwk_tree:
 
 if not config["trees_required"]:
 
-    ruleorder: symlink_nwk_tree > tree_newick_mashtree
+    ruleorder: symlink_nwk_tree > tree_newick_attotree
 
-    rule tree_newick_mashtree:
+    rule tree_newick_attotree:
         """
-        Infer a phylogenetic tree from the assemblies belonging to a given batch
+        Infer a phylogenetic tree for the batch using attotree (distance + NJ).
         """
         output:
             nwk=fn_tree_dirty(_batch="{batch}"),
+            distance=fn_tree_distance(_batch="{batch}"),
         input:
-            w_batch_asms,
-        threads: config["mashtree_threads"]
-        params:
-            k=config["mashtree_kmer_length"],
-            s=config["mashtree_sketch_size"],
-            t=min(int(config["mashtree_threads"]), workflow.cores),  # ensure that the number of cores for MashTree doesn't go too low
+            manifest=dir_input() / "{batch}.txt",
         conda:
-            "../envs/mashtree.yaml"
+            "../envs/attotree.yml"
         shell:
             """
-            mashtree \\
-                --numcpus {params.t} \\
-                --kmerlength {params.k} \\
-                --sketch-size {params.s} \\
-                --seed 42  \\
-                {input} \\
-                | tee {output.nwk}
+            mkdir -p $(dirname {output.nwk})
+            mkdir -p $(dirname {output.distance})
+            attotree \\
+                -L {input.manifest} \\
+                -o {output.nwk} \\
+                -D \\
+            > {output.distance}
             """
