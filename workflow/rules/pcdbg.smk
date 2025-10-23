@@ -24,6 +24,6 @@ rule add_colorinfo_to_gfa:
             -m {input.unitigs_to_cuts} \\
             -d {input.sqldb} \\
             -o {output} \\
-            -vv \\
+            -v \\
             -mc {params.maxcolors}
         """

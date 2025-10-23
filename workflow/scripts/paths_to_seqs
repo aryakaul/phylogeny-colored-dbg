@@ -19,8 +19,8 @@ DNA_COMPLEMENT = str.maketrans("ACGTacgtnN", "TGCAtgcanN")
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert BubbleGun deletion bubble paths into FASTA sequences."
-    )
+        description=
+        "Convert BubbleGun deletion bubble paths into FASTA sequences.")
     parser.add_argument(
         "-b",
         "--bubblegun",
@@ -104,7 +104,7 @@ def assemble_path(
         if index == 0:
             assembled.append(seq)
         else:
-            assembled.append(seq[kmer_length - 1 :])
+            assembled.append(seq[kmer_length - 1:])
     return "".join(assembled)
 
 
@@ -132,11 +132,13 @@ def export_bubble_sequences(
     for bubble in bubbles:
         path_pairs = bubble.get("valid_path_pairs") or []
         if not path_pairs:
-            logger.debug("Skipping bubble {} (no valid path pairs)", bubble.get("id"))
+            logger.debug("Skipping bubble {} (no valid path pairs)",
+                         bubble.get("id"))
             continue
 
         bubble_id = str(bubble.get("id"))
-        unitig_ids = unitig_ids_from_pairs(path for pair in path_pairs for path in pair)
+        unitig_ids = unitig_ids_from_pairs(path for pair in path_pairs
+                                           for path in pair)
         sequences = lookup_unitig_sequences(conn, unitig_ids)
         missing = set(unitig_ids) - sequences.keys()
         if missing:
@@ -147,9 +149,11 @@ def export_bubble_sequences(
             )
             continue
 
-        for pair_index, (post_path, pre_path) in enumerate(path_pairs, start=1):
+        for pair_index, (post_path, pre_path) in enumerate(path_pairs,
+                                                           start=1):
             try:
-                post_sequence = assemble_path(post_path, sequences, kmer_length)
+                post_sequence = assemble_path(post_path, sequences,
+                                              kmer_length)
                 pre_sequence = assemble_path(pre_path, sequences, kmer_length)
             except KeyError as exc:
                 logger.warning(
@@ -162,8 +166,10 @@ def export_bubble_sequences(
 
             fasta_path = output_dir / f"{bubble_id}_pair{pair_index:03d}.fasta"
             with fasta_path.open("w") as handle:
-                handle.write(f">{bubble_id}|pair{pair_index}|post\n{post_sequence}\n")
-                handle.write(f">{bubble_id}|pair{pair_index}|pre\n{pre_sequence}\n")
+                handle.write(
+                    f">{bubble_id}|pair{pair_index}|post\n{post_sequence}\n")
+                handle.write(
+                    f">{bubble_id}|pair{pair_index}|pre\n{pre_sequence}\n")
             written += 1
     return written
 
@@ -177,11 +183,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     bubbles = load_bubbles(args.bubblegun)
     if not bubbles:
-        logger.warning("No bubbles present in {}; nothing to do", args.bubblegun)
+        logger.warning("No bubbles present in {}; nothing to do",
+                       args.bubblegun)
         return
 
     with sqlite3.connect(args.db) as conn:
-        fasta_count = export_bubble_sequences(conn, bubbles, args.output, args.kmer_length)
+        fasta_count = export_bubble_sequences(conn, bubbles, args.output,
+                                              args.kmer_length)
     logger.info("Wrote {} FASTA files to {}", fasta_count, args.output)
 
 

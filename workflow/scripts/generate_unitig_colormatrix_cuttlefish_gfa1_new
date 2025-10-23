@@ -10,14 +10,19 @@ gfa1 = sys.argv[1]
 fof = sys.argv[2]
 output = sys.argv[3]
 
+
 # Function to read file line by line
 def read_file_line_by_line(filename):
     with open(filename, "r") as file:
         for line in file:
             yield line.strip()
 
+
 # Read file of files using generator
-idx_to_filepath = {index: line for index, line in enumerate(read_file_line_by_line(fof))}
+idx_to_filepath = {
+    index: line
+    for index, line in enumerate(read_file_line_by_line(fof))
+}
 logger.debug("Read in {} files", len(idx_to_filepath))
 
 # Initialize a dictionary using defaultdict
@@ -49,8 +54,9 @@ for col_idx, (sample, unitigs) in enumerate(sample_to_unitigs.items()):
 logger.debug("Created sparse unitig matrix")
 
 # Convert to DataFrame and output
-df = pd.DataFrame.sparse.from_spmatrix(sparse_df, index=unitig_set, columns=idx_to_filepath.values())
+df = pd.DataFrame.sparse.from_spmatrix(sparse_df,
+                                       index=unitig_set,
+                                       columns=idx_to_filepath.values())
 df.to_csv(output, sep="\t")
 
 logger.debug("Outputted to {}", output)
-

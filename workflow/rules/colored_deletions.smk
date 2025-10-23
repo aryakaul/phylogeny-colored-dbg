@@ -24,7 +24,7 @@ rule find_colored_deletions:
             -b {input.bubblejson} \\
             --db {input.sql} \\
             -o {output} \\
-            -vv \\
+            -v \\
             --maxpaths {params.maxpaths} \\
             -to {params.timeout} \\
             --predeletionsize {params.predeletionsize} \\
@@ -49,6 +49,6 @@ checkpoint find_paths_for_deletions:
             -d {input.sql} \\
             -k {params.kmer_length} \\
             -b {input.deletionbubbles} \\
-            -vv \\
+            -v \\
             -o {output}
         """

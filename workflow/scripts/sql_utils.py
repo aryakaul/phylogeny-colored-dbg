@@ -69,7 +69,10 @@ def lookup_unitigs_batch(
         unitig_id: {
             "length": None,
             "colors": None,
-            "neighbors": {"+": [], "-": []},
+            "neighbors": {
+                "+": [],
+                "-": []
+            },
         }
         for unitig_id in ids
     }
@@ -85,7 +88,9 @@ def lookup_unitigs_batch(
             unitig_info[unitig_id]["length"] = length
             unitig_info[unitig_id]["colors"] = colors
 
-    missing = [uid for uid, meta in unitig_info.items() if meta["length"] is None]
+    missing = [
+        uid for uid, meta in unitig_info.items() if meta["length"] is None
+    ]
     if missing:
         preview = ", ".join(missing[:5])
         suffix = "..." if len(missing) > 5 else ""
@@ -110,7 +115,8 @@ def lookup_unitigs_batch(
                 """,
                 chunk,
             )
-            for unitig_id, unitig_dir, neighbor_id, neighbor_dir in cursor.fetchall():
+            for unitig_id, unitig_dir, neighbor_id, neighbor_dir in cursor.fetchall(
+            ):
                 meta = unitig_info.get(unitig_id)
                 if meta is None:
                     continue
@@ -132,13 +138,13 @@ def lookup_unitig_cached(
 
     result = lookup_unitigs_batch(conn, [unitig_id], output_neighbors)
     if not result:
-        raise KeyError(f"Unitig {unitig_id} not present in the SQLite database")
+        raise KeyError(
+            f"Unitig {unitig_id} not present in the SQLite database")
     return result[unitig_id]
 
 
-def lookup_unitig_sequences(
-    conn: sqlite3.Connection, unitig_ids: Iterable[str]
-) -> Dict[str, str]:
+def lookup_unitig_sequences(conn: sqlite3.Connection,
+                            unitig_ids: Iterable[str]) -> Dict[str, str]:
     """Fetch the DNA sequence for an iterable of unitig identifiers."""
 
     ids = _normalise_ids(unitig_ids)
@@ -172,7 +178,8 @@ def lookup_unitig_sequences(
     return sequences
 
 
-def lookup_unitig_sequence(conn: sqlite3.Connection, unitig_id: str) -> str | None:
+def lookup_unitig_sequence(conn: sqlite3.Connection,
+                           unitig_id: str) -> str | None:
     """Retrieve the sequence of a single unitig (or ``None`` if absent)."""
 
     sequences = lookup_unitig_sequences(conn, [unitig_id])

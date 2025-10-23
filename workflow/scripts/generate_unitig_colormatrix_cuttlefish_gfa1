@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import defaultdict
 from pathlib import Path
-import sys
 from typing import Dict, Iterable, List, Sequence, Set
 
 import pandas as pd
@@ -15,8 +15,8 @@ from loguru import logger
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert cuttlefish GFA1 output to a unitig presence/absence matrix."
-    )
+        description=
+        "Convert cuttlefish GFA1 output to a unitig presence/absence matrix.")
     parser.add_argument(
         "gfa",
         type=Path,
@@ -25,7 +25,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "fof",
         type=Path,
-        help="File-of-filenames enumerating the assemblies used for cuttlefish.",
+        help=
+        "File-of-filenames enumerating the assemblies used for cuttlefish.",
     )
     parser.add_argument(
         "output",
@@ -61,13 +62,20 @@ def load_sample_paths(fof_path: Path) -> List[str]:
             if entry:
                 samples.append(entry)
     if not samples:
-        raise ValueError(f"File-of-filenames '{fof_path}' does not contain any entries")
+        raise ValueError(
+            f"File-of-filenames '{fof_path}' does not contain any entries")
     logger.debug("Loaded {} assemblies from {}", len(samples), fof_path)
     return samples
 
 
-def parse_gfa_paths(gfa_path: Path, samples: Sequence[str]) -> Dict[str, Set[str]]:
+def parse_gfa_paths(gfa_path: Path,
+                    samples: Sequence[str]) -> Dict[str, Set[str]]:
     sample_to_unitigs: Dict[str, Set[str]] = defaultdict(set)
+
+    def strip_orientation(unitig: str) -> str:
+        if unitig and unitig[-1] in "+-":
+            return unitig[:-1]
+        return unitig
 
     with gfa_path.open("r") as handle:
         for line_number, raw in enumerate(handle, start=1):
@@ -84,11 +92,13 @@ def parse_gfa_paths(gfa_path: Path, samples: Sequence[str]) -> Dict[str, Set[str
             if not (1 <= ref_seq_idx <= len(samples)):
                 raise IndexError(
                     f"GFA references sample index {ref_seq_idx}, "
-                    f"but only {len(samples)} assemblies were provided"
-                )
+                    f"but only {len(samples)} assemblies were provided")
 
             sample = samples[ref_seq_idx - 1]
-            unitigs = {u.lstrip("+-") for u in parts[2].split(",") if u}
+            unitigs = {
+                strip_orientation(u)
+                for u in parts[2].split(",") if u
+            }
             sample_to_unitigs[sample].update(unitigs)
 
     for sample in samples:
@@ -106,8 +116,13 @@ def build_presence_matrix(
     sample_to_unitigs: Dict[str, Set[str]],
     samples: Sequence[str],
 ) -> pd.DataFrame:
-    all_unitigs = sorted({unitig for unitigs in sample_to_unitigs.values() for unitig in unitigs})
-    logger.debug("Constructing presence/absence matrix with {} unitigs", len(all_unitigs))
+    all_unitigs = sorted({
+        unitig
+        for unitigs in sample_to_unitigs.values()
+        for unitig in unitigs
+    })
+    logger.debug("Constructing presence/absence matrix with {} unitigs",
+                 len(all_unitigs))
 
     if not all_unitigs:
         # No unitigs observed; return an empty frame with requested columns.

@@ -18,6 +18,9 @@ INTERMEDIATE_DIR = Path(config["intermediate_dir"]).resolve()
 OUTPUT_DIR = Path(config["output_dir"]).resolve()
 KMER_LENGTH = int(config["kmer_length"])
 ALLOWED_FASTA_SUFFIXES = {"fa", "fasta", "fna", "ffa"}
+PARSIMONY_CONFIG = config.get("parsimony", {}) or {}
+PARSIMONY_MODE = PARSIMONY_CONFIG.get("mode", "fitch")
+SANKOFF_BRANCH_PENALTY = PARSIMONY_CONFIG.get("sankoff_branch_penalty")
 
 
 def dir_input() -> Path:
@@ -30,6 +33,33 @@ def dir_intermediate() -> Path:
 
 def dir_output() -> Path:
     return OUTPUT_DIR
+
+
+def parsimony_mode() -> str:
+    return PARSIMONY_MODE
+
+
+def parsimony_sankoff_penalty() -> Optional[float]:
+    return SANKOFF_BRANCH_PENALTY
+
+
+def parsimony_branch_penalty_flag() -> str:
+    value = parsimony_sankoff_penalty()
+    if value in (None, "", False):
+        return ""
+    return f"--branch-penalty {value}"
+
+
+def parsimony_label() -> str:
+    mode = parsimony_mode()
+    if mode == "sankoff":
+        value = parsimony_sankoff_penalty()
+        if value in (None, "", False):
+            return "sankoff-auto"
+        penalty = format(value, "g")
+        penalty = penalty.replace("-", "neg").replace(".", "p")
+        return f"sankoff-{penalty}"
+    return "fitch"
 
 
 #############################################
@@ -130,15 +160,25 @@ def _require_ext(ext: Optional[str] = None, _ext: Optional[str] = None) -> str:
     return value
 
 
-def fn_cuttlefish_out(*, batch: Optional[str] = None, _batch: Optional[str] = None, ext: Optional[str] = None, _ext: Optional[str] = None):
+def fn_cuttlefish_out(
+    *,
+    batch: Optional[str] = None,
+    _batch: Optional[str] = None,
+    ext: Optional[str] = None,
+    _ext: Optional[str] = None,
+):
     batch_id = _require_batch(batch, _batch)
     extension = _require_ext(ext, _ext)
-    return str(_cuttlefish_root(batch_id) / f"{batch_id}_compcoloreddbg_k{KMER_LENGTH}.{extension}")
+    return str(
+        _cuttlefish_root(batch_id) / f"{batch_id}_compcoloreddbg_k{KMER_LENGTH}.{extension}"
+    )
 
 
 def fn_colormtx(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(INTERMEDIATE_DIR / "cuttlefish" / f"{batch_id}_unitigcolors_k{KMER_LENGTH}.tsv")
+    return str(
+        INTERMEDIATE_DIR / "cuttlefish" / f"{batch_id}_unitigcolors_k{KMER_LENGTH}.tsv"
+    )
 
 
 def fn_uqcolors(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
@@ -148,22 +188,35 @@ def fn_uqcolors(batch: Optional[str] = None, _batch: Optional[str] = None) -> st
 
 def fn_redundantcolors(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(INTERMEDIATE_DIR / "cuttlefish" / f"{batch_id}_redundantcolors_k{KMER_LENGTH}.csv")
+    return str(
+        INTERMEDIATE_DIR / "cuttlefish" / f"{batch_id}_redundantcolors_k{KMER_LENGTH}.csv"
+    )
 
 
 def fn_minimalcuts(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_minimalcuts_k{KMER_LENGTH}")
+    label = parsimony_label()
+    return str(
+        _minimal_cuts_root(batch_id) /
+        f"{batch_id}_minimalcuts_{label}_k{KMER_LENGTH}")
 
 
-def fn_minimalcuts_plotdir(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+def fn_minimalcuts_plotdir(
+    batch: Optional[str] = None, _batch: Optional[str] = None
+) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_plots_k{KMER_LENGTH}")
+    label = parsimony_label()
+    return str(
+        _minimal_cuts_root(batch_id) /
+        f"{batch_id}_plots_{label}_k{KMER_LENGTH}")
 
 
 def fn_unitig2cuts(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_unitig2cuts_k{KMER_LENGTH}")
+    label = parsimony_label()
+    return str(
+        _minimal_cuts_root(batch_id) /
+        f"{batch_id}_unitig2cuts_{label}_k{KMER_LENGTH}")
 
 
 def fn_sqldb(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
@@ -210,14 +263,17 @@ def fn_deletionbubbles(batch: Optional[str] = None, _batch: Optional[str] = None
     return str(_bubble_root() / f"{batch_id}_k{KMER_LENGTH}_deletion-bubbles.json")
 
 
-def fn_deletionbubbles_chkpoint(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
+def fn_deletionbubbles_chkpoint(
+    batch: Optional[str] = None, _batch: Optional[str] = None
+) -> str:
     batch_id = _require_batch(batch, _batch)
     return str(INTERMEDIATE_DIR / "deletion-bubbles" / batch_id)
 
 
 def fn_pcdbg(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
-    return str(OUTPUT_DIR / f"{batch_id}_k{KMER_LENGTH}_pcdbg.gfa")
+    label = parsimony_label()
+    return str(OUTPUT_DIR / f"{batch_id}_k{KMER_LENGTH}_{label}_pcdbg.gfa")
 
 
 #############################################

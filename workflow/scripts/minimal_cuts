@@ -3,262 +3,330 @@
 from __future__ import annotations
 
 import argparse
+import math
 import multiprocessing
 import os
-import re
+import statistics
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, Iterator, List, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Tuple
 
 import ete4
 from ete4 import Tree
 from loguru import logger
 
-
-# Recursive function to compute the optimal costs, cuts, and colors at each node
-def compute_costs(node, target_leaves, all_leaf_coloring=False):
-    logger.debug("Processing node: {}", node.name)
-
-    if node.is_leaf:
-        logger.debug("Node {} is a leaf", node.name)
-
-        if node.name in target_leaves:
-            logger.debug("Node {} is a target red leaf", node.name)
-            return (0, 0), (float("inf"), 0), [], []
-        else:
-            logger.debug("Node {} is a non-target blue leaf", node.name)
-            return (float("inf"), 0), (0, 0), [], []
-
-    else:
-        logger.debug("Node {} is not a leaf. Evaluating children...",
-                     node.name)
-
-    red_cost, blue_cost = (0, 0), (0, 0)
-    red_cuts, blue_cuts = [], []
-
-    ambiguous_child = False
-    # Loop through all children of the current node
-    for child in node.children:
-        logger.debug("Evaluating child node: {}", child.name)
-
-        (
-            child_red_cost,
-            child_blue_cost,
-            child_red_cuts,
-            child_blue_cuts,
-        ) = compute_costs(child, target_leaves, all_leaf_coloring)
-
-        # Update the red and blue costs and cuts based on the child's costs
-        if child_red_cost[0] <= child_blue_cost[0] + 1:
-            red_cost = (
-                red_cost[0] + child_red_cost[0],
-                red_cost[1] + child_red_cost[1],
-            )
-            red_cuts.extend(child_red_cuts)
-        else:
-            red_cost = (red_cost[0] + child_blue_cost[0] + 1, red_cost[1] + 1)
-            red_cuts.extend(child_blue_cuts)
-            red_cuts.append(child.name)
-
-        if child_blue_cost[0] <= child_red_cost[0] + 1:
-            blue_cost = (
-                blue_cost[0] + child_blue_cost[0],
-                blue_cost[1] + child_blue_cost[1],
-            )
-            blue_cuts.extend(child_blue_cuts)
-        else:
-            blue_cost = (blue_cost[0] + child_red_cost[0] + 1,
-                         blue_cost[1] + 1)
-            blue_cuts.extend(child_red_cuts)
-            blue_cuts.append(child.name)
-
-        logger.debug(
-            "Computed costs for node {}: Red Cost = {}, Blue Cost = {}",
-            node.name,
-            red_cost,
-            blue_cost,
-        )
-
-    return red_cost, blue_cost, red_cuts, blue_cuts
+STATES: Tuple[str, str] = ("red", "blue")
+INF = float("inf")
+EPS = 1e-9
 
 
-def backtrack_and_recolor(root_color, tree, cuts):
-    # Convert the cuts list to a set for efficient lookups
-    cuts_set = set(cuts)
-
-    for node in tree.traverse("levelorder"):
-        logger.debug("Node: {}", node.name)
-        if node == tree:
-            node.add_features(color=root_color)
-            continue
-        parent_color = node.up.color
-        logger.debug("Parent's color: {}", parent_color)
-        child_color = parent_color
-        if node.name in cuts_set:
-            logger.debug("Cut found! Switching child's color")
-            if parent_color == "red":
-                child_color = "blue"
-            else:
-                child_color = "red"
-        logger.debug("Child's color: {}", child_color)
-        node.add_features(color=child_color)
-
-    # Build the result dictionary
-    color_dict = {
-        node.name: node.color
-        for node in tree.traverse() if node.name
-    }
-
-    return color_dict
+@dataclass
+class NodeDP:
+    node: Tree
+    children: List["NodeDP"]
+    cost_by_state: Dict[str, float]
+    child_state_options: Dict[str, List[List[str]]]
 
 
-# Read target leaf set as chunks
-def read_target_leaves(file_path, chunk_size):
+@dataclass
+class ParsimonySolution:
+    root_state: str
+    cuts: List[str]
+    colors: Dict[str, str]
 
-    def generate_chunks():
-        with open(file_path, "r") as f:
-            chunk = []
-            for line in f:
-                stripped_line = line.strip()
-                if stripped_line:
-                    chunk.append(set(stripped_line.split()))
-                    if len(chunk) == chunk_size:
-                        yield chunk
-                        chunk = []
+
+class ParsimonyModel:
+    name = "base"
+
+    def edge_cost(self, parent_state: str, child_state: str,
+                  child_node: Tree) -> float:
+        raise NotImplementedError
+
+
+class FitchModel(ParsimonyModel):
+    name = "fitch"
+
+    def edge_cost(self, parent_state: str, child_state: str,
+                  child_node: Tree) -> float:
+        return 0.0 if parent_state == child_state else 1.0
+
+
+class SankoffModel(ParsimonyModel):
+    name = "sankoff"
+
+    def __init__(self, branch_penalty: float, fallback_length: float):
+        self.branch_penalty = branch_penalty
+        self.fallback_length = fallback_length
+
+    def edge_cost(self, parent_state: str, child_state: str,
+                  child_node: Tree) -> float:
+        if parent_state == child_state:
+            return 0.0
+        length = child_node.dist
+        if length is None or length <= 0:
+            length = self.fallback_length
+        return self.branch_penalty * length
+
+
+def read_target_leaves(file_path: str,
+                       chunk_size: int) -> Iterator[List[set[str]]]:
+
+    def generate_chunks() -> Iterator[List[set[str]]]:
+        with open(file_path, "r") as handle:
+            chunk: List[set[str]] = []
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                chunk.append(set(stripped.split()))
+                if len(chunk) == chunk_size:
+                    yield chunk
+                    chunk = []
             if chunk:
                 yield chunk
 
     return generate_chunks()
 
 
-# def read_target_leaves(file_path):
-# with open(file_path, "r") as f:
-# Split each line by whitespace and store as a set in the list
-# return [set(line.strip().split()) for line in f if line.strip()]
-"""
-Code copied from Prophyle:
-    https://github.com/prophyle/prophyle/blob/50419f0c551f03eb6a3163f32cbc14713cd1a9bb/prophyle/prophyle_propagation_preprocessing.py#L43
-"""
+def autocomplete_internal_node_names(tree: Tree, newtreefile: str) -> Tree:
+    import re
 
-
-def autocomplete_internal_node_names(tree, newtreefile):
     logger.info("Autocompleting internal node names")
 
     re_inferred = re.compile(r"^(.*)-up(\d+)$")
-
     renamed_nodes = False
-    for n in tree.traverse("postorder"):
-        if n.is_leaf:
-            assert hasattr(n, "name")
-        else:
-            for x in n.children:
-                assert hasattr(x, "name")
+    for node in tree.traverse("postorder"):
+        if node.is_leaf:
+            continue
+        if not node.name:
+            child_names = [child.name for child in node.children if child.name]
+            if not child_names:
+                continue
+            candidate = sorted(child_names)[0]
+            match = re_inferred.match(candidate)
+            if match is not None:
+                label, idx = match.groups()
+                node.name = f"{label}-up{int(idx) + 1}"
+            else:
+                node.name = f"{candidate}-up1"
+            renamed_nodes = True
+            logger.debug("Named internal node {}", node.name)
 
-            if not hasattr(n, "name") or n.name == "" or n.name is None:
-                names = [x.name for x in n.children]
-                lmin_name = sorted(names)[0]
-
-                m = re_inferred.match(lmin_name)
-                if m is not None:
-                    left, right = m.groups()
-                    right = int(right) + 1
-                    n.name = "{}-up{}".format(left, right)
-                else:
-                    n.name = lmin_name + "-up1"
-                logger.debug("Named node {}", n.name)
-                renamed_nodes = True
     if renamed_nodes:
-        logger.info("Renamed internal nodes! Outputting new tree to {}",
-                    newtreefile)
+        logger.info("Writing renamed tree to {}", newtreefile)
         tree.write(parser=1, outfile=newtreefile)
     return tree
 
 
-def process_chunk(tree, chunk_data, all_leaf_coloring):
-    results = []
-    colors_info = []
+def build_dynamic_programming_tree(node: Tree, target_leaves: set[str],
+                                   model: ParsimonyModel) -> NodeDP:
+    if node.is_leaf:
+        cost_by_state = {
+            "red": 0.0 if node.name in target_leaves else INF,
+            "blue": 0.0 if node.name not in target_leaves else INF,
+        }
+        child_state_options = {state: [] for state in STATES}
+        return NodeDP(node=node,
+                      children=[],
+                      cost_by_state=cost_by_state,
+                      child_state_options=child_state_options)
 
-    for num, target_leaves in enumerate(chunk_data):
-        logger.debug("Processing leaf set - %s" % num)
-        logger.debug("Target leaves are %s" % target_leaves)
-        start_time = time.time()
-        (
-            root_red_cost,
-            root_blue_cost,
-            root_red_cuts,
-            root_blue_cuts,
-        ) = compute_costs(tree, target_leaves, all_leaf_coloring)
+    child_dps = [
+        build_dynamic_programming_tree(child, target_leaves, model)
+        for child in node.children
+    ]
 
-        # Determine the optimal color for the root
-        if root_red_cost[0] < root_blue_cost[0]:
-            best_cuts = root_red_cuts
-            root_decision = "red"
-        elif root_blue_cost[0] < root_red_cost[0]:
-            best_cuts = root_blue_cuts
-            root_decision = "blue"
-        else:
-            best_cuts = (root_red_cuts, root_blue_cuts)
-            root_decision = "ambiguous"
+    cost_by_state: Dict[str, float] = {}
+    child_state_options: Dict[str, List[List[str]]] = {}
 
-        if not best_cuts:
-            best_cuts = ["Root"]
+    for parent_state in STATES:
+        total_cost = 0.0
+        options_per_child: List[List[str]] = []
+        feasible = True
 
-        results.append(best_cuts)
+        for child_dp in child_dps:
+            best_cost = INF
+            best_states: List[str] = []
 
-        if all_leaf_coloring:
-            logger.info("Backtracking to color internal nodes...")
-            # Call the backtracking function
-            if root_decision != "ambiguous":
-                optimal_colors = backtrack_and_recolor(root_decision, tree,
-                                                       best_cuts)
+            for child_state in STATES:
+                child_cost = child_dp.cost_by_state.get(child_state, INF)
+                if math.isinf(child_cost):
+                    continue
+                edge_cost = model.edge_cost(parent_state, child_state,
+                                            child_dp.node)
+                combined = child_cost + edge_cost
+
+                if combined + EPS < best_cost:
+                    best_cost = combined
+                    best_states = [child_state]
+                elif abs(combined - best_cost) <= EPS:
+                    best_states.append(child_state)
+
+            if not best_states:
+                feasible = False
+                options_per_child.append([])
+                total_cost = INF
             else:
-                optimal_colors_red = backtrack_and_recolor(
-                    "red", tree, best_cuts[0])
-                optimal_colors_blue = backtrack_and_recolor(
-                    "blue", tree, best_cuts[1])
-                optimal_colors = (optimal_colors_red, optimal_colors_blue)
+                options_per_child.append(best_states)
+                total_cost += best_cost
 
-            # Store a tuple with the set number, the chosen color for the set, and the color mapping
-            colors_info.append((num, root_decision, optimal_colors))
+        if not feasible:
+            cost_by_state[parent_state] = INF
+        else:
+            cost_by_state[parent_state] = total_cost
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
+        child_state_options[parent_state] = options_per_child
 
-        logger.info("Took {:.2f} seconds.", elapsed_time)
+    return NodeDP(node=node,
+                  children=child_dps,
+                  cost_by_state=cost_by_state,
+                  child_state_options=child_state_options)
+
+
+def _select_child_state(child_dp: NodeDP, allowed_states: List[str]) -> str:
+    if not allowed_states:
+        raise ValueError("No feasible child states available during trace")
+    best_cost = min(child_dp.cost_by_state[state] for state in allowed_states)
+    candidates = [
+        state for state in allowed_states
+        if abs(child_dp.cost_by_state[state] - best_cost) <= EPS
+    ]
+    candidates.sort()
+    return candidates[0]
+
+
+def trace_solution(node_dp: NodeDP, parent_state: str) -> ParsimonySolution:
+    assignments: Dict[str, str] = {}
+    cuts: List[str] = []
+
+    def _trace(current_dp: NodeDP, current_state: str) -> None:
+        node = current_dp.node
+        if node.name:
+            assignments[node.name] = current_state
+
+        child_options = current_dp.child_state_options[current_state]
+        for idx, child_dp in enumerate(current_dp.children):
+            allowed_states = child_options[idx] if idx < len(
+                child_options) else []
+            if not allowed_states:
+                continue
+            child_state = _select_child_state(child_dp, allowed_states)
+            _trace(child_dp, child_state)
+            if node.name and child_dp.node.name and child_state != current_state:
+                cuts.append(child_dp.node.name)
+
+    _trace(node_dp, parent_state)
+
+    filtered_cuts = [cut for cut in cuts if cut]
+    if not filtered_cuts:
+        filtered_cuts = ["Root"]
+
+    return ParsimonySolution(root_state=parent_state,
+                             cuts=filtered_cuts,
+                             colors=dict(assignments))
+
+
+def run_parsimony(tree: Tree, target_leaves: set[str], model: ParsimonyModel,
+                  known_leaves: set[str]) -> List[ParsimonySolution]:
+    missing = target_leaves.difference(known_leaves)
+    if missing:
+        preview = ", ".join(sorted(missing)[:5])
+        suffix = "..." if len(missing) > 5 else ""
+        logger.warning(
+            "Ignoring {:,} target leaves absent from tree: {}{}",
+            len(missing),
+            preview,
+            suffix,
+        )
+        target_leaves = target_leaves.intersection(known_leaves)
+
+    dp_root = build_dynamic_programming_tree(tree, target_leaves, model)
+    min_cost = min(dp_root.cost_by_state.values())
+    if math.isinf(min_cost):
+        logger.error("No feasible solution for leaf set {}", target_leaves)
+        return []
+
+    solutions: List[ParsimonySolution] = []
+    for state in STATES:
+        if abs(dp_root.cost_by_state[state] - min_cost) <= EPS:
+            solution = trace_solution(dp_root, state)
+            solutions.append(solution)
+
+    return solutions
+
+
+def process_chunk(tree: Tree, chunk_data: List[set[str]],
+                  all_leaf_coloring: bool, model: ParsimonyModel,
+                  known_leaves: set[str]) -> Tuple[List[object], List[tuple]]:
+    results: List[object] = []
+    colors_info: List[tuple] = []
+
+    for idx, leaf_set in enumerate(chunk_data):
+        logger.debug("Processing leaf set {} ({} leaves)", idx, len(leaf_set))
+        start = time.time()
+        solutions = run_parsimony(tree, set(leaf_set), model, known_leaves)
+
+        if not solutions:
+            results.append(["Root"])
+            if all_leaf_coloring:
+                colors_info.append((idx, "infeasible", {}))
+            continue
+
+        if len(solutions) == 1:
+            cuts_payload = list(solutions[0].cuts)
+            results.append(cuts_payload if cuts_payload else ["Root"])
+            if all_leaf_coloring:
+                colors_info.append(
+                    (idx, solutions[0].root_state, dict(solutions[0].colors)))
+        else:
+            cuts_options = tuple(
+                list(sol.cuts) if sol.cuts else ["Root"] for sol in solutions)
+            results.append(cuts_options)
+            if all_leaf_coloring:
+                colors_info.append(
+                    (idx, "ambiguous",
+                     tuple(dict(sol.colors) for sol in solutions)))
+
+        elapsed = time.time() - start
+        logger.info("Processed leaf set {} in {:.2f}s", idx, elapsed)
 
     return results, colors_info
 
 
-def _process_chunk_from_args(args):
+def _process_chunk_from_args(
+    args: Tuple[Tree, List[set[str]], bool, ParsimonyModel, set[str]]
+) -> Tuple[List[object], List[tuple]]:
     return process_chunk(*args)
 
 
 def minimal_cuts_for_all_sets(
-    tree,
-    leaves_file_path,
-    chunk_size,
-    num_threads,
-    all_leaf_coloring=False,
-):
-    results = []
-    colors_info = []
+        tree: Tree,
+        leaves_file_path: str,
+        chunk_size: int,
+        num_threads: int,
+        model: ParsimonyModel,
+        known_leaves: set[str],
+        all_leaf_coloring: bool = False) -> Tuple[List[object], List[tuple]]:
+    results: List[object] = []
+    colors_info: List[tuple] = []
 
-    def task_iter():
+    def task_iter(
+    ) -> Iterable[Tuple[Tree, List[set[str]], bool, ParsimonyModel, set[str]]]:
         for chunk in read_target_leaves(leaves_file_path, chunk_size):
-            yield (tree, chunk, all_leaf_coloring)
+            yield (tree, chunk, all_leaf_coloring, model, known_leaves)
 
     if num_threads <= 1:
-        iterator = (process_chunk(*task) for task in task_iter())
-        for chunk_results, chunk_colors in iterator:
+        for task in task_iter():
+            chunk_results, chunk_colors = process_chunk(*task)
             results.extend(chunk_results)
             if all_leaf_coloring:
                 colors_info.extend(chunk_colors)
     else:
         with multiprocessing.Pool(num_threads) as pool:
             for chunk_results, chunk_colors in pool.imap_unordered(
-                _process_chunk_from_args, task_iter()
-            ):
+                    _process_chunk_from_args, task_iter()):
                 results.extend(chunk_results)
                 if all_leaf_coloring:
                     colors_info.extend(chunk_colors)
@@ -266,74 +334,72 @@ def minimal_cuts_for_all_sets(
     return results, colors_info if all_leaf_coloring else []
 
 
-def write_output(data, output_file=None):
-    if output_file:
-        with open(output_file, "w") as f:
-            f.write(str(data))
-    else:
-        print(data)
-
-
-def plot_tree_and_colors(tree, color_dict, output):
+def plot_tree_and_colors(tree: Tree, color_dict: Dict[str, str],
+                         output: str) -> None:
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     logger.debug("Saving tree to {}", output)
 
+    working_tree = tree.copy(method="deepcopy")
     ts = ete4.TreeStyle()
 
-    def label_nodes(node, color_dict):
-        # Set default color to black
-        node_color = "#000000"  # black
-
-        # Check the color from the dictionary
-        if node.name in color_dict:
-            if color_dict[node.name] == "red":
-                node_color = "#FF0000"  # red
-            elif color_dict[node.name] == "blue":
-                node_color = "#0000FF"  # blue
-            elif color_dict[node.name] == "purple":
-                node_color = "#800080"  # purple
+    def label_nodes(node: Tree) -> None:
+        node_color = "#000000"
+        state = color_dict.get(node.name)
+        if state == "red":
+            node_color = "#FF0000"
+        elif state == "blue":
+            node_color = "#0000FF"
 
         node.img_style["hz_line_color"] = node_color
         node.img_style["vt_line_color"] = node_color
-
-        if node.is_leaf:
-            if hasattr(node, "color_face"):
-                # Update the existing face's color
-                node.color_face.bgcolor = node_color
-                node.color_face.fgcolor = node_color
-            else:
-                name_face = ete4.faces.TextFace(node.name,
-                                                tight_text=False,
-                                                fsize=10)
-                node.add_face(name_face, column=0, position="aligned")
-                # Create a new face if it doesn't exist
-                rect_face = ete4.faces.RectFace(width=10,
-                                                height=10,
-                                                fgcolor=node_color,
-                                                bgcolor=node_color)
-                node.add_face(rect_face, column=1, position="aligned")
-                # Store the face in a custom attribute for later reference
-                node.color_face = rect_face
-
-        # Sets the style of internal nodes
         node.img_style["size"] = 10
         node.img_style["fgcolor"] = node_color
 
-    # Remove default labels
+        if node.is_leaf:
+            face = ete4.faces.TextFace(node.name, tight_text=False, fsize=10)
+            node.add_face(face, column=0, position="aligned")
+            rect_face = ete4.faces.RectFace(width=10,
+                                            height=10,
+                                            fgcolor=node_color,
+                                            bgcolor=node_color)
+            node.add_face(rect_face, column=1, position="aligned")
+
     ts.show_leaf_name = False
 
-    # Modify the layout function to accept a color dictionary
-    def custom_layout(node):
-        label_nodes(node, color_dict)
+    def custom_layout(node: Tree) -> None:
+        label_nodes(node)
 
     ts.layout_fn = custom_layout
     ts.draw_guiding_lines = True
-    tree.render(output, tree_style=ts)
+    working_tree.render(output, tree_style=ts)
 
 
-def main():
+def _configure_logger(verbosity: int) -> None:
+    logger.remove()
+    if verbosity == 0:
+        logger.add(sys.stderr, level="WARNING")
+    elif verbosity == 1:
+        logger.add(sys.stderr, level="INFO")
+    else:
+        logger.add(sys.stderr, level="DEBUG")
+
+
+def _derive_default_branch_penalty(tree: Tree) -> Tuple[float, float]:
+    lengths = [
+        node.dist for node in tree.traverse("postorder")
+        if node.up is not None and node.dist is not None and node.dist > 0
+    ]
+    if not lengths:
+        return 1.0, 1.0
+    mean_length = statistics.mean(lengths)
+    penalty = 1.0 / mean_length if mean_length > 0 else 1.0
+    return penalty, mean_length
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compute minimal cuts for coloring a tree.")
+        description=
+        "Compute minimal cuts for unitig presence/absence parsimony.")
     parser.add_argument("tree_file",
                         type=str,
                         help="Path to the Newick formatted tree file.")
@@ -345,8 +411,7 @@ def main():
         "--all",
         dest="all_solutions",
         action="store_true",
-        help=
-        "Return all solutions if both red and blue colorings have the same cost.",
+        help="Emit all optimal root-state solutions when ties occur.",
     )
     parser.add_argument(
         "-t",
@@ -354,26 +419,23 @@ def main():
         type=str,
         default=
         f"./minimalcuts_fullynamedtree_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.nwk",
-        help=
-        "Path to new tree file if internal nodes need to be renamed. If not \
-        provided and internal nodes do need renaming, then new tree is saved to \
-        './minimalcuts_fullynamedtree_YYYY-MM-DD-HH:mm:ss.nwk'",
+        help=("Path to write a renamed tree if internal nodes are unnamed. "
+              "Only used when renaming is required."),
     )
     parser.add_argument(
         "-o",
         "--output",
         type=str,
         default=None,
-        help=
-        "Path to output file. If not provided, output will be printed to stdout.",
+        help="Path to output file. Defaults to stdout.",
     )
     parser.add_argument(
         "-c",
         "--colors",
         type=str,
         default=None,
-        help=
-        "If specified, also output node colors for every leaf subset in leaves_file to this file.",
+        help=("If specified, also write node colors for each leaf subset "
+              "to this file."),
     )
     parser.add_argument(
         "-p",
@@ -381,109 +443,139 @@ def main():
         dest="plot",
         type=str,
         default=None,
-        help="Plot solutions using ete4 and save plots to specified directory.",
+        help="Plot solutions using ete4 and save plots to the given directory.",
     )
     parser.add_argument(
         "-j",
         "--threads",
         default=multiprocessing.cpu_count(),
         type=int,
-        help="Number of threads to use. Default is all available.",
+        help="Number of worker processes to use. Default uses all cores.",
     )
     parser.add_argument(
         "-cs",
         "--chunksize",
         default=5000,
         type=int,
-        help=
-        "How many leaf sets to analyze at once in parallel. Default is 5,000.",
+        help="Number of leaf sets to analyse per batch.",
+    )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        choices=("fitch", "sankoff"),
+        default="fitch",
+        help="Parsimony model to use for minimal cuts.",
+    )
+    parser.add_argument(
+        "--branch-penalty",
+        type=float,
+        default=None,
+        help=("Per-unit change penalty for Sankoff mode. "
+              "If omitted, a data-driven default is computed."),
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="count",
         default=0,
-        help=
-        "Increase verbosity level. Can be specified multiple times for more detailed logs.",
+        help="Increase verbosity. Repeat for more detailed logs.",
     )
 
     args = parser.parse_args()
 
-    if args.verbose == 0:
-        logger.remove()
-    elif args.verbose == 1:
-        logger.remove()
-        logger.add(sys.stderr, level="INFO")
-    elif args.verbose >= 2:
-        logger.remove()
-        logger.add(sys.stderr, level="DEBUG")
+    _configure_logger(args.verbose)
 
     with open(args.tree_file, "r") as handle:
         tree = Tree(handle, parser=1)
-    # tree = autocomplete_internal_node_names(tree, args.tree)
 
-    # all_target_leaves = read_target_leaves(args.leaves_file)
-    results, colors = minimal_cuts_for_all_sets(tree, args.leaves_file,
-                                                args.chunksize, args.threads,
-                                                args.colors)
+    if not tree.name:
+        tree.name = "Root"
 
-    # Write minimal cuts results to output or stdout
-    logger.info("Outputting cuts to {}", args.output or "stdout")
-    if args.output:
-        out_handle = open(args.output, "w")
+    unnamed_internal = [
+        node for node in tree.traverse("postorder")
+        if not node.is_leaf and not node.name
+    ]
+    if unnamed_internal:
+        logger.info("Detected {} unnamed internal nodes; autocompleting.",
+                    len(unnamed_internal))
+        tree = autocomplete_internal_node_names(tree, args.tree)
+
+    known_leaves = {
+        node.name
+        for node in tree.traverse("postorder") if node.is_leaf and node.name
+    }
+
+    if args.mode == "fitch":
+        model: ParsimonyModel = FitchModel()
+        logger.info("Using Fitch parsimony (unit cost transitions).")
     else:
-        out_handle = sys.stdout
+        default_penalty, mean_length = _derive_default_branch_penalty(tree)
+        branch_penalty = args.branch_penalty or default_penalty
+        logger.info(
+            "Using Sankoff parsimony with branch penalty {:.6f} "
+            "(mean branch length {:.6f}).", branch_penalty, mean_length)
+        model = SankoffModel(branch_penalty=branch_penalty,
+                             fallback_length=mean_length or 1.0)
+
+    results, colors = minimal_cuts_for_all_sets(tree,
+                                                args.leaves_file,
+                                                args.chunksize,
+                                                args.threads,
+                                                model,
+                                                known_leaves,
+                                                all_leaf_coloring=bool(
+                                                    args.colors))
+
+    logger.info("Writing minimal cuts to {}", args.output or "stdout")
+    if args.output:
+        writer = open(args.output, "w")
+    else:
+        writer = sys.stdout
+
     try:
         for result in results:
-            if isinstance(result,
-                          tuple) and args.all_solutions:  # Two solutions exist
-                out_handle.write(
-                    ",".join(result[0]) + " OR " + ",".join(result[1]) + "\n"
-                )
-            elif isinstance(result, tuple):
-                out_handle.write(",".join(result[0]) + "\n")
+            if isinstance(result, tuple):
+                first = ",".join(result[0])
+                if args.all_solutions and len(result) > 1:
+                    second = ",".join(result[1])
+                    writer.write(f"{first} OR {second}\n")
+                else:
+                    writer.write(f"{first}\n")
             else:
-                out_handle.write(",".join(result) + "\n")
+                writer.write(",".join(result) + "\n")
     finally:
         if args.output:
-            out_handle.close()
+            writer.close()
 
-    # Write coloring output also
     if args.colors:
-        logger.info("Writing node colouring metadata to {}", args.colors)
-        with open(args.colors, "w") as out_colors:
-            for color in colors:
-                colordict = color[2]
-                if isinstance(colordict, tuple):
-                    if args.all_solutions:
-                        out_colors.write(
-                            f"{colordict[0]} OR {colordict[1]}\n"
-                        )
+        logger.info("Writing node colours to {}", args.colors)
+        with open(args.colors, "w") as handle:
+            for entry in colors:
+                color_payload = entry[2]
+                if isinstance(color_payload, tuple):
+                    if args.all_solutions and len(color_payload) > 1:
+                        handle.write(
+                            f"{color_payload[0]} OR {color_payload[1]}\n")
                     else:
-                        out_colors.write(f"{colordict[0]}\n")
+                        handle.write(f"{color_payload[0]}\n")
                 else:
-                    out_colors.write(f"{colordict}\n")
-        # plot trees
+                    handle.write(f"{color_payload}\n")
+
         if args.plot:
             os.makedirs(args.plot, exist_ok=True)
-            for color in colors:
-                colordict = color[2]
-                if isinstance(colordict, tuple):
-                    if args.all_solutions:
-                        output = os.path.join(
-                            args.plot, "leafset-%s-solution1.svg" % color[0])
-                        plot_tree_and_colors(tree, colordict[0], output)
-                        output = os.path.join(
-                            args.plot, "leafset-%s-solution2.svg" % color[0])
-                        plot_tree_and_colors(tree, colordict[1], output)
-                    else:
-                        output = os.path.join(
-                            args.plot, "leafset-%s-solution1.svg" % color[0])
-                        plot_tree_and_colors(tree, colordict[0], output)
+            logger.info("Rendering colour plots to {}", args.plot)
+            for entry in colors:
+                idx, _, color_payload = entry
+                if isinstance(color_payload, tuple):
+                    for solution_idx, mapping in enumerate(color_payload, 1):
+                        path = os.path.join(
+                            args.plot,
+                            f"leafset-{idx}-solution{solution_idx}.svg")
+                        plot_tree_and_colors(tree, mapping, path)
                 else:
-                    output = os.path.join(args.plot,
-                                          "leafset-%s-solution.svg" % color[0])
-                    plot_tree_and_colors(tree, colordict, output)
+                    path = os.path.join(args.plot,
+                                        f"leafset-{idx}-solution.svg")
+                    plot_tree_and_colors(tree, color_payload, path)
 
 
 if __name__ == "__main__":
