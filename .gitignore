@@ -4,3 +4,5 @@ slurm-*
 AGENT*
 .test/.conda
 .test/.snakemake/
+.test/intermediate/
+.test/output/
