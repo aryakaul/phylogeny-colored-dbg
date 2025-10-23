@@ -4,6 +4,25 @@ from pathlib import Path
 SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 
 
+rule compression_metrics:
+    output:
+        metrics=fn_compression_metrics(_batch="{batch}"),
+    input:
+        uqcolors=fn_uqcolors(_batch="{batch}"),
+        unitigs_to_cuts=fn_unitig2cuts(_batch="{batch}"),
+    params:
+        script=str(SCRIPTS_DIR / "compute_compression_metrics"),
+    conda:
+        "../envs/pandas.yml"
+    shell:
+        """
+        {params.script} \\
+            --cuttlefish {input.uqcolors} \\
+            --pcdbg {input.unitigs_to_cuts} \\
+            --output {output.metrics}
+        """
+
+
 rule add_colorinfo_to_gfa:
     input:
         sqldb=fn_sqldb(_batch="{batch}"),

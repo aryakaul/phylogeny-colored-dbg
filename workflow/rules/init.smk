@@ -219,6 +219,18 @@ def fn_unitig2cuts(batch: Optional[str] = None, _batch: Optional[str] = None) ->
         f"{batch_id}_unitig2cuts_{label}_k{KMER_LENGTH}")
 
 
+def fn_compression_metrics(
+    batch: Optional[str] = None, _batch: Optional[str] = None
+) -> str:
+    batch_id = _require_batch(batch, _batch)
+    label = parsimony_label()
+    return str(
+        INTERMEDIATE_DIR
+        / "metrics"
+        / f"{batch_id}_compression_{label}_k{KMER_LENGTH}.tsv"
+    )
+
+
 def fn_sqldb(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
     return str(INTERMEDIATE_DIR / "sqldb" / f"{batch_id}_k{KMER_LENGTH}.sqldb")
