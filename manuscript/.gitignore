@@ -1,0 +1,6 @@
+results/
+*.tsv
+*.csv
+*.pdf
+*.png
+*.svg
