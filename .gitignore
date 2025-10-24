@@ -4,3 +4,4 @@ slurm-*
 AGENT*
 .test/.conda
 .test/.snakemake/
+.ipynb*/
