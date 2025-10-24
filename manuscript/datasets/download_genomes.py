@@ -1,50 +1,64 @@
 #!/usr/bin/env python3
-"""Download representative genome cohorts for pcDBG experiments.
+"""Download high-quality genome cohorts for pcDBG experiments.
 
-The script wraps `ncbi-genome-download` to pull a small number of genomes for
-species with varying genomic complexity. It writes manifests that can be fed
-directly into the pcDBG workflow and creates placeholder tree files for manual
-curation.
+This script ensures that we retrieve at least 500 high-quality genomes for
+each target genus. It first performs a dry-run metadata sweep with
+`ncbi-genome-download`, ranks assemblies by curation status and assembly
+level, then downloads the selected cohort and writes manifests compatible
+with the pcDBG Snakemake workflow.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime as dt
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from shutil import which
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+
+HIGH_QUALITY_ASSEMBLY_LEVELS = ("complete", "chromosome")
+ASSEMBLY_LEVEL_ARG = ",".join(HIGH_QUALITY_ASSEMBLY_LEVELS)
+HIGH_QUALITY_CATEGORIES = ("reference", "representative", "na")
+REFSEQ_CATEGORY_ARG = ",".join(HIGH_QUALITY_CATEGORIES)
+
+ASSEMBLY_LEVEL_CANONICAL = {
+    "complete": "complete_genome",
+    "complete_genome": "complete_genome",
+    "chromosome": "chromosome",
+    "scaffold": "scaffold",
+    "contig": "contig",
+}
+
+CATEGORY_CANONICAL = {
+    "reference": "reference_genome",
+    "reference_genome": "reference_genome",
+    "representative": "representative_genome",
+    "representative_genome": "representative_genome",
+    "na": "na",
+}
+
+ALLOWED_ASSEMBLY_LEVELS = {"complete_genome", "chromosome"}
+CATEGORY_PRIORITY = {"reference_genome": 0, "representative_genome": 1, "na": 2, "": 3}
+ASSEMBLY_PRIORITY = {"complete_genome": 0, "chromosome": 1, "scaffold": 2, "contig": 3, "": 4}
 
 
 @dataclass(frozen=True)
 class Cohort:
     identifier: str
     group: str
-    species: str
-    default_limit: int
+    genus: str
+    target_count: int = 500
 
 
 COHORTS: List[Cohort] = [
-    Cohort(
-        identifier="listeria_low",
-        group="bacteria",
-        species="Listeria monocytogenes",
-        default_limit=10,
-    ),
-    Cohort(
-        identifier="mtbc_medium",
-        group="bacteria",
-        species="Mycobacterium tuberculosis",
-        default_limit=20,
-    ),
-    Cohort(
-        identifier="ecoli_high",
-        group="bacteria",
-        species="Escherichia coli",
-        default_limit=40,
-    ),
+    Cohort(identifier="listeria", group="bacteria", genus="Listeria"),
+    Cohort(identifier="mycobacterium", group="bacteria", genus="Mycobacterium"),
+    Cohort(identifier="escherichia", group="bacteria", genus="Escherichia"),
 ]
 
 
@@ -66,12 +80,13 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--section",
         default="refseq",
-        help="NCBI section to download from (refseq or genbank).",
+        choices=("refseq", "genbank"),
+        help="NCBI section to download from (default: refseq).",
     )
     parser.add_argument(
-        "--limit",
+        "--min-genomes",
         type=int,
-        help="Override the number of genomes to fetch for every cohort.",
+        help="Override the minimum number of genomes to fetch per cohort (default: 500).",
     )
     parser.add_argument(
         "--cohort",
@@ -79,15 +94,129 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         choices=[c.identifier for c in COHORTS],
         help="Download only the specified cohort(s). Can be used multiple times.",
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=4,
+        help="Number of parallel downloads to run (passed to ncbi-genome-download).",
+    )
     return parser.parse_args(argv)
 
 
 def ensure_tool_present() -> None:
-    if which("ncbi-genome-download") is None:
+    if shutil.which("ncbi-genome-download") is None:
         raise RuntimeError(
             "ncbi-genome-download is not available on PATH. "
             "Install it via `pip install ncbi-genome-download`."
         )
+
+
+def ensure_fasta_requested(formats: str) -> None:
+    requested = {fmt.strip().lower() for fmt in formats.split(",") if fmt.strip()}
+    if "fasta" not in requested:
+        raise RuntimeError(
+            "The download formats must include 'fasta' so manifests can reference FASTA files."
+        )
+
+
+def canonicalize_assembly_level(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    cleaned = value.strip().lower().replace(" ", "_")
+    return ASSEMBLY_LEVEL_CANONICAL.get(cleaned, cleaned)
+
+
+def canonicalize_refseq_category(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    cleaned = value.strip().lower().replace(" ", "_")
+    return CATEGORY_CANONICAL.get(cleaned, cleaned)
+
+
+def release_date_score(row: dict) -> int:
+    for key in ("seq_rel_date", "release_date"):
+        raw = (row.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = dt.datetime.strptime(raw, "%Y-%m-%d").date()
+            return -int(parsed.strftime("%Y%m%d"))
+        except ValueError:
+            continue
+    return 0
+
+
+def priority_key(row: dict) -> Tuple[int, int, int, str]:
+    category = canonicalize_refseq_category(row.get("refseq_category"))
+    assembly = canonicalize_assembly_level(row.get("assembly_level"))
+    return (
+        CATEGORY_PRIORITY.get(category, CATEGORY_PRIORITY[""]),
+        ASSEMBLY_PRIORITY.get(assembly, ASSEMBLY_PRIORITY[""]),
+        release_date_score(row),
+        row.get("assembly_accession", ""),
+    )
+
+
+def load_metadata(metadata_path: Path) -> Tuple[List[dict], List[str]]:
+    if not metadata_path.exists():
+        raise RuntimeError(f"Expected metadata table at {metadata_path}, but it was not created.")
+
+    with metadata_path.open(newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        fieldnames = reader.fieldnames or []
+        rows = [row for row in reader if row.get("assembly_accession")]
+
+    if not rows:
+        raise RuntimeError(
+            f"No assemblies were returned in the metadata table at {metadata_path}."
+        )
+    return rows, fieldnames
+
+
+def select_high_quality(rows: Sequence[dict], minimum: int) -> List[dict]:
+    candidates = [
+        row
+        for row in rows
+        if canonicalize_assembly_level(row.get("assembly_level")) in ALLOWED_ASSEMBLY_LEVELS
+    ]
+    if len(candidates) < minimum:
+        raise RuntimeError(
+            f"Only {len(candidates)} assemblies meet the quality criteria (complete/chromosome). "
+            f"Need at least {minimum} genomes."
+        )
+
+    ordered = sorted(candidates, key=priority_key)
+    selected: List[dict] = []
+    seen: set[str] = set()
+    for row in ordered:
+        accession = (row.get("assembly_accession") or "").strip()
+        if not accession or accession in seen:
+            continue
+        selected.append(row)
+        seen.add(accession)
+        if len(selected) == minimum:
+            break
+
+    if len(selected) < minimum:
+        raise RuntimeError(
+            f"After removing duplicates only {len(selected)} assemblies were available (need {minimum})."
+        )
+    return selected
+
+
+def write_metadata(fieldnames: Sequence[str], rows: Sequence[dict], destination: Path) -> None:
+    resolved_fields: List[str]
+    if fieldnames:
+        resolved_fields = list(fieldnames)
+    elif rows:
+        resolved_fields = sorted(rows[0].keys())
+    else:
+        raise RuntimeError("Cannot write metadata without field names or rows.")
+
+    with destination.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=resolved_fields, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def run_download(
@@ -95,67 +224,141 @@ def run_download(
     out_dir: Path,
     formats: str,
     section: str,
-    limit_override: Optional[int],
-) -> None:
+    min_genomes_override: Optional[int],
+    parallel: int,
+) -> List[Path]:
+    target = cohort.target_count
+    if min_genomes_override is not None and min_genomes_override > target:
+        target = min_genomes_override
+
     cohort_dir = out_dir / cohort.identifier
     assemblies_dir = cohort_dir / "assemblies"
-    metadata_path = cohort_dir / "metadata.tsv"
+    metadata_candidates = cohort_dir / "metadata_candidates.tsv"
+    selected_accessions_path = cohort_dir / "selected_accessions.txt"
+    metadata_subset_path = cohort_dir / "metadata.tsv"
 
     cohort_dir.mkdir(parents=True, exist_ok=True)
+    if assemblies_dir.exists():
+        shutil.rmtree(assemblies_dir)
+    assemblies_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
+    for path in (metadata_candidates, selected_accessions_path, metadata_subset_path):
+        if path.exists():
+            path.unlink()
+
+    metadata_cmd = [
         "ncbi-genome-download",
         cohort.group,
         "--section",
         section,
         "--formats",
         formats,
-        "--species",
-        cohort.species,
+        "--genera",
+        cohort.genus,
         "--output-folder",
         str(assemblies_dir),
         "--metadata-table",
-        str(metadata_path),
+        str(metadata_candidates),
+        "--assembly-levels",
+        ASSEMBLY_LEVEL_ARG,
+        "--refseq-categories",
+        REFSEQ_CATEGORY_ARG,
         "--parallel",
-        "4",
+        str(parallel),
+        "--dry-run",
     ]
-    limit = limit_override if limit_override is not None else cohort.default_limit
-    if limit > 0:
-        cmd.extend(["--limit", str(limit)])
 
-    print(f"[INFO] Downloading {cohort.species} ({limit} genomes)…")
-    subprocess.run(cmd, check=True)
-    print(f"[INFO] Finished downloading {cohort.identifier}")
+    print(
+        f"[INFO] Resolving catalog for genus {cohort.genus} in {cohort.group} "
+        f"(targeting {target} genomes)…"
+    )
+    subprocess.run(metadata_cmd, check=True)
+
+    metadata_rows, fieldnames = load_metadata(metadata_candidates)
+    selected_rows = select_high_quality(metadata_rows, target)
+
+    accessions = [(row.get("assembly_accession") or "").strip() for row in selected_rows]
+    selected_accessions_path.write_text("\n".join(accessions) + "\n")
+    write_metadata(fieldnames, selected_rows, metadata_subset_path)
+
+    download_cmd = [
+        "ncbi-genome-download",
+        cohort.group,
+        "--section",
+        section,
+        "--formats",
+        formats,
+        "--assembly-accessions",
+        str(selected_accessions_path),
+        "--output-folder",
+        str(assemblies_dir),
+        "--assembly-levels",
+        ASSEMBLY_LEVEL_ARG,
+        "--refseq-categories",
+        REFSEQ_CATEGORY_ARG,
+        "--parallel",
+        str(parallel),
+    ]
+
+    print(f"[INFO] Downloading {len(accessions)} assemblies for genus {cohort.genus}…")
+    subprocess.run(download_cmd, check=True)
+
+    fasta_paths = sorted(assemblies_dir.rglob("*.fna.gz"))
+    if not fasta_paths:
+        fasta_paths = sorted(assemblies_dir.rglob("*.fna"))
+
+    if len(fasta_paths) < target:
+        raise RuntimeError(
+            f"Expected at least {target} FASTA files for genus {cohort.genus}, "
+            f"but found {len(fasta_paths)} under {assemblies_dir}."
+        )
+
+    print(
+        f"[INFO] Finished downloading {len(fasta_paths)} FASTA files for genus {cohort.genus}."
+    )
+    return fasta_paths
 
 
-def write_manifest_and_tree(cohort: Cohort, out_dir: Path) -> None:
+def write_manifest_and_tree(
+    cohort: Cohort,
+    out_dir: Path,
+    fasta_paths: Sequence[Path],
+) -> None:
     cohort_dir = out_dir / cohort.identifier
     assemblies_dir = cohort_dir / "assemblies"
     manifest_path = cohort_dir / f"{cohort.identifier}.txt"
     tree_path = cohort_dir / f"{cohort.identifier}.nwk"
 
-    fasta_paths = sorted(assemblies_dir.glob("**/*.fna.gz"))
     if not fasta_paths:
         print(
-            f"[WARN] No FASTA files found for {cohort.identifier}; "
-            "manifest will be empty.",
+            f"[WARN] No FASTA files discovered for {cohort.identifier}; manifest will be empty.",
             file=sys.stderr,
         )
 
     manifest_path.write_text(
         "\n".join(str(path.resolve()) for path in fasta_paths) + ("\n" if fasta_paths else "")
     )
+
     if not tree_path.exists():
         tree_path.write_text(
             "# TODO: Replace this stub with a Newick tree covering the manifest samples.\n"
         )
+
     print(f"[INFO] Wrote manifest: {manifest_path}")
     print(f"[INFO] Tree placeholder: {tree_path}")
+    print(f"[INFO] Assemblies directory: {assemblies_dir}")
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parse_args(argv)
     ensure_tool_present()
+    ensure_fasta_requested(args.formats)
+
+    if args.min_genomes is not None and args.min_genomes < 1:
+        raise RuntimeError("--min-genomes must be a positive integer.")
+    if args.parallel < 1:
+        raise RuntimeError("--parallel must be a positive integer.")
+
     out_dir = args.output.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -166,14 +369,15 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     )
 
     for cohort in selected:
-        run_download(
+        fasta_paths = run_download(
             cohort=cohort,
             out_dir=out_dir,
             formats=args.formats,
             section=args.section,
-            limit_override=args.limit,
+            min_genomes_override=args.min_genomes,
+            parallel=args.parallel,
         )
-        write_manifest_and_tree(cohort=cohort, out_dir=out_dir)
+        write_manifest_and_tree(cohort=cohort, out_dir=out_dir, fasta_paths=fasta_paths)
 
     print("[INFO] All cohorts processed.")
 
