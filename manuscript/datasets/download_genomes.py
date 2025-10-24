@@ -19,6 +19,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 HIGH_QUALITY_ASSEMBLY_LEVELS = ("complete", "chromosome")
@@ -26,6 +28,7 @@ ASSEMBLY_LEVEL_ARG = ",".join(HIGH_QUALITY_ASSEMBLY_LEVELS)
 HIGH_QUALITY_CATEGORIES = ("reference", "representative", "na")
 REFSEQ_CATEGORY_ARG = ",".join(HIGH_QUALITY_CATEGORIES)
 
+ASSEMBLY_SUMMARY_BASE = "https://ftp.ncbi.nlm.nih.gov/genomes"
 ASSEMBLY_LEVEL_CANONICAL = {
     "complete": "complete_genome",
     "complete_genome": "complete_genome",
@@ -133,6 +136,55 @@ def canonicalize_refseq_category(value: Optional[str]) -> str:
     return CATEGORY_CANONICAL.get(cleaned, cleaned)
 
 
+def is_genus_match(organism_name: str, genus: str) -> bool:
+    if not organism_name:
+        return False
+    tokens = organism_name.strip().split()
+    if not tokens:
+        return False
+    return tokens[0].lower() == genus.lower()
+
+
+def fetch_genus_metadata(
+    section: str,
+    group: str,
+    genus: str,
+) -> Tuple[List[dict], List[str]]:
+    url = f"{ASSEMBLY_SUMMARY_BASE}/{section}/{group}/assembly_summary.txt"
+    header: Optional[List[str]] = None
+    rows: List[dict] = []
+
+    try:
+        with urlopen(url) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").rstrip("\n")
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    header = line.lstrip("#").strip().split("\t")
+                    continue
+                if not header:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < len(header):
+                    parts.extend([""] * (len(header) - len(parts)))
+                row = {header[i]: parts[i] for i in range(len(header))}
+                if not is_genus_match(row.get("organism_name", ""), genus):
+                    continue
+                if (row.get("version_status") or "").lower() != "latest":
+                    continue
+                rows.append(row)
+    except URLError as exc:
+        raise RuntimeError(f"Failed to fetch assembly summary from {url}: {exc}") from exc
+
+    if not rows:
+        raise RuntimeError(
+            f"No assemblies found for genus '{genus}' in section '{section}' group '{group}'."
+        )
+
+    return rows, header or []
+
+
 def release_date_score(row: dict) -> int:
     for key in ("seq_rel_date", "release_date"):
         raw = (row.get(key) or "").strip()
@@ -155,22 +207,6 @@ def priority_key(row: dict) -> Tuple[int, int, int, str]:
         release_date_score(row),
         row.get("assembly_accession", ""),
     )
-
-
-def load_metadata(metadata_path: Path) -> Tuple[List[dict], List[str]]:
-    if not metadata_path.exists():
-        raise RuntimeError(f"Expected metadata table at {metadata_path}, but it was not created.")
-
-    with metadata_path.open(newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
-        fieldnames = reader.fieldnames or []
-        rows = [row for row in reader if row.get("assembly_accession")]
-
-    if not rows:
-        raise RuntimeError(
-            f"No assemblies were returned in the metadata table at {metadata_path}."
-        )
-    return rows, fieldnames
 
 
 def select_high_quality(rows: Sequence[dict], minimum: int) -> List[dict]:
@@ -219,6 +255,17 @@ def write_metadata(fieldnames: Sequence[str], rows: Sequence[dict], destination:
         writer.writerows(rows)
 
 
+def cache_metadata_table(
+    section: str,
+    group: str,
+    genus: str,
+    destination: Path,
+) -> Tuple[List[dict], List[str]]:
+    rows, fieldnames = fetch_genus_metadata(section=section, group=group, genus=genus)
+    write_metadata(fieldnames, rows, destination)
+    return rows, fieldnames
+
+
 def run_download(
     cohort: Cohort,
     out_dir: Path,
@@ -246,35 +293,16 @@ def run_download(
         if path.exists():
             path.unlink()
 
-    metadata_cmd = [
-        "ncbi-genome-download",
-        cohort.group,
-        "--section",
-        section,
-        "--formats",
-        formats,
-        "--genera",
-        cohort.genus,
-        "--output-folder",
-        str(assemblies_dir),
-        "--metadata-table",
-        str(metadata_candidates),
-        "--assembly-levels",
-        ASSEMBLY_LEVEL_ARG,
-        "--refseq-categories",
-        REFSEQ_CATEGORY_ARG,
-        "--parallel",
-        str(parallel),
-        "--dry-run",
-    ]
-
     print(
         f"[INFO] Resolving catalog for genus {cohort.genus} in {cohort.group} "
         f"(targeting {target} genomes)…"
     )
-    subprocess.run(metadata_cmd, check=True)
-
-    metadata_rows, fieldnames = load_metadata(metadata_candidates)
+    metadata_rows, fieldnames = cache_metadata_table(
+        section=section,
+        group=cohort.group,
+        genus=cohort.genus,
+        destination=metadata_candidates,
+    )
     selected_rows = select_high_quality(metadata_rows, target)
 
     accessions = [(row.get("assembly_accession") or "").strip() for row in selected_rows]
