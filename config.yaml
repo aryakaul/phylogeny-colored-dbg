@@ -35,5 +35,5 @@ mashtree_sketch_size: 10000
 
 # (3) Parsimony parameters
 parsimony:
-  mode: sankoff                # fitch | sankoff
+  mode: fitch                # fitch | sankoff
   sankoff_branch_penalty:    null   # overrides auto-scaling penalty when set

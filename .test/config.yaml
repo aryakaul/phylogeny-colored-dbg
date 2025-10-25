@@ -20,7 +20,7 @@ use_conda:            True # build conda environments automatically by Snakemake
 #     - if trees_required is true, then the workflow will insist on user-provided trees
 #     - max_colors is the number of hexadecimal color codes to include in the dbg
 kmer_length:          21
-trees_required:       True
+trees_required:       False
 max_colors:           70
 tmp_dir:              .tmp
 produce_colored_deletions: True
