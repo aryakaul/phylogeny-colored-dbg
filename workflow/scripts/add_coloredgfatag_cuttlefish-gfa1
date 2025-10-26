@@ -1,144 +1,355 @@
 #!/usr/bin/env python3
+"""Annotate a cuttlefish GFA with colour tags derived from minimal-cut output."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sqlite3
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 import colorcet as cc
 from loguru import logger
-import argparse
-import os
-import sys
+
 from sql_utils import lookup_unitigs_batch
-import sqlite3
 
 
-def process_cuts_and_generate_palette(cutsperunitig, max_colors):
-    cut_countdict = {}
+def _token_sort_key(token: str) -> Tuple[int, Tuple[int, str]]:
+    """Sortable key that prefers numeric tokens while retaining string order."""
+    stripped = token.strip()
+    try:
+        value = int(stripped)
+        return (0, (value, stripped))
+    except ValueError:
+        return (1, (0, stripped))
 
-    logger.info("Counting cuts...")
-    with open(cutsperunitig, "r") as file:
-        for line in file:
-            parts = line.strip().split("\t")
-            if " OR " in parts[1]:
-                both_soln = parts[1].split(" OR ")
-                values = ",".join(sorted(both_soln[0].split(",")))
-            else:
-                values = ",".join(sorted(parts[1].split(",")))
-            if values != "Root":
-                cut_countdict[values] = cut_countdict.get(values, 0) + 1
 
-    logger.debug(cut_countdict)
-    logger.info("Generating color palette...")
-    palette = cc.glasbey[:max_colors]
-    most_common_cuts = sorted(cut_countdict.items(),
-                              key=lambda x: x[1],
-                              reverse=True)[:max_colors]
-    most_common_cuts_list = [key for key, _ in most_common_cuts]
-    cut_to_colors = {
-        cuts: palette[i]
-        for i, cuts in enumerate(most_common_cuts_list)
+def canonicalise_cut_option(option: str) -> str:
+    """Normalise a raw cut option into a stable, sorted representation."""
+    if option is None:
+        return "None"
+    stripped = option.strip()
+    if not stripped:
+        return "None"
+    if stripped.lower() == "none":
+        return "None"
+    if stripped == "Root":
+        return "Root"
+
+    tokens = [tok.strip() for tok in stripped.split(",") if tok.strip()]
+    if not tokens:
+        return "None"
+    unique_tokens = sorted(set(tokens), key=_token_sort_key)
+    return ",".join(unique_tokens)
+
+
+def parse_cut_options(raw: str) -> List[str]:
+    """Parse ``raw`` ("A OR B") into a sorted list of canonical cut strings."""
+    if raw is None:
+        return ["None"]
+    options = {
+        canonicalise_cut_option(option)
+        for option in raw.split(" OR ")
+        if option is not None
     }
-    cut_to_colors['Root'] = "#000000"
-    logger.debug(cut_to_colors)
+    if not options:
+        return ["None"]
+    return sorted(options)
 
-    return cut_to_colors
+
+def option_cardinality(option: str) -> int:
+    if option in {"Root", "None"}:
+        return 0
+    if not option:
+        return 0
+    return len([tok for tok in option.split(",") if tok])
 
 
-def modify_gfa_with_colors(gfa_filename, sqldb, cut_colors, outpath):
+def choose_primary_option(
+    options: Sequence[str],
+    frequency: Dict[str, int],
+    palette_seen: Set[str],
+) -> str:
+    """Select the primary colouring option that minimises palette expansion."""
+    if not options:
+        return "None"
+    if "Root" in options:
+        palette_seen.add("Root")
+        return "Root"
+
+    def rank(option: str) -> Tuple[int, int, int, str]:
+        seen_penalty = 0 if option in palette_seen else 1
+        freq_score = -frequency.get(option, 0)
+        cardinality = option_cardinality(option)
+        return (seen_penalty, freq_score, cardinality, option)
+
+    best = min(options, key=rank)
+    palette_seen.add(best)
+    return best
+
+
+def process_cuts_and_generate_palette(
+    cutsperunitig: Path,
+    max_colors: int,
+) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Tuple[str, ...]]]:
+    """
+    Read unitig → cut assignments, pick a primary solution per unitig that
+    minimises palette growth, and build a colour palette for the selected
+    combinations.
+    """
+    unitig_options: Dict[str, Tuple[str, ...]] = {}
+    frequency: Counter[str] = Counter()
+
+    with cutsperunitig.open("r") as handle:
+        for line_number, raw in enumerate(handle, start=1):
+            stripped = raw.rstrip("\n")
+            if not stripped:
+                continue
+            try:
+                unitig, payload = stripped.split("\t", maxsplit=1)
+            except ValueError:
+                logger.warning(
+                    "Line %d in %s is malformed; skipping: %r",
+                    line_number,
+                    cutsperunitig,
+                    stripped,
+                )
+                continue
+
+            options = tuple(parse_cut_options(payload))
+            if not options:
+                options = ("None",)
+            unitig_options[unitig] = options
+
+            for option in set(options):
+                if option not in {"Root", "None"}:
+                    frequency[option] += 1
+
+    if not unitig_options:
+        logger.warning("No unitig assignments found in %s", cutsperunitig)
+        return {"Root": "#000000"}, {}, {}
+
+    def order_key(item: Tuple[str, Tuple[str, ...]]) -> Tuple[int, int, str]:
+        _, options = item
+        best_freq = max(
+            (frequency.get(opt, 0) for opt in options if opt not in {"Root", "None"}),
+            default=0,
+        )
+        smallest_cardinality = min(option_cardinality(opt) for opt in options)
+        return (-best_freq, smallest_cardinality, item[0])
+
+    ordered_unitigs = sorted(unitig_options.items(), key=order_key)
+    palette_seen: Set[str] = {"Root", "None"}
+    primary: Dict[str, str] = {}
+    alternatives: Dict[str, Tuple[str, ...]] = {}
+    selected_counts: Counter[str] = Counter()
+
+    for unitig, options in ordered_unitigs:
+        choice = choose_primary_option(options, frequency, palette_seen)
+        primary[unitig] = choice
+        alternatives[unitig] = options
+        if choice not in {"Root", "None"}:
+            selected_counts[choice] += 1
+
+    palette = cc.glasbey[:max_colors]
+    ranked_combos = [
+        combo for combo, _ in selected_counts.most_common(max_colors)
+    ]
+    cut_to_colors: Dict[str, str] = {
+        combo: palette[idx] for idx, combo in enumerate(ranked_combos)
+    }
+    cut_to_colors["Root"] = "#000000"
+    cut_to_colors.setdefault("None", "#808080")
+
+    logger.info(
+        "Selected %d unique colour combinations (palette budget %d). "
+        "%d combinations assigned explicit colours.",
+        len({choice for choice in primary.values()}),
+        max_colors,
+        len(ranked_combos),
+    )
+
+    return cut_to_colors, primary, alternatives
+
+
+def write_alternatives_table(
+    output_path: Path | None,
+    primary: Dict[str, str],
+    alternatives: Dict[str, Tuple[str, ...]],
+) -> None:
+    if output_path is None:
+        return
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["unitig_id", "primary", "alternatives"])
+        for unitig in sorted(alternatives):
+            options = alternatives[unitig]
+            primary_choice = primary.get(unitig, options[0] if options else "None")
+            writer.writerow([
+                unitig,
+                primary_choice,
+                "|".join(options),
+            ])
+    logger.info("Wrote unitig colour alternatives to %s", output_path)
+
+
+def modify_gfa_with_colors(
+    gfa_filename: Path,
+    sqldb: Path,
+    cut_colors: Dict[str, str],
+    primary_choices: Dict[str, str],
+    alternatives: Dict[str, Tuple[str, ...]],
+    outpath: Path,
+) -> None:
     db = sqlite3.connect(sqldb)
     line_count = 0
-    logger.info(f"Generating new GFA file...")
+    logger.info("Annotating GFA with colour tags")
 
-    # Process the GFA file
-    # Write the modified GFA to a new file
-    os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    with open(outpath, "w") as out_file:
-        with open(gfa_filename, "r") as gfa_file:
+    os.makedirs(outpath.parent, exist_ok=True)
+    with outpath.open("w") as out_file:
+        with gfa_filename.open("r") as gfa_file:
             for line in gfa_file:
                 if line.startswith("S"):
                     parts = line.split()
                     segment_id = parts[1]
-                    logger.debug(f"Parsing {segment_id}")
-                    unitig_meta = lookup_unitigs_batch(db, [segment_id],
-                                                       output_neighbors=False)
+                    unitig_meta = lookup_unitigs_batch(
+                        db, [segment_id], output_neighbors=False
+                    )
                     segment_info = unitig_meta.get(segment_id)
-                    if not segment_info:
-                        logger.warning(
-                            "Segment {} missing from SQLite database; assigning grey colour",
+                    raw_cutstring = (
+                        segment_info.get("colors") if segment_info else None
+                    ) or "None"
+
+                    options = alternatives.get(segment_id)
+                    if options is None:
+                        options = tuple(parse_cut_options(raw_cutstring))
+                        alternatives[segment_id] = options
+
+                    primary_choice = primary_choices.get(segment_id)
+                    if primary_choice is None:
+                        primary_choice = options[0] if options else "None"
+                        primary_choices[segment_id] = primary_choice
+
+                    if len(options) > 1:
+                        logger.debug(
+                            "Unitig %s has %d colour solutions; selected %s",
                             segment_id,
+                            len(options),
+                            primary_choice,
                         )
-                        cutstring = "None"
-                    else:
-                        cutstring = segment_info.get("colors") or "None"
-                    logger.debug(f"Cutstring to parse: {cutstring}")
-                    if " OR " in cutstring:
-                        both_soln = cutstring.split(" OR ")
-                        logger.warning(
-                            f"Multiple solutions for {segment_id}. Only coloring by first solution"
-                        )
-                        cuts = ",".join(sorted(both_soln[0].split(",")))
-                    else:
-                        cuts = ",".join(sorted(cutstring.split(",")))
-                    logger.debug(f"Cutstring parsed to {cuts}")
-                    color = cut_colors.get(cuts, "#808080")
-                    logger.debug(f"Corresponding color: {color}")
-                    out_file.writelines(line.strip() +
-                                        f"\tCB:Z:{color}\tLB:Z:{cutstring}\n")
+
+                    color = cut_colors.get(primary_choice, "#808080")
+                    out_file.write(
+                        line.strip() +
+                        f"\tCB:Z:{color}\tLB:Z:{raw_cutstring}\n"
+                    )
                 elif line.startswith("P"):
                     continue
                 else:
-                    out_file.writelines(line)
+                    out_file.write(line)
+
                 line_count += 1
-                if line_count % 1000000 == 0:
-                    logger.debug(f"Processed {line_count} lines.")
-    logger.debug(f"Finished processing. Total lines processed: {line_count}")
-    logger.info(f"Finished writing to {outpath}")
+                if line_count % 1_000_000 == 0:
+                    logger.debug("Processed %d GFA records", line_count)
+
+    logger.info("Finished writing coloured GFA to %s", outpath)
     db.close()
 
 
-def main():
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Add color information and cuts to the GFA file specified")
-    parser.add_argument("-m",
-                        "--mincuts",
-                        type=str,
-                        help="Path to minimal cuts per unitig file")
-    parser.add_argument("-d", "--sqldb", type=str, help="Path to SQL db")
-    parser.add_argument("-g", "--gfa", type=str, help="Path to GFA input file")
-    parser.add_argument("-o",
-                        "--output",
-                        type=str,
-                        help="Path to the output gfa file for BandageNG")
+        description="Add colour information and minimal-cut labels to a GFA.")
+    parser.add_argument(
+        "-m",
+        "--mincuts",
+        type=Path,
+        required=True,
+        help="Path to the unitig-to-cut assignments (tab-separated).",
+    )
+    parser.add_argument(
+        "-d",
+        "--sqldb",
+        type=Path,
+        required=True,
+        help="Path to the pcDBG SQLite database.",
+    )
+    parser.add_argument(
+        "-g",
+        "--gfa",
+        type=Path,
+        required=True,
+        help="Path to the cuttlefish GFA1 file.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="Destination path for the coloured GFA.",
+    )
+    parser.add_argument(
+        "--alternatives-table",
+        type=Path,
+        default=None,
+        help="Optional path to write unitig colour alternatives (TSV).",
+    )
     parser.add_argument(
         "-mc",
         "--max_colors",
         type=int,
         default=20,
-        help="How many colors to visualize. Max is 70, default is 20.",
+        help="Maximum number of colour combinations to visualise (default 20).",
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="count",
         default=0,
-        help=
-        "Increase verbosity level. Can be specified multiple times for more detailed logs.",
+        help="Increase verbosity (specify twice for DEBUG).",
     )
+    return parser.parse_args(argv)
 
-    args = parser.parse_args()
 
-    if args.verbose == 0:
+def configure_logging(verbosity: int) -> None:
+    if verbosity <= 0:
         logger.remove()
-    elif args.verbose == 1:
+    elif verbosity == 1:
         logger.remove()
         logger.add(sys.stderr, level="INFO")
-    elif args.verbose >= 2:
+    else:
         logger.remove()
         logger.add(sys.stderr, level="DEBUG")
 
-    cut_to_colors = process_cuts_and_generate_palette(args.mincuts,
-                                                      args.max_colors)
-    logger.info("Color palette generated")
-    modify_gfa_with_colors(args.gfa, args.sqldb, cut_to_colors, args.output)
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    configure_logging(args.verbose)
+
+    cut_colors, primary_choices, alternatives = process_cuts_and_generate_palette(
+        args.mincuts,
+        args.max_colors,
+    )
+
+    modify_gfa_with_colors(
+        gfa_filename=args.gfa,
+        sqldb=args.sqldb,
+        cut_colors=cut_colors,
+        primary_choices=primary_choices,
+        alternatives=alternatives,
+        outpath=args.output,
+    )
+
+    write_alternatives_table(
+        args.alternatives_table,
+        primary_choices,
+        alternatives,
+    )
 
 
-# Main Execution
 if __name__ == "__main__":
     main()

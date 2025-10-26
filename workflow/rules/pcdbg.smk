@@ -30,6 +30,7 @@ rule add_colorinfo_to_gfa:
         unitigs_to_cuts=fn_unitig2cuts(_batch="{batch}"),
     output:
         pcdbg=fn_pcdbg(_batch="{batch}"),
+        color_choices=fn_unitig_color_choices(_batch="{batch}"),
     params:
         script=str(SCRIPTS_DIR / "add_coloredgfatag_cuttlefish-gfa1"),
         maxcolors=70,
@@ -37,12 +38,13 @@ rule add_colorinfo_to_gfa:
         "../envs/pandas.yml"
     shell:
         """
-        mkdir -p $(dirname {output})
+        mkdir -p $(dirname {output.pcdbg})
         {params.script} \\
             -g {input.gfa} \\
             -m {input.unitigs_to_cuts} \\
             -d {input.sqldb} \\
-            -o {output} \\
+            -o {output.pcdbg} \\
+            --alternatives-table {output.color_choices} \\
             -v \\
             -mc {params.maxcolors}
         """

@@ -220,6 +220,18 @@ def fn_unitig2cuts(batch: Optional[str] = None, _batch: Optional[str] = None) ->
         f"{batch_id}_unitig2cuts_{label}_k{KMER_LENGTH}")
 
 
+def fn_unitig_color_choices(
+    batch: Optional[str] = None,
+    _batch: Optional[str] = None,
+) -> str:
+    batch_id = _require_batch(batch, _batch)
+    label = parsimony_label()
+    return str(
+        _minimal_cuts_root(batch_id) /
+        f"{batch_id}_unitig_colorchoices_{label}_k{KMER_LENGTH}.tsv"
+    )
+
+
 def fn_compression_metrics(
     batch: Optional[str] = None, _batch: Optional[str] = None
 ) -> str:
