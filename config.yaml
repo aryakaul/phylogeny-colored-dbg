@@ -21,10 +21,10 @@ use_conda:            True # build conda environments automatically by Snakemake
 #     - max_colors is the number of hexadecimal color codes to include in the dbg
 #     - tmp_dir is the path to a temp directory on your system.  
 kmer_length:          31
-trees_required:       True
+trees_required:       False
 max_colors:           70
 tmp_dir:              /n/scratch/users/a/ak586
-produce_colored_deletions: True
+produce_colored_deletions: False
   
 
 # (2) Mashtree parameters; notes:
@@ -35,5 +35,5 @@ mashtree_sketch_size: 10000
 
 # (3) Parsimony parameters
 parsimony:
-  mode: fitch                # fitch | sankoff
+  mode: sankoff                # fitch | sankoff
   sankoff_branch_penalty:    null   # overrides auto-scaling penalty when set
