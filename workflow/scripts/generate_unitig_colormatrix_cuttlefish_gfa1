@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
-from collections import defaultdict
+from array import array
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set
+from typing import Dict, List, Sequence, Tuple
 
-import pandas as pd
+import numpy as np
 from loguru import logger
+from scipy import sparse
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -32,6 +34,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "output",
         type=Path,
         help="Destination TSV file for the presence/absence matrix.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=5000,
+        help="Number of unitig rows to materialise at once when writing the TSV "
+        "(default: 5000).",
     )
     parser.add_argument(
         "-v",
@@ -68,79 +77,120 @@ def load_sample_paths(fof_path: Path) -> List[str]:
     return samples
 
 
-def parse_gfa_paths(gfa_path: Path,
-                    samples: Sequence[str]) -> Dict[str, Set[str]]:
-    sample_to_unitigs: Dict[str, Set[str]] = defaultdict(set)
+def strip_orientation(unitig: str) -> str:
+    if unitig and unitig[-1] in "+-":
+        return unitig[:-1]
+    return unitig
 
-    def strip_orientation(unitig: str) -> str:
-        if unitig and unitig[-1] in "+-":
-            return unitig[:-1]
-        return unitig
+
+def collect_presence_indices(
+    gfa_path: Path,
+    samples: Sequence[str],
+) -> Tuple[List[str], array, array]:
+    unitig_to_index: Dict[str, int] = {}
+    unitig_ids: List[str] = []
+    row_idx: array = array("I")
+    col_idx: array = array("I")
 
     with gfa_path.open("r") as handle:
         for line_number, raw in enumerate(handle, start=1):
-            parts = raw.strip().split()
-            if not parts or parts[0] != "P":
+            if not raw or raw[0] != "P":
                 continue
+            parts = raw.rstrip("\n").split()
+            if len(parts) < 3:
+                continue
+
             try:
-                ref_seq_idx = int(parts[1].split("_")[0].split(":")[1])
+                ref_seq_idx = int(parts[1].split("_")[0].split(":")[1]) - 1
             except (IndexError, ValueError) as exc:
                 raise ValueError(
                     f"Failed to parse reference index from '{parts[1]}' on line {line_number}"
                 ) from exc
 
-            if not (1 <= ref_seq_idx <= len(samples)):
+            if not (0 <= ref_seq_idx < len(samples)):
                 raise IndexError(
-                    f"GFA references sample index {ref_seq_idx}, "
+                    f"GFA references sample index {ref_seq_idx + 1}, "
                     f"but only {len(samples)} assemblies were provided")
 
-            sample = samples[ref_seq_idx - 1]
-            unitigs = {
-                strip_orientation(u)
-                for u in parts[2].split(",") if u
+            # Deduplicate unitigs within this path before recording indices.
+            unitigs_in_path = {
+                strip_orientation(token)
+                for token in parts[2].split(",") if token
             }
-            sample_to_unitigs[sample].update(unitigs)
-
-    for sample in samples:
-        sample_to_unitigs.setdefault(sample, set())
+            for unitig in unitigs_in_path:
+                idx = unitig_to_index.get(unitig)
+                if idx is None:
+                    idx = len(unitig_ids)
+                    unitig_to_index[unitig] = idx
+                    unitig_ids.append(unitig)
+                row_idx.append(idx)
+                col_idx.append(ref_seq_idx)
 
     logger.debug(
-        "Parsed GFA path information for {} samples ({} total unitigs)",
-        len(sample_to_unitigs),
-        sum(len(unitigs) for unitigs in sample_to_unitigs.values()),
+        "Collected %d unique unitigs across %d samples (%d assignments)",
+        len(unitig_ids),
+        len(samples),
+        len(row_idx),
     )
-    return sample_to_unitigs
+    return unitig_ids, row_idx, col_idx
 
 
-def build_presence_matrix(
-    sample_to_unitigs: Dict[str, Set[str]],
+def build_sparse_matrix(
+    unitig_ids: Sequence[str],
+    row_idx: array,
+    col_idx: array,
+    sample_count: int,
+) -> sparse.csr_matrix:
+    if not unitig_ids:
+        return sparse.csr_matrix((0, sample_count), dtype=np.uint8)
+
+    row_arr = np.frombuffer(row_idx, dtype=np.uint32).astype(np.int64, copy=False)
+    col_arr = np.frombuffer(col_idx, dtype=np.uint32).astype(np.int64, copy=False)
+    data = np.ones(row_arr.shape[0], dtype=np.uint8)
+
+    coo = sparse.coo_matrix(
+        (data, (row_arr, col_arr)),
+        shape=(len(unitig_ids), sample_count),
+        dtype=np.uint8,
+    )
+    csr = coo.tocsr()
+    if csr.nnz:
+        csr.data.fill(1)
+    return csr
+
+
+def write_presence_matrix(
+    matrix: sparse.csr_matrix,
+    unitig_ids: Sequence[str],
     samples: Sequence[str],
-) -> pd.DataFrame:
-    all_unitigs = sorted({
-        unitig
-        for unitigs in sample_to_unitigs.values()
-        for unitig in unitigs
-    })
-    logger.debug("Constructing presence/absence matrix with {} unitigs",
-                 len(all_unitigs))
+    output_path: Path,
+    chunk_size: int,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+        writer.writerow(["unitig", *samples])
 
-    if not all_unitigs:
-        # No unitigs observed; return an empty frame with requested columns.
-        return pd.DataFrame(0, index=[], columns=list(samples), dtype=int)
+        n_rows = matrix.shape[0]
+        if n_rows == 0:
+            return
 
-    df = pd.DataFrame(
-        0,
-        index=all_unitigs,
-        columns=list(samples),
-        dtype=int,
-    )
+        chunk = max(1, chunk_size)
+        logger.debug(
+            "Writing presence matrix in chunks of %d (total unitigs: %d, samples: %d)",
+            chunk,
+            n_rows,
+            matrix.shape[1],
+        )
 
-    for sample, unitigs in sample_to_unitigs.items():
-        if not unitigs:
-            continue
-        df.loc[list(unitigs), sample] = 1
-
-    return df
+        for start in range(0, n_rows, chunk):
+            stop = min(start + chunk, n_rows)
+            block = matrix[start:stop]
+            dense = np.asarray(block.toarray(), dtype=np.uint8)
+            local_unitigs = unitig_ids[start:stop]
+            for offset, unitig in enumerate(local_unitigs):
+                row_values = dense[offset].tolist()
+                writer.writerow([unitig, *row_values])
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -148,12 +198,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     configure_logging(args.verbose)
 
     samples = load_sample_paths(args.fof)
-    sample_to_unitigs = parse_gfa_paths(args.gfa, samples)
-    matrix = build_presence_matrix(sample_to_unitigs, samples)
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    matrix.to_csv(args.output, sep="\t")
-    logger.info("Wrote presence/absence matrix to {}", args.output)
+    unitig_ids, row_idx, col_idx = collect_presence_indices(args.gfa, samples)
+    matrix = build_sparse_matrix(unitig_ids, row_idx, col_idx, len(samples))
+    write_presence_matrix(matrix, unitig_ids, samples, args.output, args.chunk_size)
+    logger.info(
+        "Wrote presence/absence matrix to %s (%d unitigs × %d samples, %d ones)",
+        args.output,
+        matrix.shape[0],
+        matrix.shape[1],
+        matrix.nnz,
+    )
 
 
 if __name__ == "__main__":
