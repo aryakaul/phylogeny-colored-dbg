@@ -6,16 +6,13 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import sqlite3
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 import colorcet as cc
 from loguru import logger
-
-from sql_utils import lookup_unitigs_batch
 
 
 def _token_sort_key(token: str) -> Tuple[int, Tuple[int, str]]:
@@ -95,13 +92,19 @@ def choose_primary_option(
 def process_cuts_and_generate_palette(
     cutsperunitig: Path,
     max_colors: int,
-) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, Tuple[str, ...]]]:
+) -> Tuple[
+    Dict[str, str],
+    Dict[str, str],
+    Dict[str, Tuple[str, ...]],
+    Dict[str, str],
+]:
     """
     Read unitig → cut assignments, pick a primary solution per unitig that
     minimises palette growth, and build a colour palette for the selected
     combinations.
     """
     unitig_options: Dict[str, Tuple[str, ...]] = {}
+    raw_payloads: Dict[str, str] = {}
     frequency: Counter[str] = Counter()
 
     with cutsperunitig.open("r") as handle:
@@ -124,6 +127,7 @@ def process_cuts_and_generate_palette(
             if not options:
                 options = ("None",)
             unitig_options[unitig] = options
+            raw_payloads[unitig] = payload
 
             for option in set(options):
                 if option not in {"Root", "None"}:
@@ -131,7 +135,7 @@ def process_cuts_and_generate_palette(
 
     if not unitig_options:
         logger.warning("No unitig assignments found in %s", cutsperunitig)
-        return {"Root": "#000000"}, {}, {}
+        return {"Root": "#000000"}, {}, {}, {}
 
     def order_key(item: Tuple[str, Tuple[str, ...]]) -> Tuple[int, int, str]:
         _, options = item
@@ -147,6 +151,7 @@ def process_cuts_and_generate_palette(
     primary: Dict[str, str] = {}
     alternatives: Dict[str, Tuple[str, ...]] = {}
     selected_counts: Counter[str] = Counter()
+    palette_seen: Set[str] = {"Root", "None"}
 
     for unitig, options in ordered_unitigs:
         choice = choose_primary_option(options, frequency, palette_seen)
@@ -173,7 +178,7 @@ def process_cuts_and_generate_palette(
         len(ranked_combos),
     )
 
-    return cut_to_colors, primary, alternatives
+    return cut_to_colors, primary, alternatives, raw_payloads
 
 
 def write_alternatives_table(
@@ -200,35 +205,31 @@ def write_alternatives_table(
 
 def modify_gfa_with_colors(
     gfa_filename: Path,
-    sqldb: Path,
     cut_colors: Dict[str, str],
     primary_choices: Dict[str, str],
     alternatives: Dict[str, Tuple[str, ...]],
+    raw_payloads: Dict[str, str],
     outpath: Path,
 ) -> None:
-    db = sqlite3.connect(sqldb)
     line_count = 0
     logger.info("Annotating GFA with colour tags")
 
     os.makedirs(outpath.parent, exist_ok=True)
+    missing_ids: Set[str] = set()
     with outpath.open("w") as out_file:
         with gfa_filename.open("r") as gfa_file:
             for line in gfa_file:
                 if line.startswith("S"):
                     parts = line.split()
                     segment_id = parts[1]
-                    unitig_meta = lookup_unitigs_batch(
-                        db, [segment_id], output_neighbors=False
-                    )
-                    segment_info = unitig_meta.get(segment_id)
-                    raw_cutstring = (
-                        segment_info.get("colors") if segment_info else None
-                    ) or "None"
+                    raw_cutstring = raw_payloads.get(segment_id, "None")
 
                     options = alternatives.get(segment_id)
                     if options is None:
                         options = tuple(parse_cut_options(raw_cutstring))
                         alternatives[segment_id] = options
+                        if raw_cutstring != "None":
+                            missing_ids.add(segment_id)
 
                     primary_choice = primary_choices.get(segment_id)
                     if primary_choice is None:
@@ -258,7 +259,16 @@ def modify_gfa_with_colors(
                     logger.debug("Processed %d GFA records", line_count)
 
     logger.info("Finished writing coloured GFA to %s", outpath)
-    db.close()
+    if missing_ids:
+        preview = ", ".join(sorted(missing_ids)[:5])
+        suffix = "..." if len(missing_ids) > 5 else ""
+        logger.warning(
+            "%d unitigs were absent from the colour catalogue (examples: %s%s); "
+            "inline payloads were used.",
+            len(missing_ids),
+            preview,
+            suffix,
+        )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -330,17 +340,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     configure_logging(args.verbose)
 
-    cut_colors, primary_choices, alternatives = process_cuts_and_generate_palette(
+    cut_colors, primary_choices, alternatives, raw_payloads = process_cuts_and_generate_palette(
         args.mincuts,
         args.max_colors,
     )
 
     modify_gfa_with_colors(
         gfa_filename=args.gfa,
-        sqldb=args.sqldb,
         cut_colors=cut_colors,
         primary_choices=primary_choices,
         alternatives=alternatives,
+        raw_payloads=raw_payloads,
         outpath=args.output,
     )
 
