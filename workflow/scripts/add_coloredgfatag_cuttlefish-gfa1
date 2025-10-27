@@ -116,7 +116,7 @@ def process_cuts_and_generate_palette(
                 unitig, payload = stripped.split("\t", maxsplit=1)
             except ValueError:
                 logger.warning(
-                    "Line %d in %s is malformed; skipping: %r",
+                    "Line {} in {} is malformed; skipping: {!r}",
                     line_number,
                     cutsperunitig,
                     stripped,
@@ -134,7 +134,7 @@ def process_cuts_and_generate_palette(
                     frequency[option] += 1
 
     if not unitig_options:
-        logger.warning("No unitig assignments found in %s", cutsperunitig)
+        logger.warning("No unitig assignments found in {}", cutsperunitig)
         return {"Root": "#000000"}, {}, {}, {}
 
     def order_key(item: Tuple[str, Tuple[str, ...]]) -> Tuple[int, int, str]:
@@ -151,7 +151,6 @@ def process_cuts_and_generate_palette(
     primary: Dict[str, str] = {}
     alternatives: Dict[str, Tuple[str, ...]] = {}
     selected_counts: Counter[str] = Counter()
-    palette_seen: Set[str] = {"Root", "None"}
 
     for unitig, options in ordered_unitigs:
         choice = choose_primary_option(options, frequency, palette_seen)
@@ -171,8 +170,7 @@ def process_cuts_and_generate_palette(
     cut_to_colors.setdefault("None", "#808080")
 
     logger.info(
-        "Selected %d unique colour combinations (palette budget %d). "
-        "%d combinations assigned explicit colours.",
+        "Selected {} unique colour combinations (palette budget {}). {} combinations assigned explicit colours.",
         len({choice for choice in primary.values()}),
         max_colors,
         len(ranked_combos),
@@ -200,7 +198,7 @@ def write_alternatives_table(
                 primary_choice,
                 "|".join(options),
             ])
-    logger.info("Wrote unitig colour alternatives to %s", output_path)
+    logger.info("Wrote unitig colour alternatives to {}", output_path)
 
 
 def modify_gfa_with_colors(
@@ -238,7 +236,7 @@ def modify_gfa_with_colors(
 
                     if len(options) > 1:
                         logger.debug(
-                            "Unitig %s has %d colour solutions; selected %s",
+                            "Unitig {} has {} colour solutions; selected {}",
                             segment_id,
                             len(options),
                             primary_choice,
@@ -256,15 +254,14 @@ def modify_gfa_with_colors(
 
                 line_count += 1
                 if line_count % 1_000_000 == 0:
-                    logger.debug("Processed %d GFA records", line_count)
+                    logger.debug("Processed {} GFA records", line_count)
 
-    logger.info("Finished writing coloured GFA to %s", outpath)
+    logger.info("Finished writing coloured GFA to {}", outpath)
     if missing_ids:
         preview = ", ".join(sorted(missing_ids)[:5])
         suffix = "..." if len(missing_ids) > 5 else ""
         logger.warning(
-            "%d unitigs were absent from the colour catalogue (examples: %s%s); "
-            "inline payloads were used.",
+            "{} unitigs were absent from the colour catalogue (examples: {}{}); inline payloads were used.",
             len(missing_ids),
             preview,
             suffix,
