@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+Detect concordance breakpoints in a phylogeny-colored de Bruijn graph.
+
+A concordance breakpoint is an edge where adjacent unitigs have discordant
+phylogenetic assignments - indicating a boundary between regions with
+different evolutionary histories.
+
+Input:
+  - SQLite database with unitigs (colors) and adjacency tables
+  - Newick tree with named internal nodes
+
+Output:
+  - TSV with breakpoint edges and discordance metrics
+"""
+
+from __future__ import annotations
+
+import argparse
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+from ete4 import Tree
+from loguru import logger
+
+
+def configure_logging(verbosity: int) -> None:
+    """Set up loguru logging based on verbosity level."""
+    logger.remove()
+    if verbosity == 0:
+        logger.add(sys.stderr, level="WARNING")
+    elif verbosity == 1:
+        logger.add(sys.stderr, level="INFO")
+    else:
+        logger.add(sys.stderr, level="DEBUG")
+
+
+def load_tree(tree_path: Path) -> Tree:
+    """Load and return the phylogenetic tree."""
+    with tree_path.open("r") as handle:
+        tree = Tree(handle.read(), parser=1)
+    logger.info("Loaded tree with {} leaves", len(list(tree.leaves())))
+    return tree
+
+
+def build_node_depth_map(tree: Tree) -> Dict[str, int]:
+    """
+    Build a mapping from node name to depth (distance from root in edges).
+
+    Root has depth 0, its children have depth 1, etc.
+    """
+    depth_map: Dict[str, int] = {}
+
+    for node in tree.traverse("preorder"):
+        if node.up is None:
+            depth_map[node.name] = 0
+        else:
+            parent_depth = depth_map.get(node.up.name, 0)
+            depth_map[node.name] = parent_depth + 1
+
+    logger.debug("Built depth map for {} nodes", len(depth_map))
+    return depth_map
+
+
+def build_node_lookup(tree: Tree) -> Dict[str, Tree]:
+    """Build a mapping from node name to node object for fast lookup."""
+    return {node.name: node for node in tree.traverse() if node.name}
+
+
+def compute_tree_distance(
+    node_a: str,
+    node_b: str,
+    node_lookup: Dict[str, Tree],
+) -> Tuple[int, Optional[str]]:
+    """
+    Compute the topological distance between two nodes in the tree.
+
+    Returns:
+        (distance, mrca_name): Number of edges between nodes and their MRCA name.
+        Returns (-1, None) if either node is not found.
+    """
+    if node_a not in node_lookup or node_b not in node_lookup:
+        return (-1, None)
+
+    tree_node_a = node_lookup[node_a]
+    tree_node_b = node_lookup[node_b]
+
+    # Get ancestors of each node
+    ancestors_a: Set[str] = set()
+    current = tree_node_a
+    while current is not None:
+        if current.name:
+            ancestors_a.add(current.name)
+        current = current.up
+
+    # Find MRCA by walking up from node_b
+    mrca = None
+    current = tree_node_b
+    while current is not None:
+        if current.name and current.name in ancestors_a:
+            mrca = current
+            break
+        current = current.up
+
+    if mrca is None:
+        return (-1, None)
+
+    # Count edges from each node to MRCA
+    dist_a = 0
+    current = tree_node_a
+    while current is not None and current.name != mrca.name:
+        dist_a += 1
+        current = current.up
+
+    dist_b = 0
+    current = tree_node_b
+    while current is not None and current.name != mrca.name:
+        dist_b += 1
+        current = current.up
+
+    return (dist_a + dist_b, mrca.name)
+
+
+def parse_assignment(raw_colors: str) -> List[str]:
+    """
+    Parse the colors/assignment string from the database.
+
+    Handles formats like:
+      - "NodeA,NodeB" (multiple assignments)
+      - "NodeA OR NodeB" (alternative solutions)
+      - "Root"
+      - "None"
+
+    Returns list of assigned node names (taking first option if OR present).
+    """
+    if not raw_colors or raw_colors.lower() == "none":
+        return []
+
+    # Take first alternative if multiple solutions
+    if " OR " in raw_colors:
+        raw_colors = raw_colors.split(" OR ")[0]
+
+    # Split comma-separated nodes
+    nodes = [n.strip() for n in raw_colors.split(",") if n.strip()]
+    return nodes
+
+
+def get_primary_assignment(raw_colors: str) -> Optional[str]:
+    """
+    Get the primary (first) assignment from a colors string.
+
+    For concordance comparison, we use the first/primary assignment.
+    """
+    assignments = parse_assignment(raw_colors)
+    if not assignments:
+        return None
+    return assignments[0]
+
+
+def detect_breakpoints(
+    db_path: Path,
+    tree: Tree,
+    min_tree_distance: int = 1,
+) -> List[Dict]:
+    """
+    Detect concordance breakpoints by scanning all edges in the adjacency table.
+
+    Args:
+        db_path: Path to SQLite database
+        tree: Phylogenetic tree
+        min_tree_distance: Minimum tree distance to report as breakpoint
+
+    Returns:
+        List of breakpoint records
+    """
+    node_lookup = build_node_lookup(tree)
+    depth_map = build_node_depth_map(tree)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    # Query all edges with their assignments
+    query = """
+        SELECT
+            a.unitig_id AS unitig_a,
+            a.unitig_direction AS dir_a,
+            a.neighbor_id AS unitig_b,
+            a.neighbor_direction AS dir_b,
+            u1.colors AS colors_a,
+            u2.colors AS colors_b,
+            u1.length AS len_a,
+            u2.length AS len_b
+        FROM adjacency a
+        JOIN unitigs u1 ON a.unitig_id = u1.unitig_id
+        JOIN unitigs u2 ON a.neighbor_id = u2.unitig_id
+    """
+
+    breakpoints = []
+    total_edges = 0
+    concordant = 0
+    discordant = 0
+    unassigned = 0
+
+    logger.info("Scanning edges for concordance breakpoints...")
+
+    for row in conn.execute(query):
+        total_edges += 1
+
+        assign_a = get_primary_assignment(row["colors_a"])
+        assign_b = get_primary_assignment(row["colors_b"])
+
+        # Skip if either unitig has no assignment
+        if assign_a is None or assign_b is None:
+            unassigned += 1
+            continue
+
+        # Check if assignments are the same
+        if assign_a == assign_b:
+            concordant += 1
+            continue
+
+        # Compute tree distance between assignments
+        tree_dist, mrca = compute_tree_distance(assign_a, assign_b, node_lookup)
+
+        if tree_dist < 0:
+            # One or both nodes not found in tree
+            logger.debug(
+                "Could not compute distance for {} -> {}: {} vs {}",
+                row["unitig_a"], row["unitig_b"], assign_a, assign_b
+            )
+            continue
+
+        if tree_dist >= min_tree_distance:
+            discordant += 1
+            breakpoints.append({
+                "unitig_a": row["unitig_a"],
+                "dir_a": row["dir_a"],
+                "unitig_b": row["unitig_b"],
+                "dir_b": row["dir_b"],
+                "assignment_a": assign_a,
+                "assignment_b": assign_b,
+                "depth_a": depth_map.get(assign_a, -1),
+                "depth_b": depth_map.get(assign_b, -1),
+                "tree_distance": tree_dist,
+                "mrca": mrca,
+                "len_a": row["len_a"],
+                "len_b": row["len_b"],
+            })
+
+        if total_edges % 100000 == 0:
+            logger.info("Processed {:,} edges...", total_edges)
+
+    conn.close()
+
+    logger.info(
+        "Scan complete: {:,} total edges, {:,} concordant, {:,} discordant, {:,} unassigned",
+        total_edges, concordant, discordant, unassigned
+    )
+
+    return breakpoints
+
+
+def write_breakpoints(breakpoints: List[Dict], output_path: Path) -> None:
+    """Write breakpoints to TSV file."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    columns = [
+        "unitig_a", "dir_a", "unitig_b", "dir_b",
+        "assignment_a", "assignment_b",
+        "depth_a", "depth_b", "tree_distance", "mrca",
+        "len_a", "len_b"
+    ]
+
+    with output_path.open("w") as handle:
+        handle.write("\t".join(columns) + "\n")
+        for bp in breakpoints:
+            row = [str(bp.get(col, "")) for col in columns]
+            handle.write("\t".join(row) + "\n")
+
+    logger.info("Wrote {:,} breakpoints to {}", len(breakpoints), output_path)
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Detect concordance breakpoints in a phylogeny-colored DBG."
+    )
+    parser.add_argument(
+        "-d", "--database",
+        type=Path,
+        required=True,
+        help="Path to pcDBG SQLite database.",
+    )
+    parser.add_argument(
+        "-t", "--tree",
+        type=Path,
+        required=True,
+        help="Path to Newick tree with named internal nodes.",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=Path,
+        required=True,
+        help="Output TSV file for breakpoints.",
+    )
+    parser.add_argument(
+        "--min-distance",
+        type=int,
+        default=1,
+        help="Minimum tree distance to report as breakpoint (default: 1).",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (use twice for debug).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    configure_logging(args.verbose)
+
+    logger.info("Loading tree from {}", args.tree)
+    tree = load_tree(args.tree)
+
+    logger.info("Detecting breakpoints from {}", args.database)
+    breakpoints = detect_breakpoints(
+        args.database,
+        tree,
+        min_tree_distance=args.min_distance,
+    )
+
+    write_breakpoints(breakpoints, args.output)
+
+    # Summary statistics
+    if breakpoints:
+        distances = [bp["tree_distance"] for bp in breakpoints]
+        logger.info(
+            "Tree distance distribution: min={}, max={}, mean={:.2f}",
+            min(distances), max(distances), sum(distances) / len(distances)
+        )
+
+
+if __name__ == "__main__":
+    main()

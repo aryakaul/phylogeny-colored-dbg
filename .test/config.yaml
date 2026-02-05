@@ -24,6 +24,7 @@ trees_required:       False
 max_colors:           70
 tmp_dir:              .tmp
 produce_colored_deletions: True
+produce_breakpoints: True
   
 
 # (2) Mashtree parameters; notes:
