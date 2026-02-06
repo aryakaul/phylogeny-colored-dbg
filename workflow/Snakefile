@@ -21,9 +21,11 @@ include: "rules/sqldb.smk"
 include: "rules/pcdbg.smk"
 include: "rules/bubblegun.smk"
 include: "rules/colored_deletions.smk"
+include: "rules/breakpoints.smk"
 
 
 PRODUCE_COLORED_DELETIONS = config.get("produce_colored_deletions", True)
+PRODUCE_BREAKPOINTS = config.get("produce_breakpoints", False)
 
 pcdbg_targets = expand(fn_pcdbg(_batch="{batch}"), batch=get_batches())
 compression_targets = expand(
@@ -32,6 +34,12 @@ compression_targets = expand(
 deletion_targets = (
     expand(fn_deletionbubbles(_batch="{batch}"), batch=get_batches())
     if PRODUCE_COLORED_DELETIONS
+    else []
+)
+breakpoint_targets = (
+    expand(fn_breakpoints(_batch="{batch}"), batch=get_batches())
+    + expand(fn_breakpoint_summary(_batch="{batch}"), batch=get_batches())
+    if PRODUCE_BREAKPOINTS
     else []
 )
 
@@ -44,4 +52,4 @@ wildcard_constraints:
 
 rule all:
     input:
-        pcdbg_targets + compression_targets + deletion_targets,
+        pcdbg_targets + compression_targets + deletion_targets + breakpoint_targets,

@@ -25,6 +25,7 @@ trees_required:       False
 max_colors:           70
 tmp_dir:              /n/scratch/users/a/ak586
 produce_colored_deletions: False
+produce_breakpoints: True
   
 
 # (2) Mashtree parameters; notes:
