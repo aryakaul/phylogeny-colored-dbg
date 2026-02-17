@@ -15,6 +15,7 @@ rule run_cuttlefish:
     params:
         k=config["kmer_length"],
         temp=f"{config.get('tmp_dir', 'tmp')}" + "/{batch}_cuttlefish",
+    threads: 8
     shell:
         """
         ulimit -n 2048
