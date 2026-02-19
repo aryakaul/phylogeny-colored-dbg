@@ -22,6 +22,7 @@ PARSIMONY_CONFIG = config.get("parsimony", {}) or {}
 PARSIMONY_MODE = PARSIMONY_CONFIG.get("mode", "fitch")
 SANKOFF_BRANCH_PENALTY = PARSIMONY_CONFIG.get("sankoff_branch_penalty")
 TREES_REQUIRED = bool(config.get("trees_required", True))
+MAX_THREADS = int(config.get("threads", 8))
 
 
 def dir_input() -> Path:

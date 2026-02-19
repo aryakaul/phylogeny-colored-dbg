@@ -67,12 +67,14 @@ if not config["trees_required"]:
             manifest=dir_input() / "{batch}.txt",
         conda:
             "../envs/attotree.yml"
+        threads: MAX_THREADS
         shell:
             """
             mkdir -p $(dirname {output.nwk})
             mkdir -p $(dirname {output.distance})
             attotree \\
                 -L {input.manifest} \\
+                -t {threads} \\
                 -o {output.nwk} \\
                 -D \\
             > {output.distance}

@@ -18,6 +18,7 @@ rule minimal_cuts_percolorset:
         branch_penalty_flag=parsimony_branch_penalty_flag(),
     conda:
         "../envs/ete4.yml"
+    threads: MAX_THREADS
     shell:
         """
 
@@ -31,7 +32,8 @@ rule minimal_cuts_percolorset:
             --all \\
             --mode {params.mode} \\
             {params.branch_penalty_flag} \\
-            -cs {params.chunksize}
+            -cs {params.chunksize} \\
+            -j {threads}
         """
 
 
