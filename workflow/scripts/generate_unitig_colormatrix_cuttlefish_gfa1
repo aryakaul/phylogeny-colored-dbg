@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
+import time
 from array import array
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -73,7 +73,7 @@ def load_sample_paths(fof_path: Path) -> List[str]:
     if not samples:
         raise ValueError(
             f"File-of-filenames '{fof_path}' does not contain any entries")
-    logger.debug("Loaded {} assemblies from {}", len(samples), fof_path)
+    logger.info("Loaded {} assemblies from {}", len(samples), fof_path)
     return samples
 
 
@@ -87,10 +87,13 @@ def collect_presence_indices(
     gfa_path: Path,
     samples: Sequence[str],
 ) -> Tuple[List[str], array, array]:
+    logger.info("Parsing GFA path lines from {}", gfa_path)
+    t0 = time.monotonic()
     unitig_to_index: Dict[str, int] = {}
     unitig_ids: List[str] = []
     row_idx: array = array("I")
     col_idx: array = array("I")
+    paths_parsed = 0
 
     with gfa_path.open("r") as handle:
         for line_number, raw in enumerate(handle, start=1):
@@ -126,11 +129,21 @@ def collect_presence_indices(
                 row_idx.append(idx)
                 col_idx.append(ref_seq_idx)
 
-    logger.debug(
-        "Collected %d unique unitigs across %d samples (%d assignments)",
+            paths_parsed += 1
+            if paths_parsed % 50_000 == 0:
+                logger.info(
+                    "  parsed {:,} paths ({:,} unique unitigs so far)",
+                    paths_parsed,
+                    len(unitig_ids),
+                )
+
+    elapsed = time.monotonic() - t0
+    logger.info(
+        "Parsed {:,} paths → {:,} unique unitigs, {:,} assignments in {:.1f}s",
+        paths_parsed,
         len(unitig_ids),
-        len(samples),
         len(row_idx),
+        elapsed,
     )
     return unitig_ids, row_idx, col_idx
 
@@ -141,6 +154,9 @@ def build_sparse_matrix(
     col_idx: array,
     sample_count: int,
 ) -> sparse.csr_matrix:
+    logger.info("Building sparse matrix ({:,} unitigs × {:,} samples)", len(unitig_ids), sample_count)
+    t0 = time.monotonic()
+
     if not unitig_ids:
         return sparse.csr_matrix((0, sample_count), dtype=np.uint8)
 
@@ -156,7 +172,19 @@ def build_sparse_matrix(
     csr = coo.tocsr()
     if csr.nnz:
         csr.data.fill(1)
+
+    elapsed = time.monotonic() - t0
+    density = csr.nnz / (csr.shape[0] * csr.shape[1]) * 100 if csr.shape[0] else 0
+    logger.info(
+        "Sparse matrix ready: {:,} nonzeros ({:.1f}% dense) in {:.1f}s",
+        csr.nnz,
+        density,
+        elapsed,
+    )
     return csr
+
+
+_DIGITS = np.array(['0', '1'], dtype='U1')
 
 
 def write_presence_matrix(
@@ -166,31 +194,43 @@ def write_presence_matrix(
     output_path: Path,
     chunk_size: int,
 ) -> None:
+    logger.info("Writing presence matrix to {}", output_path)
+    t0 = time.monotonic()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="") as handle:
-        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
-        writer.writerow(["unitig", *samples])
 
-        n_rows = matrix.shape[0]
-        if n_rows == 0:
-            return
+    n_rows = matrix.shape[0]
+    if n_rows == 0:
+        with output_path.open("w") as handle:
+            handle.write("unitig\t" + "\t".join(samples) + "\n")
+        logger.info("Matrix is empty; wrote header only")
+        return
 
-        chunk = max(1, chunk_size)
-        logger.debug(
-            "Writing presence matrix in chunks of %d (total unitigs: %d, samples: %d)",
-            chunk,
-            n_rows,
-            matrix.shape[1],
-        )
+    chunk = max(1, chunk_size)
+    rows_written = 0
+
+    with output_path.open("w") as handle:
+        handle.write("unitig\t" + "\t".join(samples) + "\n")
 
         for start in range(0, n_rows, chunk):
             stop = min(start + chunk, n_rows)
-            block = matrix[start:stop]
-            dense = np.asarray(block.toarray(), dtype=np.uint8)
+            dense = matrix[start:stop].toarray()
             local_unitigs = unitig_ids[start:stop]
             for offset, unitig in enumerate(local_unitigs):
-                row_values = dense[offset].tolist()
-                writer.writerow([unitig, *row_values])
+                handle.write(unitig)
+                handle.write('\t')
+                handle.write('\t'.join(_DIGITS[dense[offset]]))
+                handle.write('\n')
+            rows_written += stop - start
+            if rows_written % 50_000 < chunk:
+                logger.info(
+                    "  written {:,} / {:,} unitig rows ({:.0f}%)",
+                    rows_written,
+                    n_rows,
+                    rows_written / n_rows * 100,
+                )
+
+    elapsed = time.monotonic() - t0
+    logger.info("Finished writing {:,} rows in {:.1f}s", n_rows, elapsed)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
