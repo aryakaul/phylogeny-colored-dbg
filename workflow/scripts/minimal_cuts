@@ -700,32 +700,40 @@ def main() -> None:
     if args.colors:
         logger.info("Writing node colours to {}", args.colors)
         with open(args.colors, "w") as handle:
-            for entry in colors:
+            has_ambiguous = any(
+                isinstance(entry[2], tuple) for entry in colors)
+            if has_ambiguous and args.all_solutions:
+                handle.write("leaf_set_idx\tsolution\tnode\tstate\n")
+            else:
+                handle.write("leaf_set_idx\tnode\tstate\n")
+
+            for global_idx, entry in enumerate(colors):
                 color_payload = entry[2]
                 if isinstance(color_payload, tuple):
-                    if args.all_solutions and len(color_payload) > 1:
-                        handle.write(
-                            f"{color_payload[0]} OR {color_payload[1]}\n")
+                    if args.all_solutions:
+                        for sol_idx, mapping in enumerate(color_payload):
+                            for node_name, state in sorted(mapping.items()):
+                                handle.write(
+                                    f"{global_idx}\t{sol_idx}\t{node_name}\t{state}\n"
+                                )
                     else:
-                        handle.write(f"{color_payload[0]}\n")
-                else:
-                    handle.write(f"{color_payload}\n")
-
-        if args.plot:
-            os.makedirs(args.plot, exist_ok=True)
-            logger.info("Rendering colour plots to {}", args.plot)
-            for entry in colors:
-                idx, _, color_payload = entry
-                if isinstance(color_payload, tuple):
-                    for solution_idx, mapping in enumerate(color_payload, 1):
-                        path = os.path.join(
-                            args.plot,
-                            f"leafset-{idx}-solution{solution_idx}.svg")
-                        plot_tree_and_colors(tree, mapping, path)
-                else:
-                    path = os.path.join(args.plot,
-                                        f"leafset-{idx}-solution.svg")
-                    plot_tree_and_colors(tree, color_payload, path)
+                        for node_name, state in sorted(
+                                color_payload[0].items()):
+                            handle.write(
+                                f"{global_idx}\t{node_name}\t{state}\n")
+                elif isinstance(color_payload, dict):
+                    if has_ambiguous and args.all_solutions:
+                        for node_name, state in sorted(
+                                color_payload.items()):
+                            handle.write(
+                                f"{global_idx}\t0\t{node_name}\t{state}\n"
+                            )
+                    else:
+                        for node_name, state in sorted(
+                                color_payload.items()):
+                            handle.write(
+                                f"{global_idx}\t{node_name}\t{state}\n"
+                            )
 
 
 if __name__ == "__main__":

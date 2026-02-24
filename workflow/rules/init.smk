@@ -203,6 +203,16 @@ def fn_minimalcuts(batch: Optional[str] = None, _batch: Optional[str] = None) ->
         f"{batch_id}_minimalcuts_{label}_k{KMER_LENGTH}")
 
 
+def fn_minimalcuts_colors(
+    batch: Optional[str] = None, _batch: Optional[str] = None
+) -> str:
+    batch_id = _require_batch(batch, _batch)
+    label = parsimony_label()
+    return str(
+        _minimal_cuts_root(batch_id) /
+        f"{batch_id}_minimalcuts_colors_{label}_k{KMER_LENGTH}.tsv")
+
+
 def fn_minimalcuts_plotdir(
     batch: Optional[str] = None, _batch: Optional[str] = None
 ) -> str:
