@@ -290,7 +290,7 @@ def process_chunk(tree: Tree, chunk_data: List[set[str]],
                      tuple(dict(sol.colors) for sol in solutions)))
 
         elapsed = time.time() - start
-        logger.info("Processed leaf set {} in {:.2f}s", idx, elapsed)
+        logger.debug("Processed leaf set {} in {:.2f}s", idx, elapsed)
 
     return results, colors_info
 

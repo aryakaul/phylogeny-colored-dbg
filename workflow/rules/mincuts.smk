@@ -22,7 +22,6 @@ rule minimal_cuts_percolorset:
     shell:
         """
 
-        echo "{params.mode}"
         mkdir -p $(dirname {output})
         {params.script} \\
             {input.tree} \\
