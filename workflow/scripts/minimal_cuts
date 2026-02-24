@@ -47,6 +47,7 @@ _worker_tree: Tree = None  # type: ignore[assignment]
 _worker_model: "ParsimonyModel" = None  # type: ignore[assignment]
 _worker_known_leaves: set[str] = set()
 _worker_all_leaf_coloring: bool = False
+_worker_verbosity: int = 0
 
 
 @dataclass
@@ -380,17 +381,19 @@ def process_chunk(tree: Tree, chunk_data: List[set[str]],
 
 
 def _init_worker(tree: Tree, model: ParsimonyModel, known_leaves: set[str],
-                 all_leaf_coloring: bool) -> None:
+                 all_leaf_coloring: bool, verbosity: int) -> None:
     """Initializer for multiprocessing.Pool workers.
 
     Stores the tree, model, and known_leaves as module-level globals so they
     are pickled once (at pool creation) rather than with every chunk.
+    Also configures the logger in the worker process to match the main process.
     """
     global _worker_tree, _worker_model, _worker_known_leaves, _worker_all_leaf_coloring
     _worker_tree = tree
     _worker_model = model
     _worker_known_leaves = known_leaves
     _worker_all_leaf_coloring = all_leaf_coloring
+    _configure_logger(verbosity)
 
 
 def _process_chunk_worker(
@@ -407,7 +410,8 @@ def minimal_cuts_for_all_sets(
         num_threads: int,
         model: ParsimonyModel,
         known_leaves: set[str],
-        all_leaf_coloring: bool = False) -> Tuple[List[object], List[tuple]]:
+        all_leaf_coloring: bool = False,
+        verbosity: int = 0) -> Tuple[List[object], List[tuple]]:
     """Run parsimony on all leaf sets from the leaves file.
 
     Reads leaf sets in chunks, dispatches them to worker processes (or runs
@@ -455,7 +459,7 @@ def minimal_cuts_for_all_sets(
                 num_threads,
                 initializer=_init_worker,
                 initargs=(tree, model, known_leaves,
-                          all_leaf_coloring)) as pool:
+                          all_leaf_coloring, verbosity)) as pool:
             for chunk_results, chunk_colors in pool.imap_unordered(
                     _process_chunk_worker, _chunk_iter()):
                 results.extend(chunk_results)
@@ -669,7 +673,8 @@ def main() -> None:
                                                 model,
                                                 known_leaves,
                                                 all_leaf_coloring=bool(
-                                                    args.colors))
+                                                    args.colors),
+                                                verbosity=args.verbose)
 
     logger.info("Writing minimal cuts to {}", args.output or "stdout")
     if args.output:
