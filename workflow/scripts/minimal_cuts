@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""Compute minimal parsimony cuts for unitig presence/absence patterns.
+
+For each unique presence/absence vector (leaf set), performs Sankoff or Fitch
+parsimony on the phylogenetic tree and reports the minimal set of edges where
+the ancestral state changes — i.e., the "cuts" separating present (red) from
+absent (blue) clades.
+
+Optimization notes
+------------------
+- Pool initializer pattern: The tree, model, and known_leaves are loaded once
+  per worker process via multiprocessing.Pool(initializer=...) rather than being
+  pickled with every chunk. This avoids O(n_chunks) serializations of the Tree.
+- Chunk size trade-off: Larger chunks reduce IPC overhead but increase per-worker
+  memory. The default of 5000 balances throughput and memory for typical datasets.
+- The DP tree (NodeDP) is rebuilt from scratch for each leaf set. Caching the tree
+  topology and only swapping leaf costs was considered but not implemented because
+  NodeDP construction is lightweight for trees under ~10k nodes, and the rebuild
+  keeps the code simple with no shared mutable state between leaf sets.
+"""
 
 from __future__ import annotations
 
@@ -21,9 +40,22 @@ STATES: Tuple[str, str] = ("red", "blue")
 INF = float("inf")
 EPS = 1e-9
 
+# Module-level globals set by _init_worker for multiprocessing.
+# Each worker process gets its own copy via the Pool initializer,
+# avoiding repeated pickling of the tree with every chunk.
+_worker_tree: Tree = None  # type: ignore[assignment]
+_worker_model: "ParsimonyModel" = None  # type: ignore[assignment]
+_worker_known_leaves: set[str] = set()
+_worker_all_leaf_coloring: bool = False
+
 
 @dataclass
 class NodeDP:
+    """Dynamic programming node mirroring the phylogeny during parsimony.
+
+    Stores the optimal cost to assign each state at this node, and the
+    corresponding best child-state choices that achieve that cost.
+    """
     node: Tree
     children: List["NodeDP"]
     cost_by_state: Dict[str, float]
@@ -32,12 +64,20 @@ class NodeDP:
 
 @dataclass
 class ParsimonySolution:
+    """One optimal parsimony reconstruction for a leaf set.
+
+    Attributes:
+        root_state: The state assigned to the root ("red" or "blue").
+        cuts: Node names where the state changes from parent to child.
+        colors: Mapping of node name -> assigned state for all named nodes.
+    """
     root_state: str
     cuts: List[str]
     colors: Dict[str, str]
 
 
 class ParsimonyModel:
+    """Base class for parsimony transition cost models."""
     name = "base"
 
     def edge_cost(self, parent_state: str, child_state: str,
@@ -46,6 +86,7 @@ class ParsimonyModel:
 
 
 class FitchModel(ParsimonyModel):
+    """Unit-cost (Fitch) parsimony: every state change costs 1."""
     name = "fitch"
 
     def edge_cost(self, parent_state: str, child_state: str,
@@ -54,6 +95,10 @@ class FitchModel(ParsimonyModel):
 
 
 class SankoffModel(ParsimonyModel):
+    """Branch-length-weighted (Sankoff) parsimony.
+
+    The cost of a state change on an edge is branch_penalty * branch_length.
+    """
     name = "sankoff"
 
     def __init__(self, branch_penalty: float, fallback_length: float):
@@ -70,8 +115,23 @@ class SankoffModel(ParsimonyModel):
         return self.branch_penalty * length
 
 
+def _count_leaf_sets(file_path: str) -> int:
+    """Count non-empty lines in the leaves file (one leaf set per line)."""
+    count = 0
+    with open(file_path, "r") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
 def read_target_leaves(file_path: str,
                        chunk_size: int) -> Iterator[List[set[str]]]:
+    """Yield chunks of leaf sets from the leaves file.
+
+    Each line is whitespace-split into a set of leaf names. Lines are batched
+    into lists of ``chunk_size`` for parallel processing.
+    """
 
     def generate_chunks() -> Iterator[List[set[str]]]:
         with open(file_path, "r") as handle:
@@ -91,6 +151,11 @@ def read_target_leaves(file_path: str,
 
 
 def autocomplete_internal_node_names(tree: Tree, newtreefile: str) -> Tree:
+    """Assign names to unnamed internal nodes based on their children.
+
+    Names follow the pattern ``<child_name>-up1``, ``<child_name>-up2``, etc.,
+    incrementing from the alphabetically first child name.
+    """
     import re
 
     logger.info("Autocompleting internal node names")
@@ -122,6 +187,12 @@ def autocomplete_internal_node_names(tree: Tree, newtreefile: str) -> Tree:
 
 def build_dynamic_programming_tree(node: Tree, target_leaves: set[str],
                                    model: ParsimonyModel) -> NodeDP:
+    """Build the Sankoff/Fitch DP tree via post-order traversal.
+
+    Leaves are constrained to "red" if present in target_leaves, "blue"
+    otherwise (infinite cost for the wrong state). Internal nodes accumulate
+    the minimum cost over children for each possible state assignment.
+    """
     if node.is_leaf:
         cost_by_state = {
             "red": 0.0 if node.name in target_leaves else INF,
@@ -186,6 +257,7 @@ def build_dynamic_programming_tree(node: Tree, target_leaves: set[str],
 
 
 def _select_child_state(child_dp: NodeDP, allowed_states: List[str]) -> str:
+    """Pick the lowest-cost child state, breaking ties alphabetically."""
     if not allowed_states:
         raise ValueError("No feasible child states available during trace")
     best_cost = min(child_dp.cost_by_state[state] for state in allowed_states)
@@ -198,6 +270,12 @@ def _select_child_state(child_dp: NodeDP, allowed_states: List[str]) -> str:
 
 
 def trace_solution(node_dp: NodeDP, parent_state: str) -> ParsimonySolution:
+    """Trace back through the DP tree to recover state assignments and cuts.
+
+    Starting from the root with ``parent_state``, greedily selects the
+    lowest-cost child state at each internal node. An edge where the state
+    changes is recorded as a "cut".
+    """
     assignments: Dict[str, str] = {}
     cuts: List[str] = []
 
@@ -230,6 +308,11 @@ def trace_solution(node_dp: NodeDP, parent_state: str) -> ParsimonySolution:
 
 def run_parsimony(tree: Tree, target_leaves: set[str], model: ParsimonyModel,
                   known_leaves: set[str]) -> List[ParsimonySolution]:
+    """Run parsimony for one leaf set, returning all optimal solutions.
+
+    Filters out target leaves not present in the tree, builds the DP tree,
+    and traces back all root states that achieve the minimum cost.
+    """
     missing = target_leaves.difference(known_leaves)
     if missing:
         preview = ", ".join(sorted(missing)[:5])
@@ -260,6 +343,7 @@ def run_parsimony(tree: Tree, target_leaves: set[str], model: ParsimonyModel,
 def process_chunk(tree: Tree, chunk_data: List[set[str]],
                   all_leaf_coloring: bool, model: ParsimonyModel,
                   known_leaves: set[str]) -> Tuple[List[object], List[tuple]]:
+    """Process a batch of leaf sets, returning cuts and optional colorings."""
     results: List[object] = []
     colors_info: List[tuple] = []
 
@@ -295,10 +379,25 @@ def process_chunk(tree: Tree, chunk_data: List[set[str]],
     return results, colors_info
 
 
-def _process_chunk_from_args(
-    args: Tuple[Tree, List[set[str]], bool, ParsimonyModel, set[str]]
-) -> Tuple[List[object], List[tuple]]:
-    return process_chunk(*args)
+def _init_worker(tree: Tree, model: ParsimonyModel, known_leaves: set[str],
+                 all_leaf_coloring: bool) -> None:
+    """Initializer for multiprocessing.Pool workers.
+
+    Stores the tree, model, and known_leaves as module-level globals so they
+    are pickled once (at pool creation) rather than with every chunk.
+    """
+    global _worker_tree, _worker_model, _worker_known_leaves, _worker_all_leaf_coloring
+    _worker_tree = tree
+    _worker_model = model
+    _worker_known_leaves = known_leaves
+    _worker_all_leaf_coloring = all_leaf_coloring
+
+
+def _process_chunk_worker(
+        chunk_data: List[set[str]]) -> Tuple[List[object], List[tuple]]:
+    """Worker target that uses module-level globals set by _init_worker."""
+    return process_chunk(_worker_tree, chunk_data, _worker_all_leaf_coloring,
+                         _worker_model, _worker_known_leaves)
 
 
 def minimal_cuts_for_all_sets(
@@ -309,33 +408,73 @@ def minimal_cuts_for_all_sets(
         model: ParsimonyModel,
         known_leaves: set[str],
         all_leaf_coloring: bool = False) -> Tuple[List[object], List[tuple]]:
+    """Run parsimony on all leaf sets from the leaves file.
+
+    Reads leaf sets in chunks, dispatches them to worker processes (or runs
+    single-threaded), and aggregates results. Logs progress at INFO level.
+    """
+    total_sets = _count_leaf_sets(leaves_file_path)
+    total_chunks = math.ceil(total_sets / chunk_size) if chunk_size > 0 else 1
+    logger.info(
+        "Processing {:,} leaf sets in {:,} chunks of {:,} (threads={})",
+        total_sets, total_chunks, chunk_size, num_threads)
+
     results: List[object] = []
     colors_info: List[tuple] = []
+    sets_done = 0
+    chunks_done = 0
+    t_start = time.time()
 
-    def task_iter(
-    ) -> Iterable[Tuple[Tree, List[set[str]], bool, ParsimonyModel, set[str]]]:
+    def _log_chunk_progress(chunk_size_actual: int) -> None:
+        nonlocal sets_done, chunks_done
+        sets_done += chunk_size_actual
+        chunks_done += 1
+        elapsed = time.time() - t_start
+        pct = sets_done / total_sets * 100 if total_sets > 0 else 100
+        rate = sets_done / elapsed if elapsed > 0 else 0
+        logger.info(
+            "Chunk {}/{} done — {:,}/{:,} leaf sets ({:.0f}%) "
+            "[{:.1f}s elapsed, {:.0f} sets/s]",
+            chunks_done, total_chunks, sets_done, total_sets, pct,
+            elapsed, rate)
+
+    def _chunk_iter() -> Iterator[List[set[str]]]:
         for chunk in read_target_leaves(leaves_file_path, chunk_size):
-            yield (tree, chunk, all_leaf_coloring, model, known_leaves)
+            yield chunk
 
     if num_threads <= 1:
-        for task in task_iter():
-            chunk_results, chunk_colors = process_chunk(*task)
+        for chunk_data in _chunk_iter():
+            chunk_results, chunk_colors = process_chunk(
+                tree, chunk_data, all_leaf_coloring, model, known_leaves)
             results.extend(chunk_results)
             if all_leaf_coloring:
                 colors_info.extend(chunk_colors)
+            _log_chunk_progress(len(chunk_data))
     else:
-        with multiprocessing.Pool(num_threads) as pool:
+        with multiprocessing.Pool(
+                num_threads,
+                initializer=_init_worker,
+                initargs=(tree, model, known_leaves,
+                          all_leaf_coloring)) as pool:
             for chunk_results, chunk_colors in pool.imap_unordered(
-                    _process_chunk_from_args, task_iter()):
+                    _process_chunk_worker, _chunk_iter()):
                 results.extend(chunk_results)
                 if all_leaf_coloring:
                     colors_info.extend(chunk_colors)
+                _log_chunk_progress(len(chunk_results))
+
+    elapsed_total = time.time() - t_start
+    rate = total_sets / elapsed_total if elapsed_total > 0 else 0
+    logger.info(
+        "Parsimony complete: {:,} leaf sets in {:.1f}s ({:.0f} sets/s)",
+        total_sets, elapsed_total, rate)
 
     return results, colors_info if all_leaf_coloring else []
 
 
 def plot_tree_and_colors(tree: Tree, color_dict: Dict[str, str],
                          output: str) -> None:
+    """Render the tree with red/blue node coloring to an SVG file."""
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     logger.debug("Saving tree to {}", output)
 
@@ -375,6 +514,10 @@ def plot_tree_and_colors(tree: Tree, color_dict: Dict[str, str],
 
 
 def _configure_logger(verbosity: int) -> None:
+    """Set up loguru with the requested verbosity level.
+
+    -v=0: WARNING only, -v=1: INFO, -v>=2: DEBUG.
+    """
     logger.remove()
     if verbosity == 0:
         logger.add(sys.stderr, level="WARNING")
@@ -385,6 +528,7 @@ def _configure_logger(verbosity: int) -> None:
 
 
 def _derive_default_branch_penalty(tree: Tree) -> Tuple[float, float]:
+    """Compute a data-driven Sankoff branch penalty from mean branch length."""
     lengths = [
         node.dist for node in tree.traverse("postorder")
         if node.up is not None and node.dist is not None and node.dist > 0
@@ -504,6 +648,7 @@ def main() -> None:
         node.name
         for node in tree.traverse("postorder") if node.is_leaf and node.name
     }
+    logger.info("Tree loaded: {:,} leaves", len(known_leaves))
 
     if args.mode == "fitch":
         model: ParsimonyModel = FitchModel()
