@@ -242,7 +242,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     matrix = build_sparse_matrix(unitig_ids, row_idx, col_idx, len(samples))
     write_presence_matrix(matrix, unitig_ids, samples, args.output, args.chunk_size)
     logger.info(
-        "Wrote presence/absence matrix to %s (%d unitigs × %d samples, %d ones)",
+        "Wrote presence/absence matrix to {} ({} unitigs × {} samples, {} ones)",
         args.output,
         matrix.shape[0],
         matrix.shape[1],

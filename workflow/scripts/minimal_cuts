@@ -22,6 +22,7 @@ Optimization notes
 from __future__ import annotations
 
 import argparse
+import gzip
 import math
 import multiprocessing
 import os
@@ -36,7 +37,7 @@ import ete4
 from ete4 import Tree
 from loguru import logger
 
-STATES: Tuple[str, str] = ("red", "blue")
+STATES: Tuple[str, str] = ("present", "absent")
 INF = float("inf")
 EPS = 1e-9
 
@@ -68,7 +69,7 @@ class ParsimonySolution:
     """One optimal parsimony reconstruction for a leaf set.
 
     Attributes:
-        root_state: The state assigned to the root ("red" or "blue").
+        root_state: The state assigned to the root ("present" or "absent").
         cuts: Node names where the state changes from parent to child.
         colors: Mapping of node name -> assigned state for all named nodes.
     """
@@ -190,14 +191,14 @@ def build_dynamic_programming_tree(node: Tree, target_leaves: set[str],
                                    model: ParsimonyModel) -> NodeDP:
     """Build the Sankoff/Fitch DP tree via post-order traversal.
 
-    Leaves are constrained to "red" if present in target_leaves, "blue"
+    Leaves are constrained to "present" if in target_leaves, "absent"
     otherwise (infinite cost for the wrong state). Internal nodes accumulate
     the minimum cost over children for each possible state assignment.
     """
     if node.is_leaf:
         cost_by_state = {
-            "red": 0.0 if node.name in target_leaves else INF,
-            "blue": 0.0 if node.name not in target_leaves else INF,
+            "present": 0.0 if node.name in target_leaves else INF,
+            "absent": 0.0 if node.name not in target_leaves else INF,
         }
         child_state_options = {state: [] for state in STATES}
         return NodeDP(node=node,
@@ -488,9 +489,9 @@ def plot_tree_and_colors(tree: Tree, color_dict: Dict[str, str],
     def label_nodes(node: Tree) -> None:
         node_color = "#000000"
         state = color_dict.get(node.name)
-        if state == "red":
+        if state == "present":
             node_color = "#FF0000"
-        elif state == "blue":
+        elif state == "absent":
             node_color = "#0000FF"
 
         node.img_style["hz_line_color"] = node_color
@@ -699,7 +700,8 @@ def main() -> None:
 
     if args.colors:
         logger.info("Writing node colours to {}", args.colors)
-        with open(args.colors, "w") as handle:
+        opener = gzip.open if args.colors.endswith(".gz") else open
+        with opener(args.colors, "wt") as handle:
             has_ambiguous = any(
                 isinstance(entry[2], tuple) for entry in colors)
             if has_ambiguous and args.all_solutions:

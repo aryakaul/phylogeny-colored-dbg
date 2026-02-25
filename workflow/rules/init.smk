@@ -22,6 +22,7 @@ PARSIMONY_CONFIG = config.get("parsimony", {}) or {}
 PARSIMONY_MODE = PARSIMONY_CONFIG.get("mode", "fitch")
 SANKOFF_BRANCH_PENALTY = PARSIMONY_CONFIG.get("sankoff_branch_penalty")
 TREES_REQUIRED = bool(config.get("trees_required", True))
+PRODUCE_MINIMALCUTS_COLORS = bool(config.get("produce_minimalcuts_colors", False))
 MAX_THREADS = int(config.get("threads", 8))
 
 
@@ -210,7 +211,7 @@ def fn_minimalcuts_colors(
     label = parsimony_label()
     return str(
         _minimal_cuts_root(batch_id) /
-        f"{batch_id}_minimalcuts_colors_{label}_k{KMER_LENGTH}.tsv")
+        f"{batch_id}_minimalcuts_colors_{label}_k{KMER_LENGTH}.tsv.gz")
 
 
 def fn_minimalcuts_plotdir(
