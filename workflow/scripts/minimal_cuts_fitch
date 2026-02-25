@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""Numpy-vectorized Fitch parsimony for minimal cut computation.
+
+Processes all leaf sets simultaneously via numpy array operations on the
+tree topology, replacing the per-leaf-set Python-object approach used by
+the generic minimal_cuts script.
+
+Encoding convention (uint8 bitmask):
+    0b01 = 1 = "present"
+    0b10 = 2 = "absent"
+    0b11 = 3 = ambiguous (both states possible)
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import math
+import sys
+import time
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from ete4 import Tree
+from loguru import logger
+
+
+# ---------------------------------------------------------------------------
+# Topology precomputation
+# ---------------------------------------------------------------------------
+
+def _precompute_topology(tree: Tree) -> dict:
+    """Traverse the ete4 tree once and produce integer-indexed arrays.
+
+    Returns a dict with:
+        postorder:        list of node indices in post-order
+        preorder:         list of node indices in pre-order
+        parent:           int array, parent[i] = parent index (-1 for root)
+        children:         list of lists of child indices
+        node_names:       list of name strings (or "")
+        leaf_name_to_idx: dict mapping leaf name -> node index
+        is_leaf:          bool array
+        root_idx:         int
+        n_nodes:          int
+    """
+    node_to_idx: Dict[int, int] = {}  # id(node) -> index
+    postorder: List[int] = []
+    node_names: List[str] = []
+    children: List[List[int]] = []
+    is_leaf_list: List[bool] = []
+    leaf_name_to_idx: Dict[str, int] = {}
+
+    # Assign indices in post-order
+    for idx, node in enumerate(tree.traverse("postorder")):
+        node_to_idx[id(node)] = idx
+        postorder.append(idx)
+        node_names.append(node.name or "")
+        is_leaf_list.append(node.is_leaf)
+        children.append([])
+        if node.is_leaf and node.name:
+            leaf_name_to_idx[node.name] = idx
+
+    n_nodes = len(postorder)
+    parent = np.full(n_nodes, -1, dtype=np.int32)
+
+    # Fill parent and children arrays
+    for node in tree.traverse("postorder"):
+        pidx = node_to_idx[id(node)]
+        for child in node.children:
+            cidx = node_to_idx[id(child)]
+            children[pidx].append(cidx)
+            parent[cidx] = pidx
+
+    # Build pre-order list (reverse of post-order gives a valid pre-order
+    # only for the root-first property; rebuild properly)
+    preorder: List[int] = []
+    for node in tree.traverse("preorder"):
+        preorder.append(node_to_idx[id(node)])
+
+    root_idx = preorder[0]
+
+    return {
+        "postorder": postorder,
+        "preorder": preorder,
+        "parent": parent,
+        "children": children,
+        "node_names": node_names,
+        "leaf_name_to_idx": leaf_name_to_idx,
+        "is_leaf": np.array(is_leaf_list, dtype=bool),
+        "root_idx": root_idx,
+        "n_nodes": n_nodes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Leaf-set encoding
+# ---------------------------------------------------------------------------
+
+def _count_leaf_sets(file_path: str) -> int:
+    """Count non-empty lines in the leaves file."""
+    count = 0
+    with open(file_path, "r") as handle:
+        for line in handle:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _read_leaf_sets_chunk(handle, chunk_size: int) -> List[List[str]]:
+    """Read up to chunk_size leaf sets from an open file handle."""
+    chunk: List[List[str]] = []
+    for line in handle:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        chunk.append(stripped.split())
+        if len(chunk) == chunk_size:
+            break
+    return chunk
+
+
+def _encode_leaf_sets(
+    leaf_sets: List[List[str]],
+    leaf_name_to_idx: Dict[str, int],
+    n_nodes: int,
+) -> np.ndarray:
+    """Encode leaf sets into a (B, n_nodes) uint8 bitmask matrix.
+
+    For leaves:  1 = present, 2 = absent.
+    Internal nodes start at 0 (filled during bottom-up pass).
+    """
+    B = len(leaf_sets)
+    state = np.zeros((B, n_nodes), dtype=np.uint8)
+
+    # Build set of all known leaf indices for fast "absent" assignment
+    all_leaf_indices = np.array(list(leaf_name_to_idx.values()), dtype=np.int32)
+
+    # Default all leaves to "absent" (2)
+    state[:, all_leaf_indices] = 2
+
+    # Set "present" (1) for target leaves
+    for b, leaves in enumerate(leaf_sets):
+        for name in leaves:
+            idx = leaf_name_to_idx.get(name)
+            if idx is not None:
+                state[b, idx] = 1
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Vectorized Fitch bottom-up
+# ---------------------------------------------------------------------------
+
+def _fitch_bottom_up(
+    state: np.ndarray,
+    postorder: List[int],
+    children: List[List[int]],
+    is_leaf: np.ndarray,
+) -> np.ndarray:
+    """Vectorized Fitch bottom-up pass over all B leaf sets.
+
+    For each internal node in post-order:
+        inter = AND of children state sets
+        union = OR of children state sets
+        state[:, node] = inter where inter > 0, else union
+
+    Operates in-place on state and returns it.
+    """
+    for node_idx in postorder:
+        if is_leaf[node_idx]:
+            continue
+        child_indices = children[node_idx]
+        if not child_indices:
+            continue
+
+        # Start with first child
+        inter = state[:, child_indices[0]].copy()
+        union = state[:, child_indices[0]].copy()
+
+        for cidx in child_indices[1:]:
+            child_state = state[:, cidx]
+            inter = inter & child_state
+            union = union | child_state
+
+        # Where intersection is non-empty, use it; otherwise use union
+        state[:, node_idx] = np.where(inter > 0, inter, union)
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Vectorized Fitch top-down
+# ---------------------------------------------------------------------------
+
+def _fitch_top_down(
+    state_sets: np.ndarray,
+    assigned: np.ndarray,
+    preorder: List[int],
+    parent: np.ndarray,
+    root_idx: int,
+    root_choice: int,
+) -> np.ndarray:
+    """Vectorized Fitch top-down pass.
+
+    Args:
+        state_sets: (B, N) uint8 bitmask from bottom-up
+        assigned:   (B, N) uint8 output array (modified in-place)
+        preorder:   node indices in pre-order
+        parent:     parent index array
+        root_idx:   index of root node
+        root_choice: bitmask for root assignment (1=present, 2=absent)
+
+    For each node in pre-order (skipping root):
+        If parent's assigned state is in the node's state set, inherit it.
+        Otherwise, pick from the state set (prefer "present"=1 when tied).
+    """
+    # Assign root
+    # For root: pick from state_set, biased by root_choice
+    root_ss = state_sets[:, root_idx]  # (B,)
+    # If root_choice is in state set, use it; otherwise use what's available
+    can_use_choice = (root_ss & root_choice) > 0
+    assigned[:, root_idx] = np.where(can_use_choice, root_choice, root_ss)
+    # If state_set is 3 (ambiguous) and choice isn't available (shouldn't happen
+    # since 3 & anything > 0), handle gracefully
+    # For truly ambiguous (state_set == 3), root_choice determines which way
+    assigned[:, root_idx] = np.where(
+        can_use_choice, root_choice,
+        # Fallback: prefer 1 (present)
+        np.where((root_ss & 1) > 0, np.uint8(1), np.uint8(2))
+    )
+
+    for node_idx in preorder:
+        if node_idx == root_idx:
+            continue
+        pidx = parent[node_idx]
+        parent_state = assigned[:, pidx]  # (B,)
+        node_ss = state_sets[:, node_idx]  # (B,)
+
+        # Can we inherit parent's state?
+        can_inherit = (node_ss & parent_state) > 0
+
+        # Fallback: pick from state set, prefer present (1)
+        fallback = np.where((node_ss & 1) > 0, np.uint8(1), np.uint8(2))
+
+        assigned[:, node_idx] = np.where(can_inherit, parent_state, fallback)
+
+    return assigned
+
+
+# ---------------------------------------------------------------------------
+# Cut extraction and output
+# ---------------------------------------------------------------------------
+
+def _extract_cuts_and_write(
+    assigned: np.ndarray,
+    parent: np.ndarray,
+    node_names: List[str],
+    root_idx: int,
+    n_nodes: int,
+    global_offset: int,
+    cuts_handle,
+    colors_handle,
+    all_solutions: bool,
+    solution_idx: Optional[int],
+    has_ambiguous_global: bool,
+    write_colors: bool,
+) -> None:
+    """Extract cuts from assigned states and write to output files.
+
+    A cut occurs where assigned[:, node] != assigned[:, parent[node]]
+    for named nodes with named parents.
+    """
+    B = assigned.shape[0]
+
+    # Build mask of named nodes with named parents (excluding root)
+    named_mask = np.array(
+        [bool(node_names[i]) and parent[i] >= 0 and bool(node_names[parent[i]])
+         for i in range(n_nodes)],
+        dtype=bool,
+    )
+    named_indices = np.where(named_mask)[0]
+
+    if len(named_indices) == 0:
+        for b in range(B):
+            cuts_handle.write("Root\n")
+        return
+
+    # Vectorized: for each named node, check if state differs from parent
+    # child_states shape: (B, len(named_indices))
+    child_states = assigned[:, named_indices]
+    parent_indices = parent[named_indices]
+    parent_states = assigned[:, parent_indices]
+    is_cut = child_states != parent_states  # (B, len(named_indices))
+
+    # Get names for named_indices
+    cut_names = [node_names[i] for i in named_indices]
+
+    for b in range(B):
+        global_idx = global_offset + b
+        cuts_for_b = [cut_names[j] for j in range(len(named_indices)) if is_cut[b, j]]
+
+        if not cuts_for_b:
+            cuts_for_b = ["Root"]
+
+        if write_colors:
+            root_state_str = "present" if assigned[b, root_idx] == 1 else "absent"
+            for i in range(n_nodes):
+                name = node_names[i]
+                if not name:
+                    continue
+                state_val = assigned[b, i]
+                state_str = "present" if state_val == 1 else "absent"
+                if has_ambiguous_global and all_solutions:
+                    sol_col = solution_idx if solution_idx is not None else 0
+                    colors_handle.write(f"{global_idx}\t{sol_col}\t{name}\t{state_str}\n")
+                else:
+                    colors_handle.write(f"{global_idx}\t{name}\t{state_str}\n")
+
+        # Cuts output is deferred to _write_cuts_line (handles ambiguous merging)
+        # Store for now — we'll handle in the orchestration layer
+        yield (b, cuts_for_b)
+
+
+def _write_cuts_batch(
+    assigned_list: List[Tuple[np.ndarray, int]],
+    parent: np.ndarray,
+    node_names: List[str],
+    root_idx: int,
+    n_nodes: int,
+    global_offset: int,
+    B: int,
+    cuts_handle,
+    colors_handle,
+    all_solutions: bool,
+    write_colors: bool,
+    has_ambiguous: np.ndarray,
+) -> None:
+    """Write cuts and colors for a batch, handling ambiguous solutions.
+
+    assigned_list: list of (assigned_array, root_choice) for each solution pass.
+        For unambiguous leaf sets, only one pass is used.
+        For ambiguous leaf sets with --all, two passes are used.
+    """
+    # Build named node info once
+    named_mask = np.array(
+        [bool(node_names[i]) and parent[i] >= 0 and bool(node_names[parent[i]])
+         for i in range(n_nodes)],
+        dtype=bool,
+    )
+    named_indices = np.where(named_mask)[0]
+    cut_names = [node_names[i] for i in named_indices]
+
+    # For single-solution cases (most common path)
+    if len(assigned_list) == 1:
+        assigned = assigned_list[0][0]
+        if len(named_indices) > 0:
+            child_states = assigned[:, named_indices]
+            parent_indices = parent[named_indices]
+            parent_states = assigned[:, parent_indices]
+            is_cut = child_states != parent_states
+        else:
+            is_cut = np.zeros((B, 0), dtype=bool)
+
+        for b in range(B):
+            global_idx = global_offset + b
+            cuts = [cut_names[j] for j in range(len(named_indices)) if is_cut[b, j]]
+            if not cuts:
+                cuts = ["Root"]
+            cuts_handle.write(",".join(cuts) + "\n")
+
+            if write_colors:
+                for i in range(n_nodes):
+                    name = node_names[i]
+                    if not name:
+                        continue
+                    state_str = "present" if assigned[b, i] == 1 else "absent"
+                    colors_handle.write(f"{global_idx}\t{name}\t{state_str}\n")
+        return
+
+    # Two-solution case (--all with ambiguous root)
+    assert len(assigned_list) == 2
+    assigned_a, _ = assigned_list[0]  # root_choice=1 (present)
+    assigned_b, _ = assigned_list[1]  # root_choice=2 (absent)
+
+    if len(named_indices) > 0:
+        child_a = assigned_a[:, named_indices]
+        parent_a = assigned_a[:, parent[named_indices]]
+        is_cut_a = child_a != parent_a
+
+        child_b = assigned_b[:, named_indices]
+        parent_b = assigned_b[:, parent[named_indices]]
+        is_cut_b = child_b != parent_b
+    else:
+        is_cut_a = np.zeros((B, 0), dtype=bool)
+        is_cut_b = np.zeros((B, 0), dtype=bool)
+
+    # has_ambiguous tells us which leaf sets had ambiguous root
+    has_ambiguous_any = np.any(has_ambiguous)
+
+    for b in range(B):
+        global_idx = global_offset + b
+
+        cuts_a = [cut_names[j] for j in range(len(named_indices)) if is_cut_a[b, j]]
+        if not cuts_a:
+            cuts_a = ["Root"]
+
+        if has_ambiguous[b] and all_solutions:
+            cuts_b = [cut_names[j] for j in range(len(named_indices)) if is_cut_b[b, j]]
+            if not cuts_b:
+                cuts_b = ["Root"]
+
+            # Check if solutions are actually different
+            if cuts_a == cuts_b:
+                cuts_handle.write(",".join(cuts_a) + "\n")
+            else:
+                cuts_handle.write(f"{','.join(cuts_a)} OR {','.join(cuts_b)}\n")
+
+            if write_colors:
+                for i in range(n_nodes):
+                    name = node_names[i]
+                    if not name:
+                        continue
+                    state_a = "present" if assigned_a[b, i] == 1 else "absent"
+                    state_b = "present" if assigned_b[b, i] == 1 else "absent"
+                    colors_handle.write(f"{global_idx}\t0\t{name}\t{state_a}\n")
+                    colors_handle.write(f"{global_idx}\t1\t{name}\t{state_b}\n")
+        else:
+            cuts_handle.write(",".join(cuts_a) + "\n")
+
+            if write_colors:
+                if has_ambiguous_any and all_solutions:
+                    for i in range(n_nodes):
+                        name = node_names[i]
+                        if not name:
+                            continue
+                        state_str = "present" if assigned_a[b, i] == 1 else "absent"
+                        colors_handle.write(f"{global_idx}\t0\t{name}\t{state_str}\n")
+                else:
+                    for i in range(n_nodes):
+                        name = node_names[i]
+                        if not name:
+                            continue
+                        state_str = "present" if assigned_a[b, i] == 1 else "absent"
+                        colors_handle.write(f"{global_idx}\t{name}\t{state_str}\n")
+
+
+# ---------------------------------------------------------------------------
+# Internal-node naming (shared with minimal_cuts)
+# ---------------------------------------------------------------------------
+
+def autocomplete_internal_node_names(tree: Tree, newtreefile: str) -> Tree:
+    """Assign names to unnamed internal nodes based on their children."""
+    import re
+
+    logger.info("Autocompleting internal node names")
+
+    re_inferred = re.compile(r"^(.*)-up(\d+)$")
+    renamed_nodes = False
+    for node in tree.traverse("postorder"):
+        if node.is_leaf:
+            continue
+        if not node.name:
+            child_names = [child.name for child in node.children if child.name]
+            if not child_names:
+                continue
+            candidate = sorted(child_names)[0]
+            match = re_inferred.match(candidate)
+            if match is not None:
+                label, idx = match.groups()
+                node.name = f"{label}-up{int(idx) + 1}"
+            else:
+                node.name = f"{candidate}-up1"
+            renamed_nodes = True
+            logger.debug("Named internal node {}", node.name)
+
+    if renamed_nodes:
+        logger.info("Writing renamed tree to {}", newtreefile)
+        tree.write(parser=1, outfile=newtreefile)
+    return tree
+
+
+# ---------------------------------------------------------------------------
+# Logger configuration
+# ---------------------------------------------------------------------------
+
+def _configure_logger(verbosity: int) -> None:
+    logger.remove()
+    if verbosity == 0:
+        logger.add(sys.stderr, level="WARNING")
+    elif verbosity == 1:
+        logger.add(sys.stderr, level="INFO")
+    else:
+        logger.add(sys.stderr, level="DEBUG")
+
+
+# ---------------------------------------------------------------------------
+# Main orchestration
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Numpy-vectorized Fitch parsimony for minimal cuts.")
+    parser.add_argument("tree_file", type=str,
+                        help="Path to the Newick formatted tree file.")
+    parser.add_argument("leaves_file", type=str,
+                        help="Path to the file containing target (present) leaves.")
+    parser.add_argument("--all", dest="all_solutions", action="store_true",
+                        help="Emit all optimal root-state solutions when ties occur.")
+    parser.add_argument("-t", "--tree", type=str,
+                        default=f"./minimalcuts_fullynamedtree_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.nwk",
+                        help="Path to write a renamed tree if internal nodes are unnamed.")
+    parser.add_argument("-o", "--output", type=str, default=None,
+                        help="Path to output file. Defaults to stdout.")
+    parser.add_argument("-c", "--colors", type=str, default=None,
+                        help="If specified, write node colors for each leaf subset to this file.")
+    parser.add_argument("-cs", "--chunksize", default=5000, type=int,
+                        help="Number of leaf sets per batch (bounds memory usage).")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="Increase verbosity. Repeat for more detail.")
+
+    args = parser.parse_args()
+    _configure_logger(args.verbose)
+
+    # --- Load tree ---
+    with open(args.tree_file, "r") as handle:
+        tree = Tree(handle, parser=1)
+
+    if not tree.name:
+        tree.name = "Root"
+
+    unnamed_internal = [
+        node for node in tree.traverse("postorder")
+        if not node.is_leaf and not node.name
+    ]
+    if unnamed_internal:
+        logger.info("Detected {} unnamed internal nodes; autocompleting.",
+                     len(unnamed_internal))
+        tree = autocomplete_internal_node_names(tree, args.tree)
+
+    known_leaves = {
+        node.name for node in tree.traverse("postorder")
+        if node.is_leaf and node.name
+    }
+    logger.info("Tree loaded: {:,} leaves", len(known_leaves))
+
+    # --- Precompute topology ---
+    topo = _precompute_topology(tree)
+    logger.info("Topology precomputed: {} nodes", topo["n_nodes"])
+
+    # --- Count total leaf sets ---
+    total_sets = _count_leaf_sets(args.leaves_file)
+    total_chunks = math.ceil(total_sets / args.chunksize) if args.chunksize > 0 else 1
+    logger.info("Processing {:,} leaf sets in {:,} chunks of {:,}",
+                total_sets, total_chunks, args.chunksize)
+
+    # --- Open output files ---
+    write_colors = bool(args.colors)
+    if args.output:
+        cuts_handle = open(args.output, "w")
+    else:
+        cuts_handle = sys.stdout
+
+    colors_handle = None
+    if write_colors:
+        opener = gzip.open if args.colors.endswith(".gz") else open
+        colors_handle = opener(args.colors, "wt")
+
+    try:
+        # Write colors header after we know if there are ambiguous sets.
+        # We defer header writing: accumulate first chunk, check ambiguity,
+        # then write header + data. For simplicity with streaming, we'll
+        # do a two-pass approach only for the header decision.
+        # Actually, let's just always include the solution column when --all
+        # is set and there are ambiguous sets. We can't know ahead of time,
+        # so we use a simple heuristic: if --all, include the solution column.
+        colors_header_written = False
+
+        global_offset = 0
+        t_start = time.time()
+        sets_done = 0
+        chunks_done = 0
+
+        with open(args.leaves_file, "r") as leaves_fh:
+            while True:
+                leaf_sets = _read_leaf_sets_chunk(leaves_fh, args.chunksize)
+                if not leaf_sets:
+                    break
+
+                B = len(leaf_sets)
+
+                # Encode
+                state = _encode_leaf_sets(leaf_sets, topo["leaf_name_to_idx"],
+                                          topo["n_nodes"])
+
+                # Bottom-up
+                state = _fitch_bottom_up(state, topo["postorder"],
+                                         topo["children"], topo["is_leaf"])
+
+                # Identify ambiguous roots (state_set == 3 means both states possible)
+                root_ss = state[:, topo["root_idx"]]
+                has_ambiguous = root_ss == 3
+
+                # Top-down pass 1: prefer "present" (1) at root
+                assigned_a = np.zeros_like(state)
+                _fitch_top_down(state, assigned_a, topo["preorder"],
+                                topo["parent"], topo["root_idx"],
+                                root_choice=1)
+
+                assigned_list = [(assigned_a, 1)]
+
+                if args.all_solutions and np.any(has_ambiguous):
+                    # Top-down pass 2: prefer "absent" (2) at root
+                    assigned_b = np.zeros_like(state)
+                    _fitch_top_down(state, assigned_b, topo["preorder"],
+                                    topo["parent"], topo["root_idx"],
+                                    root_choice=2)
+                    assigned_list.append((assigned_b, 2))
+
+                # Write colors header on first chunk
+                if write_colors and not colors_header_written:
+                    if args.all_solutions and np.any(has_ambiguous):
+                        colors_handle.write("leaf_set_idx\tsolution\tnode\tstate\n")
+                    else:
+                        colors_handle.write("leaf_set_idx\tnode\tstate\n")
+                    colors_header_written = True
+
+                # Write outputs
+                _write_cuts_batch(
+                    assigned_list=assigned_list,
+                    parent=topo["parent"],
+                    node_names=topo["node_names"],
+                    root_idx=topo["root_idx"],
+                    n_nodes=topo["n_nodes"],
+                    global_offset=global_offset,
+                    B=B,
+                    cuts_handle=cuts_handle,
+                    colors_handle=colors_handle,
+                    all_solutions=args.all_solutions,
+                    write_colors=write_colors,
+                    has_ambiguous=has_ambiguous,
+                )
+
+                global_offset += B
+                sets_done += B
+                chunks_done += 1
+                elapsed = time.time() - t_start
+                pct = sets_done / total_sets * 100 if total_sets > 0 else 100
+                rate = sets_done / elapsed if elapsed > 0 else 0
+                logger.info(
+                    "Chunk {}/{} done — {:,}/{:,} leaf sets ({:.0f}%) "
+                    "[{:.1f}s elapsed, {:.0f} sets/s]",
+                    chunks_done, total_chunks, sets_done, total_sets, pct,
+                    elapsed, rate)
+
+        elapsed_total = time.time() - t_start
+        rate = total_sets / elapsed_total if elapsed_total > 0 else 0
+        logger.info(
+            "Fitch parsimony complete: {:,} leaf sets in {:.1f}s ({:.0f} sets/s)",
+            total_sets, elapsed_total, rate)
+
+    finally:
+        if args.output and cuts_handle is not sys.stdout:
+            cuts_handle.close()
+        if colors_handle is not None:
+            colors_handle.close()
+
+
+if __name__ == "__main__":
+    main()

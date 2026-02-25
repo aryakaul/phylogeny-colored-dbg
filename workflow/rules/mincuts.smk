@@ -4,6 +4,9 @@ from pathlib import Path
 SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 
 
+_USE_FITCH_SCRIPT = parsimony_mode() == "fitch"
+
+
 rule minimal_cuts_percolorset:
     output:
         cuts=fn_minimalcuts(_batch="{batch}"),
@@ -12,11 +15,12 @@ rule minimal_cuts_percolorset:
         tree=fn_tree_sorted(_batch="{batch}"),
         uqcolors=fn_uqcolors(_batch="{batch}"),
     params:
-        script=str(SCRIPTS_DIR / "minimal_cuts"),
+        script=str(SCRIPTS_DIR / ("minimal_cuts_fitch" if _USE_FITCH_SCRIPT else "minimal_cuts")),
         chunksize=5000,
         mode=parsimony_mode(),
         branch_penalty_flag=parsimony_branch_penalty_flag(),
         colors_flag=lambda wc: f"-c {fn_minimalcuts_colors(batch=wc.batch)}" if PRODUCE_MINIMALCUTS_COLORS else "",
+        use_fitch=_USE_FITCH_SCRIPT,
     conda:
         "../envs/ete4.yml"
     threads: MAX_THREADS
@@ -24,17 +28,28 @@ rule minimal_cuts_percolorset:
         """
 
         mkdir -p $(dirname {output.cuts})
-        {params.script} \\
-            {input.tree} \\
-            {input.uqcolors} \\
-            -o {output.cuts} \\
-            {params.colors_flag} \\
-            -v \\
-            --all \\
-            --mode {params.mode} \\
-            {params.branch_penalty_flag} \\
-            -cs {params.chunksize} \\
-            -j {threads}
+        if [ "{params.use_fitch}" = "True" ]; then
+            {params.script} \\
+                {input.tree} \\
+                {input.uqcolors} \\
+                -o {output.cuts} \\
+                {params.colors_flag} \\
+                -v \\
+                --all \\
+                -cs {params.chunksize}
+        else
+            {params.script} \\
+                {input.tree} \\
+                {input.uqcolors} \\
+                -o {output.cuts} \\
+                {params.colors_flag} \\
+                -v \\
+                --all \\
+                --mode {params.mode} \\
+                {params.branch_penalty_flag} \\
+                -cs {params.chunksize} \\
+                -j {threads}
+        fi
         """
 
 
