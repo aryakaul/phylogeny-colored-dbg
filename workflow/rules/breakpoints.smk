@@ -1,9 +1,10 @@
 """
-Concordance breakpoint detection rules.
+Concordance breakpoint detection.
 
-Detects edges in the pcDBG where adjacent unitigs have discordant
-phylogenetic assignments, indicating boundaries between differently-inherited
-genomic regions.
+Rules for:
+  1. Binary breakpoint detection (original concordance_breakpoints)
+  2. Stratified breakpoints with permutation null model
+  3. Summary statistics
 """
 
 from pathlib import Path
@@ -11,6 +12,10 @@ from pathlib import Path
 
 SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 
+
+# ---------------------------------------------------------------------------
+# Output path helpers
+# ---------------------------------------------------------------------------
 
 def fn_breakpoints(batch: str | None = None, _batch: str | None = None) -> str:
     """Output path for concordance breakpoints TSV."""
@@ -34,6 +39,21 @@ def fn_breakpoint_summary(batch: str | None = None, _batch: str | None = None) -
     )
 
 
+def fn_breakpoints_stratified(batch: str | None = None, _batch: str | None = None) -> str:
+    """Output path for stratified concordance breakpoints TSV."""
+    batch_id = batch if batch is not None else _batch
+    if batch_id is None:
+        raise ValueError("Batch identifier is required.")
+    label = parsimony_label()
+    return str(
+        dir_output() / "breakpoints" / f"{batch_id}_k{KMER_LENGTH}_{label}_breakpoints_stratified.tsv"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rule 1: Original binary breakpoint detection
+# ---------------------------------------------------------------------------
+
 rule detect_concordance_breakpoints:
     """
     Detect edges where adjacent unitigs have discordant phylogenetic assignments.
@@ -45,7 +65,7 @@ rule detect_concordance_breakpoints:
         breakpoints=fn_breakpoints(_batch="{batch}"),
     params:
         script=str(SCRIPTS_DIR / "concordance_breakpoints"),
-        min_distance=1,  # Minimum tree distance to report
+        min_distance=1,
     conda:
         "../envs/ete4.yml"
     shell:
@@ -83,13 +103,44 @@ rule summarize_breakpoints:
             "unique_assignments_b": df["assignment_b"].nunique() if len(df) > 0 else 0,
         }
 
-        # Tree distance distribution
         if len(df) > 0:
             dist_counts = df["tree_distance"].value_counts().sort_index()
             for dist, count in dist_counts.items():
                 summary[f"distance_{dist}_count"] = count
 
-        # Write summary
         with open(output.summary, "w") as f:
             for key, value in summary.items():
                 f.write(f"{key}\t{value}\n")
+
+
+# ---------------------------------------------------------------------------
+# Rule 2: Stratified breakpoints with permutation null model
+# ---------------------------------------------------------------------------
+
+rule stratified_concordance_breakpoints:
+    """
+    Continuous tree-distance metric per edge with permutation p-values.
+    Replaces binary concordant/discordant with a distance + null model.
+    """
+    input:
+        sqldb=fn_sqldb(_batch="{batch}"),
+        tree=fn_tree_sorted(_batch="{batch}"),
+        gfa=fn_pcdbg(_batch="{batch}"),
+    output:
+        breakpoints=fn_breakpoints_stratified(_batch="{batch}"),
+    params:
+        script=str(SCRIPTS_DIR / "concordance_breakpoints_stratified"),
+        permutations=1000,
+    conda:
+        "../envs/ete4.yml"
+    shell:
+        """
+        mkdir -p $(dirname {output.breakpoints})
+        {params.script} \\
+            --db {input.sqldb} \\
+            --tree {input.tree} \\
+            --gfa {input.gfa} \\
+            --permutations {params.permutations} \\
+            --output {output.breakpoints} \\
+            -v
+        """

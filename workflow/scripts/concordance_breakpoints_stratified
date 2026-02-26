@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""Stratified concordance breakpoints with permutation null model.
+
+Replaces the binary concordant/discordant call from
+``concordance_breakpoints`` with:
+
+1. A **continuous tree-distance** metric between adjacent unitigs'
+   phylogenetic assignments (cut-strings).
+2. A **normalized distance** (tree_distance / tree_diameter).
+3. A **permutation p-value** from a null model where cut-string labels
+   are shuffled across unitigs, preserving the overall frequency
+   distribution.
+
+Cut-strings are read from the SQLite ``colors`` column (not the GFA's
+``LB:Z:`` tag, which stores the same data but whose name suggests a hex
+color — using the DB avoids confusion and is faster).
+
+Distance between two assignments handles three cases:
+
+- **Single node vs single node** (vast majority): direct tree-distance
+  lookup in a precomputed dict-of-dicts.  This is the fast path.
+- **Multi-cut solutions** (e.g. "NodeA,NodeB" vs "NodeC"): directed
+  Hausdorff averaged — for each node in set A find its nearest in B,
+  average, then vice versa, then average both directions.
+- **OR-ambiguous** (e.g. "X OR Y,Z"): minimum distance across all
+  pairwise combinations of alternative solutions.
+
+The permutation test vectorizes with numpy: an integer index maps each
+unitig to its cut-string, a precomputed (U×U) assignment distance
+matrix enables O(1) per-edge lookups, and shuffling + fancy indexing
+gives O(E) per permutation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sqlite3
+import sys
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Dict, FrozenSet, List, Sequence, Tuple
+
+import numpy as np
+from ete4 import Tree
+from loguru import logger
+
+# Distances are quantized to int(d * _Q) for the permutation histogram.
+# 0.01 resolution covers all Hausdorff-average fractional values.
+_Q = 100
+
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+def _configure_logger(verbosity: int) -> None:
+    """0 → WARNING, 1 → INFO, 2+ → DEBUG."""
+    logger.remove()
+    level = "WARNING" if verbosity == 0 else (
+        "INFO" if verbosity == 1 else "DEBUG")
+    logger.add(sys.stderr, level=level)
+
+
+# ---------------------------------------------------------------------------
+# Tree: pairwise topological distances via BFS
+# ---------------------------------------------------------------------------
+
+def _build_node_distances(
+    tree: Tree,
+) -> Tuple[Dict[str, Dict[str, int]], int]:
+    """Pairwise topological distances between all named tree nodes.
+
+    Builds a full adjacency list (including unnamed nodes as pass-through
+    edges) then BFS from every named node.  Unnamed nodes are traversed
+    but not stored as endpoints, so the edge count is always correct even
+    if post-processing missed an internal node.
+
+    Returns:
+        dist   -- dist[a][b] = number of edges on the a→b path
+        diam   -- max(dist[a][b]) across all named pairs
+    """
+    # Assign stable keys to all nodes (name, or placeholder for unnamed)
+    node_key: Dict[int, str] = {}
+    named_keys: set[str] = set()
+    for node in tree.traverse():
+        key = node.name if node.name else f"__anon_{id(node)}"
+        node_key[id(node)] = key
+        if node.name:
+            named_keys.add(key)
+
+    # Undirected adjacency (parent ↔ child)
+    adj: Dict[str, List[str]] = defaultdict(list)
+    for node in tree.traverse():
+        pk = node_key[id(node)]
+        for child in node.children:
+            ck = node_key[id(child)]
+            adj[pk].append(ck)
+            adj[ck].append(pk)
+
+    # BFS from every named node
+    distances: Dict[str, Dict[str, int]] = {}
+    for start in sorted(named_keys):
+        visited = {start: 0}
+        queue: deque[str] = deque([start])
+        while queue:
+            cur = queue.popleft()
+            for nb in adj[cur]:
+                if nb not in visited:
+                    visited[nb] = visited[cur] + 1
+                    queue.append(nb)
+        distances[start] = {
+            k: v for k, v in visited.items() if k in named_keys
+        }
+
+    diam = max(
+        (d for row in distances.values() for d in row.values()), default=0)
+    logger.info(
+        "Node distances: {} named nodes, diameter = {}", len(named_keys), diam)
+    return distances, diam
+
+
+# ---------------------------------------------------------------------------
+# Cut-string parsing
+# ---------------------------------------------------------------------------
+
+def _parse_cutstring(raw: str) -> List[FrozenSet[str]]:
+    """Parse a raw cut-string into a list of alternative solutions.
+
+    Each solution is a frozenset of node names (the cut-points).
+
+    Examples::
+
+        "NodeA"            → [frozenset({"NodeA"})]
+        "NodeA,NodeB"      → [frozenset({"NodeA", "NodeB"})]
+        "A OR B,C"         → [frozenset({"A"}), frozenset({"B", "C"})]
+        "Root"             → [frozenset({"Root"})]
+        "None" / ""        → []  (unassigned)
+    """
+    if not raw or raw.strip().lower() == "none":
+        return []
+    alts: List[FrozenSet[str]] = []
+    for option in raw.split(" OR "):
+        nodes = frozenset(n.strip() for n in option.split(",") if n.strip())
+        if nodes:
+            alts.append(nodes)
+    return alts
+
+
+# ---------------------------------------------------------------------------
+# Distance between assignments
+# ---------------------------------------------------------------------------
+
+def _solution_distance(
+    sol_a: FrozenSet[str],
+    sol_b: FrozenSet[str],
+    node_dist: Dict[str, Dict[str, int]],
+) -> float:
+    """Distance between two single solutions (each a set of cut-nodes).
+
+    Fast path (single node vs single node): one dict lookup.
+    Multi-node: directed Hausdorff averaged — mean of pairwise minima,
+    computed in both directions and averaged.
+
+    Returns -1.0 if any node is absent from the distance matrix.
+    """
+    if sol_a == sol_b:
+        return 0.0
+
+    # Validate that every node is in the distance matrix
+    for n in sol_a | sol_b:
+        if n not in node_dist:
+            return -1.0
+
+    # Fast path: single vs single
+    if len(sol_a) == 1 and len(sol_b) == 1:
+        na = next(iter(sol_a))
+        nb = next(iter(sol_b))
+        return float(node_dist[na][nb])
+
+    # General case: directed Hausdorff averaged
+    def _directed(src: FrozenSet[str], dst: FrozenSet[str]) -> float:
+        return sum(
+            min(node_dist[s][d] for d in dst) for s in src
+        ) / len(src)
+
+    return (_directed(sol_a, sol_b) + _directed(sol_b, sol_a)) / 2.0
+
+
+def _assignment_distance(
+    alts_a: List[FrozenSet[str]],
+    alts_b: List[FrozenSet[str]],
+    node_dist: Dict[str, Dict[str, int]],
+) -> float:
+    """Distance between two full assignments, handling OR-ambiguity.
+
+    If any alternative in A equals one in B → concordant (distance 0).
+    Otherwise → minimum pairwise solution distance across A × B.
+    Returns -1.0 if no valid distance can be computed.
+    """
+    # Quick concordance check: shared alternative
+    set_a = set(alts_a)
+    if any(sb in set_a for sb in alts_b):
+        return 0.0
+
+    best = float("inf")
+    for sa in alts_a:
+        for sb in alts_b:
+            d = _solution_distance(sa, sb, node_dist)
+            if 0 <= d < best:
+                best = d
+    return best if best < float("inf") else -1.0
+
+
+def _build_assignment_distance_matrix(
+    unique_cutstrings: List[str],
+    node_dist: Dict[str, Dict[str, int]],
+) -> np.ndarray:
+    """Precompute pairwise distances between all unique cut-strings.
+
+    Returns a (U × U) float32 matrix.  Entries are -1 where distance
+    cannot be computed (missing tree node).
+    """
+    parsed = [_parse_cutstring(cs) for cs in unique_cutstrings]
+    U = len(unique_cutstrings)
+    mat = np.full((U, U), -1.0, dtype=np.float32)
+    np.fill_diagonal(mat, 0.0)
+
+    for i in range(U):
+        if not parsed[i]:
+            continue
+        for j in range(i + 1, U):
+            if not parsed[j]:
+                continue
+            d = _assignment_distance(parsed[i], parsed[j], node_dist)
+            mat[i, j] = d
+            mat[j, i] = d
+
+    return mat
+
+
+# ---------------------------------------------------------------------------
+# Permutation null model
+# ---------------------------------------------------------------------------
+
+def _run_permutation_test(
+    edge_a_idx: np.ndarray,
+    edge_b_idx: np.ndarray,
+    assignment_indices: np.ndarray,
+    dist_matrix: np.ndarray,
+    n_permutations: int,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, float]:
+    """Permutation null model for edge tree-distances.
+
+    For each permutation, shuffles the unitig→cut-string mapping
+    (preserving frequency distribution) and recomputes all edge
+    distances via the precomputed assignment distance matrix.
+
+    Returns:
+        survival   -- survival[q] = P(permuted_distance ≥ q/_Q).
+                      Index with int(round(distance * _Q)).
+        mean_perm  -- mean distance across all valid permuted edges.
+    """
+    valid_entries = dist_matrix[dist_matrix >= 0]
+    if len(valid_entries) == 0:
+        return np.ones(1, dtype=np.float64), 0.0
+
+    max_q = int(np.max(valid_entries) * _Q) + 1
+    hist = np.zeros(max_q + 1, dtype=np.int64)
+    total_valid = 0
+    total_sum = 0.0
+
+    for p in range(n_permutations):
+        perm = assignment_indices.copy()
+        rng.shuffle(perm)
+
+        dists = dist_matrix[perm[edge_a_idx], perm[edge_b_idx]]
+
+        valid_mask = dists >= 0
+        valid_dists = dists[valid_mask]
+
+        quantized = np.clip(
+            (valid_dists * _Q + 0.5).astype(np.int64), 0, max_q)
+        hist += np.bincount(quantized, minlength=max_q + 1)
+        total_valid += int(valid_mask.sum())
+        total_sum += float(valid_dists.sum())
+
+        if (p + 1) % 100 == 0:
+            logger.info("Permutation {}/{}", p + 1, n_permutations)
+
+    # Survival function: P(distance ≥ threshold)
+    survival = np.cumsum(hist[::-1])[::-1].astype(np.float64)
+    if total_valid > 0:
+        survival /= total_valid
+        mean_perm = total_sum / total_valid
+    else:
+        mean_perm = 0.0
+
+    return survival, mean_perm
+
+
+def _lookup_pvalue(distance: float, survival: np.ndarray) -> float:
+    """Map an observed distance to its permutation p-value."""
+    q = int(round(distance * _Q))
+    if q < 0:
+        return float("nan")
+    if q >= len(survival):
+        return 0.0
+    return float(survival[q])
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Stratified concordance breakpoints with permutation null model."
+        ))
+    parser.add_argument(
+        "--gfa", type=Path, required=True,
+        help="Colored GFA1 file (accepted for pipeline compatibility; "
+             "data is read from --db).")
+    parser.add_argument(
+        "--tree", type=Path, required=True,
+        help="Postprocessed Newick tree with named internal nodes.")
+    parser.add_argument(
+        "--db", type=Path, required=True,
+        help="SQLite database with unitigs (colors) and adjacency tables.")
+    parser.add_argument(
+        "--permutations", type=int, default=1000,
+        help="Number of label permutations for null model (default: 1000).")
+    parser.add_argument(
+        "--output", type=Path, required=True,
+        help="Output TSV path.")
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility (default: 42).")
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="Increase verbosity (-v for INFO, -vv for DEBUG).")
+
+    args = parser.parse_args(argv)
+    _configure_logger(args.verbose)
+
+    # -- Load tree and build node distances ----------------------------------
+    logger.info("Loading tree from {}", args.tree)
+    with args.tree.open() as fh:
+        tree = Tree(fh.read(), parser=1)
+    if not tree.name:
+        tree.name = "Root"
+
+    t0 = time.time()
+    node_dist, diameter = _build_node_distances(tree)
+    logger.info("Node distances computed in {:.1f}s", time.time() - t0)
+
+    if diameter == 0:
+        logger.error("Tree diameter is 0; cannot normalize distances.")
+        sys.exit(1)
+
+    # -- Load assignments and edges from SQLite ------------------------------
+    logger.info("Loading data from {}", args.db)
+    conn = sqlite3.connect(args.db)
+
+    unitig_colors: Dict[str, str] = {}
+    for uid, colors in conn.execute("SELECT unitig_id, colors FROM unitigs"):
+        unitig_colors[uid] = colors if colors else "None"
+
+    edges_raw: List[Tuple[str, str, str, str]] = list(conn.execute(
+        "SELECT unitig_id, unitig_direction, neighbor_id, neighbor_direction "
+        "FROM adjacency"))
+    conn.close()
+
+    logger.info(
+        "Loaded {:,} unitigs, {:,} edges", len(unitig_colors), len(edges_raw))
+
+    # -- Index: unitigs → integers, cut-strings → integers -------------------
+    # Only unitigs with a real (non-None) assignment participate.
+    assigned_unitigs = {
+        uid for uid, cs in unitig_colors.items()
+        if cs.strip().lower() != "none" and cs.strip()
+    }
+
+    unique_cs = sorted({unitig_colors[uid] for uid in assigned_unitigs})
+    cs_to_idx = {cs: i for i, cs in enumerate(unique_cs)}
+    logger.info("{} unique non-None cut-strings", len(unique_cs))
+
+    unitig_list = sorted(assigned_unitigs)
+    unitig_to_flat = {uid: i for i, uid in enumerate(unitig_list)}
+    assignment_indices = np.array(
+        [cs_to_idx[unitig_colors[uid]] for uid in unitig_list],
+        dtype=np.int32)
+
+    # -- Assignment distance matrix ------------------------------------------
+    t0 = time.time()
+    dist_matrix = _build_assignment_distance_matrix(unique_cs, node_dist)
+    n_valid_pairs = int(np.sum(dist_matrix >= 0)) - len(unique_cs)  # excl diag
+    logger.info(
+        "Assignment distance matrix ({0}×{0}, {1:,} valid pairs) "
+        "built in {2:.1f}s",
+        len(unique_cs), n_valid_pairs // 2, time.time() - t0)
+
+    # -- Filter edges: both endpoints must be assigned -----------------------
+    edge_a_flat: List[int] = []
+    edge_b_flat: List[int] = []
+    edge_meta: List[Tuple[str, str, str, str, str, str]] = []
+
+    for uid_a, dir_a, uid_b, dir_b in edges_raw:
+        if uid_a not in unitig_to_flat or uid_b not in unitig_to_flat:
+            continue
+        cs_a = unitig_colors[uid_a]
+        cs_b = unitig_colors[uid_b]
+        edge_a_flat.append(unitig_to_flat[uid_a])
+        edge_b_flat.append(unitig_to_flat[uid_b])
+        edge_meta.append((uid_a, dir_a, uid_b, dir_b, cs_a, cs_b))
+
+    edge_a_idx = np.array(edge_a_flat, dtype=np.int32)
+    edge_b_idx = np.array(edge_b_flat, dtype=np.int32)
+    E = len(edge_meta)
+    logger.info("{:,} edges with both endpoints assigned", E)
+
+    # -- Observed distances --------------------------------------------------
+    obs_cs_a = assignment_indices[edge_a_idx]
+    obs_cs_b = assignment_indices[edge_b_idx]
+    observed = dist_matrix[obs_cs_a, obs_cs_b]
+
+    n_valid = int(np.sum(observed >= 0))
+    n_concordant = int(np.sum(observed == 0))
+    n_discordant = int(np.sum(observed > 0))
+    n_invalid = int(np.sum(observed < 0))
+    mean_obs = (
+        float(np.mean(observed[observed >= 0])) if n_valid > 0 else 0.0)
+
+    logger.info(
+        "Observed: {:,} valid, {:,} concordant, {:,} discordant, "
+        "{:,} invalid",
+        n_valid, n_concordant, n_discordant, n_invalid)
+
+    # -- Permutation test ----------------------------------------------------
+    rng = np.random.default_rng(args.seed)
+
+    if args.permutations > 0 and E > 0:
+        t0 = time.time()
+        logger.info("Running {:,} permutations...", args.permutations)
+        survival, mean_perm = _run_permutation_test(
+            edge_a_idx, edge_b_idx, assignment_indices, dist_matrix,
+            args.permutations, rng)
+        logger.info("Permutations done in {:.1f}s", time.time() - t0)
+    else:
+        survival = np.ones(1, dtype=np.float64)
+        mean_perm = 0.0
+
+    # -- Write output --------------------------------------------------------
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    columns = [
+        "unitig_A", "dir_A", "unitig_B", "dir_B",
+        "cutstring_A", "cutstring_B",
+        "tree_distance", "normalized_distance",
+        "concordant", "permutation_pvalue",
+    ]
+
+    n_written = 0
+    with args.output.open("w") as out:
+        out.write("\t".join(columns) + "\n")
+        for i, (uid_a, dir_a, uid_b, dir_b, cs_a, cs_b) in enumerate(
+                edge_meta):
+            d = float(observed[i])
+            if d < 0:
+                continue  # skip edges with unresolvable distance
+            norm_d = d / diameter
+            concordant = "true" if d == 0 else "false"
+            if args.permutations > 0:
+                pval_str = f"{_lookup_pvalue(d, survival):.6g}"
+            else:
+                pval_str = "NA"
+            out.write(
+                f"{uid_a}\t{dir_a}\t{uid_b}\t{dir_b}\t"
+                f"{cs_a}\t{cs_b}\t"
+                f"{d:.4g}\t{norm_d:.6f}\t{concordant}\t{pval_str}\n")
+            n_written += 1
+
+    logger.info("Wrote {:,} scored edges to {}", n_written, args.output)
+
+    # -- Summary to stderr ---------------------------------------------------
+    print("\n--- Concordance Breakpoint Summary ---", file=sys.stderr)
+    print(f"Total links (both assigned):  {E:,}", file=sys.stderr)
+    print(f"  Concordant (distance = 0):  {n_concordant:,}", file=sys.stderr)
+    print(f"  Discordant (distance > 0):  {n_discordant:,}", file=sys.stderr)
+    if n_invalid:
+        print(
+            f"  Invalid (missing nodes):    {n_invalid:,}", file=sys.stderr)
+    print(f"Mean observed tree distance:  {mean_obs:.4f}", file=sys.stderr)
+
+    if args.permutations > 0 and E > 0:
+        print(
+            f"Mean permuted tree distance:  {mean_perm:.4f}", file=sys.stderr)
+        sig_count = sum(
+            1 for d in observed if d >= 0 and _lookup_pvalue(d, survival) < 0.05
+        )
+        frac_sig = sig_count / n_valid if n_valid > 0 else 0.0
+        print(
+            f"Fraction with p < 0.05:       {frac_sig:.4f} "
+            f"({sig_count:,}/{n_valid:,})",
+            file=sys.stderr)
+
+    print("--------------------------------------", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

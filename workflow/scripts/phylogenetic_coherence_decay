@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Phylogenetic coherence decay along graph walks.
+
+Measures how rapidly phylogenetic assignment (cut-string) changes as
+you walk outward from a unitig in the compacted colored de Bruijn graph.
+
+For a sample of seed unitigs, BFS explores neighbors up to ``--max-hops``
+edges away.  At each hop distance *h*, the fraction of reached unitigs
+that share the seed's exact cut-string is recorded ("coherence").  The
+resulting decay curve summarises the size of co-inherited blocks:
+
+- **Slow decay** → large contiguous regions share evolutionary origin.
+- **Fast decay** → mosaic genome with frequent assignment changes.
+
+A null expectation (probability two random unitigs match under random
+label assignment = Σ fᵢ², the Simpson index) is reported as a baseline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sqlite3
+import sys
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import numpy as np
+from loguru import logger
+
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+def _configure_logger(verbosity: int) -> None:
+    """0 → WARNING, 1 → INFO, 2+ → DEBUG."""
+    logger.remove()
+    level = "WARNING" if verbosity == 0 else (
+        "INFO" if verbosity == 1 else "DEBUG")
+    logger.add(sys.stderr, level=level)
+
+
+# ---------------------------------------------------------------------------
+# Graph loading
+# ---------------------------------------------------------------------------
+
+def _load_graph_and_colors(
+    db_path: Path,
+) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+    """Load adjacency list and cut-string assignments from SQLite.
+
+    The graph is treated as **undirected**: for every (A→B) edge we also
+    record (B→A), and strand orientation is ignored.  This matches the
+    analysis intent (walking along the genome without regard to reading
+    direction).
+
+    Returns:
+        adj    -- adj[uid] = list of neighbor uids (undirected)
+        colors -- colors[uid] = raw cut-string (or "None")
+    """
+    conn = sqlite3.connect(db_path)
+
+    # Adjacency → undirected
+    adj: Dict[str, List[str]] = defaultdict(list)
+    for uid, _, nid, _ in conn.execute(
+        "SELECT unitig_id, unitig_direction, "
+        "neighbor_id, neighbor_direction FROM adjacency"
+    ):
+        adj[uid].append(nid)
+        adj[nid].append(uid)
+
+    # Cut-strings
+    colors: Dict[str, str] = {}
+    for uid, cs in conn.execute("SELECT unitig_id, colors FROM unitigs"):
+        colors[uid] = cs if cs else "None"
+
+    conn.close()
+
+    # Ensure every unitig in colors has an adjacency entry (isolated nodes)
+    for uid in colors:
+        if uid not in adj:
+            adj[uid] = []
+
+    logger.info(
+        "Graph loaded: {:,} unitigs, {:,} undirected adjacency entries",
+        len(colors), sum(len(v) for v in adj.values()))
+    return dict(adj), colors
+
+
+# ---------------------------------------------------------------------------
+# BFS coherence measurement
+# ---------------------------------------------------------------------------
+
+def _bfs_coherence(
+    seed: str,
+    adj: Dict[str, List[str]],
+    colors: Dict[str, str],
+    max_hops: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """BFS from *seed* up to *max_hops*, counting concordant neighbours.
+
+    Returns two int arrays of length max_hops (index 0 = hop 1):
+        n_reached    -- total unitigs reached at each hop distance
+        n_concordant -- of those, how many share the seed's cut-string
+    """
+    seed_color = colors.get(seed, "None")
+    n_reached = np.zeros(max_hops, dtype=np.int64)
+    n_concordant = np.zeros(max_hops, dtype=np.int64)
+
+    visited = {seed}
+    frontier = [seed]
+
+    for h in range(max_hops):
+        next_frontier: List[str] = []
+        for uid in frontier:
+            for nb in adj.get(uid, []):
+                if nb not in visited:
+                    visited.add(nb)
+                    next_frontier.append(nb)
+                    n_reached[h] += 1
+                    if colors.get(nb, "None") == seed_color:
+                        n_concordant[h] += 1
+        frontier = next_frontier
+        if not frontier:
+            break  # no more reachable nodes
+
+    return n_reached, n_concordant
+
+
+# ---------------------------------------------------------------------------
+# Null expectation
+# ---------------------------------------------------------------------------
+
+def _simpson_index(colors: Dict[str, str]) -> float:
+    """Probability two randomly chosen unitigs have the same cut-string.
+
+    This is Σ fᵢ² (Simpson's index / Herfindahl index), where fᵢ is the
+    relative frequency of the i-th unique cut-string.
+    """
+    total = len(colors)
+    if total == 0:
+        return 0.0
+    counts: Dict[str, int] = defaultdict(int)
+    for cs in colors.values():
+        counts[cs] += 1
+    return sum((c / total) ** 2 for c in counts.values())
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+def _plot_decay(
+    hops: np.ndarray,
+    coherence: np.ndarray,
+    null_exp: float,
+    output_path: Path,
+) -> None:
+    """Save a coherence-decay PNG."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_theme(style="whitegrid", context="notebook")
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    sns.lineplot(x=hops, y=coherence, marker="o", linewidth=1.5,
+                 markersize=4, label="Observed coherence", ax=ax)
+    ax.axhline(null_exp, color="grey", linestyle="--", linewidth=1,
+               label=f"Null (Simpson index = {null_exp:.4f})")
+    ax.set_xlabel("Hop distance")
+    ax.set_ylabel("Coherence (fraction same cut-string)")
+    ax.set_title("Phylogenetic coherence decay")
+    ax.set_ylim(bottom=0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    logger.info("Plot saved to {}", output_path)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Phylogenetic coherence decay along graph walks.")
+    parser.add_argument(
+        "--db", type=Path, required=True,
+        help="SQLite database with unitigs and adjacency tables.")
+    parser.add_argument(
+        "--max-hops", type=int, default=20,
+        help="Maximum BFS walk distance (default: 20).")
+    parser.add_argument(
+        "--samples", type=int, default=10_000,
+        help="Number of seed unitigs to sample (default: 10000).")
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for reproducibility (default: 42).")
+    parser.add_argument(
+        "--output", type=Path, required=True,
+        help="Output TSV path.")
+    parser.add_argument(
+        "--plot", type=Path, default=None,
+        help="Optional path for a PNG decay-curve plot.")
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="Increase verbosity (-v for INFO, -vv for DEBUG).")
+
+    args = parser.parse_args(argv)
+    _configure_logger(args.verbose)
+
+    # -- Load graph ----------------------------------------------------------
+    adj, colors = _load_graph_and_colors(args.db)
+
+    # -- Select seeds --------------------------------------------------------
+    rng = np.random.default_rng(args.seed)
+    all_unitigs = list(colors.keys())
+    n_seeds = min(args.samples, len(all_unitigs))
+    if n_seeds == len(all_unitigs):
+        seeds = all_unitigs
+        logger.info("Using all {:,} unitigs as seeds", n_seeds)
+    else:
+        seed_indices = rng.choice(len(all_unitigs), size=n_seeds, replace=False)
+        seeds = [all_unitigs[i] for i in seed_indices]
+        logger.info("Sampled {:,} seed unitigs", n_seeds)
+
+    # -- BFS from each seed --------------------------------------------------
+    total_reached = np.zeros(args.max_hops, dtype=np.int64)
+    total_concordant = np.zeros(args.max_hops, dtype=np.int64)
+
+    t0 = time.time()
+    for i, s in enumerate(seeds):
+        reached, concordant = _bfs_coherence(s, adj, colors, args.max_hops)
+        total_reached += reached
+        total_concordant += concordant
+
+        if (i + 1) % 1000 == 0:
+            logger.info(
+                "BFS {}/{} seeds ({:.0f}%) [{:.1f}s]",
+                i + 1, n_seeds, (i + 1) / n_seeds * 100,
+                time.time() - t0)
+
+    logger.info(
+        "BFS complete: {:,} seeds in {:.1f}s", n_seeds, time.time() - t0)
+
+    # -- Compute coherence and null ------------------------------------------
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coherence = np.where(
+            total_reached > 0,
+            total_concordant / total_reached,
+            np.nan)
+
+    null_exp = _simpson_index(colors)
+    logger.info("Null expectation (Simpson index): {:.6f}", null_exp)
+
+    # -- Write output --------------------------------------------------------
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    hops = np.arange(1, args.max_hops + 1)
+
+    with args.output.open("w") as out:
+        out.write("hop_distance\tn_pairs\tn_concordant\tcoherence\t"
+                  "null_expectation\n")
+        for h in range(args.max_hops):
+            coh_str = f"{coherence[h]:.6f}" if not np.isnan(coherence[h]) else "NA"
+            out.write(
+                f"{hops[h]}\t{total_reached[h]}\t{total_concordant[h]}\t"
+                f"{coh_str}\t{null_exp:.6f}\n")
+
+    logger.info("Output written to {}", args.output)
+
+    # -- Plot ----------------------------------------------------------------
+    if args.plot is not None:
+        # Only plot hops where data exists
+        valid = ~np.isnan(coherence)
+        if np.any(valid):
+            args.plot.parent.mkdir(parents=True, exist_ok=True)
+            _plot_decay(hops[valid], coherence[valid], null_exp, args.plot)
+        else:
+            logger.warning("No valid coherence data to plot")
+
+    # -- Summary to stderr ---------------------------------------------------
+    print("\n--- Phylogenetic Coherence Decay ---", file=sys.stderr)
+    print(f"Seeds:            {n_seeds:,}", file=sys.stderr)
+    print(f"Max hops:         {args.max_hops}", file=sys.stderr)
+    print(f"Null expectation: {null_exp:.6f}", file=sys.stderr)
+    if not np.isnan(coherence[0]):
+        print(f"Coherence (h=1):  {coherence[0]:.6f}", file=sys.stderr)
+    # Find hop where coherence first drops below null
+    crossover = np.where((coherence <= null_exp) & ~np.isnan(coherence))[0]
+    if len(crossover) > 0:
+        print(
+            f"Crosses null at:  hop {hops[crossover[0]]}", file=sys.stderr)
+    else:
+        print("Crosses null at:  never (within max-hops)", file=sys.stderr)
+    print("------------------------------------", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
