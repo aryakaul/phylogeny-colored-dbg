@@ -17,23 +17,23 @@ color — using the DB avoids confusion and is faster).
 
 Distance between two assignments handles three cases:
 
-- **Single node vs single node** (vast majority): direct tree-distance
-  lookup in a precomputed dict-of-dicts.  This is the fast path.
+- **Single node vs single node** (vast majority): direct lookup in a
+  precomputed N×N node distance matrix (N = named tree nodes, ~2000).
+  This is the fast path and is fully vectorized with numpy.
 - **Multi-cut solutions** (e.g. "NodeA,NodeB" vs "NodeC"): directed
   Hausdorff averaged — for each node in set A find its nearest in B,
   average, then vice versa, then average both directions.
 - **OR-ambiguous** (e.g. "X OR Y,Z"): minimum distance across all
   pairwise combinations of alternative solutions.
 
-The permutation test vectorizes with numpy: an integer index maps each
-unitig to its cut-string, a precomputed (U×U) assignment distance
-matrix enables O(1) per-edge lookups, and shuffling + fancy indexing
-gives O(E) per permutation.
+The permutation test is parallelized across ``--jobs`` workers using
+fork-based multiprocessing (shared read-only data via copy-on-write).
 """
 
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import sqlite3
 import sys
 import time
@@ -68,17 +68,14 @@ def _configure_logger(verbosity: int) -> None:
 
 def _build_node_distances(
     tree: Tree,
-) -> Tuple[Dict[str, Dict[str, int]], int]:
+) -> Tuple[Dict[str, Dict[str, int]], List[str], np.ndarray, int]:
     """Pairwise topological distances between all named tree nodes.
 
-    Builds a full adjacency list (including unnamed nodes as pass-through
-    edges) then BFS from every named node.  Unnamed nodes are traversed
-    but not stored as endpoints, so the edge count is always correct even
-    if post-processing missed an internal node.
-
     Returns:
-        dist   -- dist[a][b] = number of edges on the a→b path
-        diam   -- max(dist[a][b]) across all named pairs
+        dist_dict  -- dist_dict[a][b] = number of edges on the a→b path
+        node_names -- sorted list of named node names
+        dist_np    -- N×N int16 numpy array of pairwise distances
+        diam       -- max(dist[a][b]) across all named pairs
     """
     # Assign stable keys to all nodes (name, or placeholder for unnamed)
     node_key: Dict[int, str] = {}
@@ -99,7 +96,7 @@ def _build_node_distances(
             adj[ck].append(pk)
 
     # BFS from every named node
-    distances: Dict[str, Dict[str, int]] = {}
+    dist_dict: Dict[str, Dict[str, int]] = {}
     for start in sorted(named_keys):
         visited = {start: 0}
         queue: deque[str] = deque([start])
@@ -109,19 +106,30 @@ def _build_node_distances(
                 if nb not in visited:
                     visited[nb] = visited[cur] + 1
                     queue.append(nb)
-        distances[start] = {
+        dist_dict[start] = {
             k: v for k, v in visited.items() if k in named_keys
         }
 
     diam = max(
-        (d for row in distances.values() for d in row.values()), default=0)
+        (d for row in dist_dict.values() for d in row.values()), default=0)
+
+    # Build numpy matrix
+    node_names = sorted(named_keys)
+    name_to_idx = {n: i for i, n in enumerate(node_names)}
+    N = len(node_names)
+    dist_np = np.zeros((N, N), dtype=np.int16)
+    for a, row in dist_dict.items():
+        ai = name_to_idx[a]
+        for b, d in row.items():
+            dist_np[ai, name_to_idx[b]] = d
+
     logger.info(
-        "Node distances: {} named nodes, diameter = {}", len(named_keys), diam)
-    return distances, diam
+        "Node distances: {} named nodes, diameter = {}", N, diam)
+    return dist_dict, node_names, dist_np, diam
 
 
 # ---------------------------------------------------------------------------
-# Cut-string parsing
+# Cut-string parsing and classification
 # ---------------------------------------------------------------------------
 
 def _parse_cutstring(raw: str) -> List[FrozenSet[str]]:
@@ -147,6 +155,39 @@ def _parse_cutstring(raw: str) -> List[FrozenSet[str]]:
     return alts
 
 
+def _classify_cutstrings(
+    unique_cs: List[str],
+    name_to_nidx: Dict[str, int],
+) -> Tuple[np.ndarray, np.ndarray, List[List[FrozenSet[str]]]]:
+    """Classify cut-strings as simple (single tree node) or complex.
+
+    Returns:
+        is_simple      -- bool array [U], True if single-node cut-string
+        simple_node_idx -- int32 array [U], tree-node index if simple, -1 otherwise
+        parsed_cs      -- parsed form of each unique cut-string
+    """
+    U = len(unique_cs)
+    is_simple = np.zeros(U, dtype=np.bool_)
+    simple_node_idx = np.full(U, -1, dtype=np.int32)
+    parsed_cs = []
+
+    for i, cs in enumerate(unique_cs):
+        p = _parse_cutstring(cs)
+        parsed_cs.append(p)
+        if len(p) == 1 and len(p[0]) == 1:
+            node_name = next(iter(p[0]))
+            nidx = name_to_nidx.get(node_name)
+            if nidx is not None:
+                is_simple[i] = True
+                simple_node_idx[i] = nidx
+
+    n_simple = int(is_simple.sum())
+    logger.info(
+        "Cut-string classification: {:,} simple ({:.1f}%), {:,} complex",
+        n_simple, 100.0 * n_simple / max(U, 1), U - n_simple)
+    return is_simple, simple_node_idx, parsed_cs
+
+
 # ---------------------------------------------------------------------------
 # Distance between assignments
 # ---------------------------------------------------------------------------
@@ -154,50 +195,42 @@ def _parse_cutstring(raw: str) -> List[FrozenSet[str]]:
 def _solution_distance(
     sol_a: FrozenSet[str],
     sol_b: FrozenSet[str],
-    node_dist: Dict[str, Dict[str, int]],
+    node_dist_np: np.ndarray,
+    name_to_nidx: Dict[str, int],
 ) -> float:
     """Distance between two single solutions (each a set of cut-nodes).
-
-    Fast path (single node vs single node): one dict lookup.
-    Multi-node: directed Hausdorff averaged — mean of pairwise minima,
-    computed in both directions and averaged.
 
     Returns -1.0 if any node is absent from the distance matrix.
     """
     if sol_a == sol_b:
         return 0.0
 
-    # Validate that every node is in the distance matrix
-    for n in sol_a | sol_b:
-        if n not in node_dist:
-            return -1.0
+    idx_a = [name_to_nidx.get(n) for n in sol_a]
+    idx_b = [name_to_nidx.get(n) for n in sol_b]
+
+    if any(i is None for i in idx_a) or any(i is None for i in idx_b):
+        return -1.0
 
     # Fast path: single vs single
-    if len(sol_a) == 1 and len(sol_b) == 1:
-        na = next(iter(sol_a))
-        nb = next(iter(sol_b))
-        return float(node_dist[na][nb])
+    if len(idx_a) == 1 and len(idx_b) == 1:
+        return float(node_dist_np[idx_a[0], idx_b[0]])
 
     # General case: directed Hausdorff averaged
-    def _directed(src: FrozenSet[str], dst: FrozenSet[str]) -> float:
-        return sum(
-            min(node_dist[s][d] for d in dst) for s in src
-        ) / len(src)
-
-    return (_directed(sol_a, sol_b) + _directed(sol_b, sol_a)) / 2.0
+    ia = np.array(idx_a, dtype=np.int32)
+    ib = np.array(idx_b, dtype=np.int32)
+    sub = node_dist_np[np.ix_(ia, ib)].astype(np.float64)
+    d_ab = float(sub.min(axis=1).mean())
+    d_ba = float(sub.min(axis=0).mean())
+    return (d_ab + d_ba) / 2.0
 
 
 def _assignment_distance(
     alts_a: List[FrozenSet[str]],
     alts_b: List[FrozenSet[str]],
-    node_dist: Dict[str, Dict[str, int]],
+    node_dist_np: np.ndarray,
+    name_to_nidx: Dict[str, int],
 ) -> float:
-    """Distance between two full assignments, handling OR-ambiguity.
-
-    If any alternative in A equals one in B → concordant (distance 0).
-    Otherwise → minimum pairwise solution distance across A × B.
-    Returns -1.0 if no valid distance can be computed.
-    """
+    """Distance between two full assignments, handling OR-ambiguity."""
     # Quick concordance check: shared alternative
     set_a = set(alts_a)
     if any(sb in set_a for sb in alts_b):
@@ -206,76 +239,94 @@ def _assignment_distance(
     best = float("inf")
     for sa in alts_a:
         for sb in alts_b:
-            d = _solution_distance(sa, sb, node_dist)
+            d = _solution_distance(sa, sb, node_dist_np, name_to_nidx)
             if 0 <= d < best:
                 best = d
     return best if best < float("inf") else -1.0
 
 
-def _build_assignment_distance_matrix(
-    unique_cutstrings: List[str],
-    node_dist: Dict[str, Dict[str, int]],
+def _compute_edge_distances(
+    cs_a: np.ndarray,
+    cs_b: np.ndarray,
+    is_simple: np.ndarray,
+    simple_node_idx: np.ndarray,
+    node_dist_np: np.ndarray,
+    parsed_cs: List[List[FrozenSet[str]]],
+    name_to_nidx: Dict[str, int],
 ) -> np.ndarray:
-    """Precompute pairwise distances between all unique cut-strings.
+    """Compute tree distances for edges, vectorized where possible.
 
-    Returns a (U × U) float32 matrix.  Entries are -1 where distance
-    cannot be computed (missing tree node).
+    Args:
+        cs_a, cs_b: cut-string indices for each edge endpoint [E]
+
+    Returns:
+        dists: float32 array [E], -1.0 for invalid distances
     """
-    parsed = [_parse_cutstring(cs) for cs in unique_cutstrings]
-    U = len(unique_cutstrings)
-    mat = np.full((U, U), -1.0, dtype=np.float32)
-    np.fill_diagonal(mat, 0.0)
+    E = len(cs_a)
+    dists = np.full(E, -1.0, dtype=np.float32)
 
-    for i in range(U):
-        if not parsed[i]:
-            continue
-        for j in range(i + 1, U):
-            if not parsed[j]:
-                continue
-            d = _assignment_distance(parsed[i], parsed[j], node_dist)
-            mat[i, j] = d
-            mat[j, i] = d
+    # Same cut-string → distance 0
+    same = cs_a == cs_b
+    dists[same] = 0.0
 
-    return mat
+    # Both simple → vectorized N×N lookup
+    both_simple = is_simple[cs_a] & is_simple[cs_b] & ~same
+    if both_simple.any():
+        na = simple_node_idx[cs_a[both_simple]]
+        nb = simple_node_idx[cs_b[both_simple]]
+        dists[both_simple] = node_dist_np[na, nb].astype(np.float32)
+
+    # Complex pairs: Python loop
+    need_complex = ~same & ~both_simple
+    for idx in np.where(need_complex)[0]:
+        p_a = parsed_cs[cs_a[idx]]
+        p_b = parsed_cs[cs_b[idx]]
+        if p_a and p_b:
+            dists[idx] = _assignment_distance(
+                p_a, p_b, node_dist_np, name_to_nidx)
+
+    return dists
+
+
+# ---------------------------------------------------------------------------
+# Shared state for fork-based multiprocessing
+# ---------------------------------------------------------------------------
+
+_SHARED: Dict = {}
 
 
 # ---------------------------------------------------------------------------
 # Permutation null model
 # ---------------------------------------------------------------------------
 
-def _run_permutation_test(
-    edge_a_idx: np.ndarray,
-    edge_b_idx: np.ndarray,
-    assignment_indices: np.ndarray,
-    dist_matrix: np.ndarray,
-    n_permutations: int,
-    rng: np.random.Generator,
-) -> Tuple[np.ndarray, float]:
-    """Permutation null model for edge tree-distances.
+def _permutation_worker(args_tuple):
+    """Run a batch of permutations. Reads shared data from _SHARED."""
+    perm_start, perm_end, seed = args_tuple
 
-    For each permutation, shuffles the unitig→cut-string mapping
-    (preserving frequency distribution) and recomputes all edge
-    distances via the precomputed assignment distance matrix.
+    assignment_indices = _SHARED["assignment_indices"]
+    edge_a_idx = _SHARED["edge_a_idx"]
+    edge_b_idx = _SHARED["edge_b_idx"]
+    is_simple = _SHARED["is_simple"]
+    simple_node_idx = _SHARED["simple_node_idx"]
+    node_dist_np = _SHARED["node_dist_np"]
+    parsed_cs = _SHARED["parsed_cs"]
+    name_to_nidx = _SHARED["name_to_nidx"]
+    max_q = _SHARED["max_q"]
 
-    Returns:
-        survival   -- survival[q] = P(permuted_distance ≥ q/_Q).
-                      Index with int(round(distance * _Q)).
-        mean_perm  -- mean distance across all valid permuted edges.
-    """
-    valid_entries = dist_matrix[dist_matrix >= 0]
-    if len(valid_entries) == 0:
-        return np.ones(1, dtype=np.float64), 0.0
-
-    max_q = int(np.max(valid_entries) * _Q) + 1
+    rng = np.random.default_rng(seed)
     hist = np.zeros(max_q + 1, dtype=np.int64)
     total_valid = 0
     total_sum = 0.0
 
-    for p in range(n_permutations):
+    for p in range(perm_start, perm_end):
         perm = assignment_indices.copy()
         rng.shuffle(perm)
 
-        dists = dist_matrix[perm[edge_a_idx], perm[edge_b_idx]]
+        cs_a = perm[edge_a_idx]
+        cs_b = perm[edge_b_idx]
+        dists = _compute_edge_distances(
+            cs_a, cs_b, is_simple, simple_node_idx,
+            node_dist_np, parsed_cs, name_to_nidx)
 
         valid_mask = dists >= 0
         valid_dists = dists[valid_mask]
@@ -286,8 +337,56 @@ def _run_permutation_test(
         total_valid += int(valid_mask.sum())
         total_sum += float(valid_dists.sum())
 
-        if (p + 1) % 100 == 0:
-            logger.info("Permutation {}/{}", p + 1, n_permutations)
+        n_done = p - perm_start + 1
+        if n_done % 100 == 0:
+            logger.info(
+                "Permutation worker: {}/{}", n_done, perm_end - perm_start)
+
+    return hist, total_valid, total_sum
+
+
+def _run_permutation_test(
+    n_permutations: int,
+    n_jobs: int,
+    max_dist: float,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, float]:
+    """Permutation null model for edge tree-distances.
+
+    Returns:
+        survival   -- survival[q] = P(permuted_distance ≥ q/_Q).
+                      Index with int(round(distance * _Q)).
+        mean_perm  -- mean distance across all valid permuted edges.
+    """
+    max_q = int(max_dist * _Q) + 1
+    _SHARED["max_q"] = max_q
+
+    # Assign each worker a contiguous range of permutations + unique seed
+    chunk_size = (n_permutations + n_jobs - 1) // n_jobs
+    worker_args = []
+    for i in range(n_jobs):
+        start = i * chunk_size
+        end = min(start + chunk_size, n_permutations)
+        if start >= end:
+            break
+        worker_seed = int(rng.integers(0, 2**62))
+        worker_args.append((start, end, worker_seed))
+
+    if n_jobs == 1:
+        hist, total_valid, total_sum = _permutation_worker(worker_args[0])
+    else:
+        hist = np.zeros(max_q + 1, dtype=np.int64)
+        total_valid = 0
+        total_sum = 0.0
+
+        ctx = mp.get_context("fork")
+        with ctx.Pool(n_jobs) as pool:
+            for w_hist, w_valid, w_sum in pool.imap_unordered(
+                _permutation_worker, worker_args
+            ):
+                hist += w_hist
+                total_valid += w_valid
+                total_sum += w_sum
 
     # Survival function: P(distance ≥ threshold)
     survival = np.cumsum(hist[::-1])[::-1].astype(np.float64)
@@ -339,6 +438,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--seed", type=int, default=42,
         help="Random seed for reproducibility (default: 42).")
     parser.add_argument(
+        "--jobs", type=int, default=1,
+        help="Number of parallel workers (default: 1).")
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase verbosity (-v for INFO, -vv for DEBUG).")
 
@@ -353,7 +455,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         tree.name = "Root"
 
     t0 = time.time()
-    node_dist, diameter = _build_node_distances(tree)
+    node_dist_dict, node_names, node_dist_np, diameter = \
+        _build_node_distances(tree)
+    name_to_nidx = {n: i for i, n in enumerate(node_names)}
     logger.info("Node distances computed in {:.1f}s", time.time() - t0)
 
     if diameter == 0:
@@ -377,7 +481,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         "Loaded {:,} unitigs, {:,} edges", len(unitig_colors), len(edges_raw))
 
     # -- Index: unitigs → integers, cut-strings → integers -------------------
-    # Only unitigs with a real (non-None) assignment participate.
     assigned_unitigs = {
         uid for uid, cs in unitig_colors.items()
         if cs.strip().lower() != "none" and cs.strip()
@@ -385,7 +488,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     unique_cs = sorted({unitig_colors[uid] for uid in assigned_unitigs})
     cs_to_idx = {cs: i for i, cs in enumerate(unique_cs)}
-    logger.info("{} unique non-None cut-strings", len(unique_cs))
+    logger.info("{:,} unique non-None cut-strings", len(unique_cs))
 
     unitig_list = sorted(assigned_unitigs)
     unitig_to_flat = {uid: i for i, uid in enumerate(unitig_list)}
@@ -393,14 +496,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         [cs_to_idx[unitig_colors[uid]] for uid in unitig_list],
         dtype=np.int32)
 
-    # -- Assignment distance matrix ------------------------------------------
+    # -- Classify cut-strings ------------------------------------------------
     t0 = time.time()
-    dist_matrix = _build_assignment_distance_matrix(unique_cs, node_dist)
-    n_valid_pairs = int(np.sum(dist_matrix >= 0)) - len(unique_cs)  # excl diag
-    logger.info(
-        "Assignment distance matrix ({0}×{0}, {1:,} valid pairs) "
-        "built in {2:.1f}s",
-        len(unique_cs), n_valid_pairs // 2, time.time() - t0)
+    is_simple, simple_node_idx, parsed_cs = \
+        _classify_cutstrings(unique_cs, name_to_nidx)
+    logger.info("Cut-strings classified in {:.1f}s", time.time() - t0)
 
     # -- Filter edges: both endpoints must be assigned -----------------------
     edge_a_flat: List[int] = []
@@ -422,9 +522,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     logger.info("{:,} edges with both endpoints assigned", E)
 
     # -- Observed distances --------------------------------------------------
+    t0 = time.time()
     obs_cs_a = assignment_indices[edge_a_idx]
     obs_cs_b = assignment_indices[edge_b_idx]
-    observed = dist_matrix[obs_cs_a, obs_cs_b]
+    observed = _compute_edge_distances(
+        obs_cs_a, obs_cs_b, is_simple, simple_node_idx,
+        node_dist_np, parsed_cs, name_to_nidx)
+    logger.info("Observed distances computed in {:.1f}s", time.time() - t0)
 
     n_valid = int(np.sum(observed >= 0))
     n_concordant = int(np.sum(observed == 0))
@@ -440,13 +544,27 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # -- Permutation test ----------------------------------------------------
     rng = np.random.default_rng(args.seed)
+    n_jobs = max(1, args.jobs)
 
     if args.permutations > 0 and E > 0:
+        # Populate shared state before forking
+        _SHARED["assignment_indices"] = assignment_indices
+        _SHARED["edge_a_idx"] = edge_a_idx
+        _SHARED["edge_b_idx"] = edge_b_idx
+        _SHARED["is_simple"] = is_simple
+        _SHARED["simple_node_idx"] = simple_node_idx
+        _SHARED["node_dist_np"] = node_dist_np
+        _SHARED["parsed_cs"] = parsed_cs
+        _SHARED["name_to_nidx"] = name_to_nidx
+
+        max_dist = float(node_dist_np.max())
+
         t0 = time.time()
-        logger.info("Running {:,} permutations...", args.permutations)
+        logger.info(
+            "Running {:,} permutations across {} workers...",
+            args.permutations, n_jobs)
         survival, mean_perm = _run_permutation_test(
-            edge_a_idx, edge_b_idx, assignment_indices, dist_matrix,
-            args.permutations, rng)
+            args.permutations, n_jobs, max_dist, rng)
         logger.info("Permutations done in {:.1f}s", time.time() - t0)
     else:
         survival = np.ones(1, dtype=np.float64)

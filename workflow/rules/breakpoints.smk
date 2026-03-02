@@ -131,6 +131,7 @@ rule stratified_concordance_breakpoints:
     params:
         script=str(SCRIPTS_DIR / "concordance_breakpoints_stratified"),
         permutations=1000,
+    threads: MAX_THREADS
     conda:
         "../envs/ete4.yml"
     shell:
@@ -141,6 +142,7 @@ rule stratified_concordance_breakpoints:
             --tree {input.tree} \\
             --gfa {input.gfa} \\
             --permutations {params.permutations} \\
+            --jobs {threads} \\
             --output {output.breakpoints} \\
             -v
         """
