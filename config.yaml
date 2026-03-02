@@ -26,12 +26,13 @@ max_colors:           70
 tmp_dir:              /tmp
 produce_colored_deletions: False
 produce_breakpoints: True
-produce_minimalcuts_colors: True
+produce_minimalcuts_colors: False
+produce_coherence_decay: True
   
 
 # (2) Threading; notes:
 #     - controls max threads for multithreaded steps
-threads:              8
+threads:              64
 
 # (3) Mashtree/attotree parameters; notes:
 #     - sketch size should be at least 10k to achieve a sufficient resolution
