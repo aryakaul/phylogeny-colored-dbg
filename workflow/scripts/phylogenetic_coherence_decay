@@ -22,11 +22,11 @@ A null expectation for each definition is reported as a baseline.
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import sqlite3
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Sequence, Tuple
 
@@ -59,7 +59,7 @@ def _parse_cutstring(cs: str) -> List[FrozenSet[str]]:
         "NodeA OR NodeB,NodeC" → [{NodeA}, {NodeB, NodeC}]
     """
     if not cs or cs == "None":
-        return [frozenset()]
+        return [frozenset({"__UNASSIGNED__"})]
     alternatives = cs.split(" OR ")
     solutions = []
     for alt in alternatives:
@@ -156,7 +156,7 @@ def _build_containment_table(
     if M > 50_000:
         logger.warning(
             "M = {:,} > 50,000; skipping precompute of M² containment table. "
-            "Will use on-the-fly checks (slower BFS).", M)
+            "Will use on-the-fly checks.", M)
         return unique_cuts, cut_to_idx, None
 
     # Pre-parse all cut-strings
@@ -244,13 +244,22 @@ def _bfs_coherence(
 
 
 # ---------------------------------------------------------------------------
-# Worker function for multiprocessing
+# Shared state for fork-based multiprocessing
 # ---------------------------------------------------------------------------
 
+# Populated by the parent process before forking; child processes inherit
+# these via copy-on-write without any pickling overhead.
+_SHARED: Dict = {}
+
+
 def _worker_bfs(args_tuple):
-    """Process a batch of seeds. Called by ProcessPoolExecutor."""
-    (seeds, adj, unitig_to_cut_idx, max_hops,
-     contain_table, parsed_cuts, worker_id) = args_tuple
+    """Process a batch of seeds. Reads shared data from module-level _SHARED."""
+    seeds, worker_id = args_tuple
+    adj = _SHARED["adj"]
+    unitig_to_cut_idx = _SHARED["unitig_to_cut_idx"]
+    max_hops = _SHARED["max_hops"]
+    contain_table = _SHARED["contain_table"]
+    parsed_cuts = _SHARED["parsed_cuts"]
 
     total_reached = np.zeros(max_hops, dtype=np.int64)
     total_strict = np.zeros(max_hops, dtype=np.int64)
@@ -296,6 +305,7 @@ def _containment_null(
     unique_cuts: List[str],
     contain_table: np.ndarray | None,
     parsed_cuts: List[List[FrozenSet[str]]] | None,
+    rng: np.random.Generator | None = None,
 ) -> float:
     """Null expectation for containment coherence: Σ_{i,j coherent} f_i * f_j."""
     total = len(colors)
@@ -309,18 +319,36 @@ def _containment_null(
     freqs = np.array([counts[cs] / total for cs in unique_cuts])
 
     if contain_table is not None:
-        # Vectorized: f^T @ C @ f
-        return float(freqs @ contain_table.astype(np.float64) @ freqs)
+        # Row-wise dot: O(M²) work but O(M) extra memory,
+        # avoids materializing an M×M float64 matrix.
+        return float(sum(
+            freqs[i] * freqs[contain_table[i]].sum()
+            for i in range(len(freqs))
+        ))
 
-    # On-the-fly fallback
-    M = len(unique_cuts)
-    null_val = 0.0
-    for i in range(M):
-        null_val += freqs[i] * freqs[i]  # diagonal (i == j)
-        for j in range(i + 1, M):
-            if _containment_check(parsed_cuts[i], parsed_cuts[j]):
-                null_val += 2.0 * freqs[i] * freqs[j]
-    return null_val
+    # Large M: sample-based estimation.
+    # Drawing 1M frequency-weighted random pairs and checking containment
+    # gives a precise estimate (SE < 0.001) in seconds, vs. hours for the
+    # exhaustive M²/2 loop when M ≈ 500k.
+    if rng is None:
+        rng = np.random.default_rng(42)
+    n_samples = 1_000_000
+    idx_a = rng.choice(len(unique_cuts), size=n_samples, p=freqs)
+    idx_b = rng.choice(len(unique_cuts), size=n_samples, p=freqs)
+
+    n_coherent = 0
+    for k in range(n_samples):
+        i, j = int(idx_a[k]), int(idx_b[k])
+        if i == j or _containment_check(parsed_cuts[i], parsed_cuts[j]):
+            n_coherent += 1
+
+    estimate = n_coherent / n_samples
+    logger.info(
+        "Containment null estimated from {:,} samples: {:.6f} "
+        "(SE ≈ {:.6f})",
+        n_samples, estimate,
+        (estimate * (1 - estimate) / n_samples) ** 0.5)
+    return estimate
 
 
 # ---------------------------------------------------------------------------
@@ -431,20 +459,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         logger.info("Sampled {:,} seed unitigs", n_seeds)
 
     # -- BFS from each seed --------------------------------------------------
+    # Populate module-level shared state BEFORE forking so child processes
+    # inherit it via copy-on-write (zero serialization cost).
+    _SHARED["adj"] = adj
+    _SHARED["unitig_to_cut_idx"] = unitig_to_cut_idx
+    _SHARED["max_hops"] = args.max_hops
+    _SHARED["contain_table"] = contain_table
+    _SHARED["parsed_cuts"] = parsed_cuts
+
     t0 = time.time()
     n_jobs = max(1, args.jobs)
 
     if n_jobs == 1:
-        # Single-threaded: run directly
         total_reached, total_strict, total_contain = _worker_bfs(
-            (seeds, adj, unitig_to_cut_idx, args.max_hops,
-             contain_table, parsed_cuts, 0))
+            (seeds, 0))
     else:
         # Partition seeds across workers
         chunks = np.array_split(seeds, n_jobs)
         worker_args = [
-            (list(chunk), adj, unitig_to_cut_idx, args.max_hops,
-             contain_table, parsed_cuts, i)
+            (list(chunk), i)
             for i, chunk in enumerate(chunks) if len(chunk) > 0
         ]
 
@@ -452,8 +485,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         total_strict = np.zeros(args.max_hops, dtype=np.int64)
         total_contain = np.zeros(args.max_hops, dtype=np.int64)
 
-        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
-            for reached, strict, contain in executor.map(
+        ctx = mp.get_context("fork")
+        with ctx.Pool(n_jobs) as pool:
+            for reached, strict, contain in pool.imap_unordered(
                 _worker_bfs, worker_args
             ):
                 total_reached += reached
@@ -476,7 +510,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     null_strict = _simpson_index(colors)
     null_contain = _containment_null(
-        colors, unique_cuts, contain_table, parsed_cuts)
+        colors, unique_cuts, contain_table, parsed_cuts, rng)
 
     logger.info("Null strict (Simpson index): {:.6f}", null_strict)
     logger.info("Null containment: {:.6f}", null_contain)
