@@ -28,13 +28,13 @@ def fn_coherence_decay(batch: str | None = None, _batch: str | None = None) -> s
 
 
 def fn_coherence_decay_plot(batch: str | None = None, _batch: str | None = None) -> str:
-    """Output path for coherence decay PNG plot."""
+    """Output path for coherence decay SVG plot."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "coherence" / f"{batch_id}_k{KMER_LENGTH}_{label}_coherence_decay.png"
+        dir_output() / "coherence" / f"{batch_id}_k{KMER_LENGTH}_{label}_coherence_decay.svg"
     )
 
 
@@ -56,6 +56,7 @@ rule phylogenetic_coherence_decay:
         script=str(SCRIPTS_DIR / "phylogenetic_coherence_decay"),
         max_hops=20,
         samples=10000,
+    threads: MAX_THREADS
     conda:
         "../envs/ete4.yml"
     shell:
@@ -65,6 +66,7 @@ rule phylogenetic_coherence_decay:
             --db {input.sqldb} \\
             --max-hops {params.max_hops} \\
             --samples {params.samples} \\
+            --jobs {threads} \\
             --output {output.tsv} \\
             --plot {output.plot} \\
             -v

@@ -6,14 +6,17 @@ you walk outward from a unitig in the compacted colored de Bruijn graph.
 
 For a sample of seed unitigs, BFS explores neighbors up to ``--max-hops``
 edges away.  At each hop distance *h*, the fraction of reached unitigs
-that share the seed's exact cut-string is recorded ("coherence").  The
-resulting decay curve summarises the size of co-inherited blocks:
+that share the seed's phylogenetic assignment is recorded ("coherence").
 
-- **Slow decay** → large contiguous regions share evolutionary origin.
-- **Fast decay** → mosaic genome with frequent assignment changes.
+Two coherence definitions are reported:
 
-A null expectation (probability two random unitigs match under random
-label assignment = Σ fᵢ², the Simpson index) is reported as a baseline.
+- **Strict**: cut-strings must be identical as strings.
+- **Containment**: for at least one pair of alternative solutions,
+  one node-set is a subset of (or equal to) the other.  This captures
+  unitigs that share a primary evolutionary event but differ in secondary
+  refinements (e.g., partial loss within a subclade).
+
+A null expectation for each definition is reported as a baseline.
 """
 
 from __future__ import annotations
@@ -22,9 +25,10 @@ import argparse
 import sqlite3
 import sys
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Sequence, Tuple
 
 import numpy as np
 from loguru import logger
@@ -43,6 +47,40 @@ def _configure_logger(verbosity: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cut-string parsing
+# ---------------------------------------------------------------------------
+
+def _parse_cutstring(cs: str) -> List[FrozenSet[str]]:
+    """Parse a cut-string into a list of alternative solution sets.
+
+    Rules:
+        "NodeA"             → [{NodeA}]
+        "NodeA,NodeB"       → [{NodeA, NodeB}]
+        "NodeA OR NodeB,NodeC" → [{NodeA}, {NodeB, NodeC}]
+    """
+    if not cs or cs == "None":
+        return [frozenset()]
+    alternatives = cs.split(" OR ")
+    solutions = []
+    for alt in alternatives:
+        nodes = frozenset(n.strip() for n in alt.split(",") if n.strip())
+        solutions.append(nodes)
+    return solutions
+
+
+def _containment_check(
+    sols_a: List[FrozenSet[str]],
+    sols_b: List[FrozenSet[str]],
+) -> bool:
+    """True if any pair of solutions satisfies set containment."""
+    for sa in sols_a:
+        for sb in sols_b:
+            if sa <= sb or sb <= sa:
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Graph loading
 # ---------------------------------------------------------------------------
 
@@ -52,9 +90,7 @@ def _load_graph_and_colors(
     """Load adjacency list and cut-string assignments from SQLite.
 
     The graph is treated as **undirected**: for every (A→B) edge we also
-    record (B→A), and strand orientation is ignored.  This matches the
-    analysis intent (walking along the genome without regard to reading
-    direction).
+    record (B→A), and strand orientation is ignored.
 
     Returns:
         adj    -- adj[uid] = list of neighbor uids (undirected)
@@ -90,24 +126,92 @@ def _load_graph_and_colors(
 
 
 # ---------------------------------------------------------------------------
+# Precompute coherence lookup
+# ---------------------------------------------------------------------------
+
+def _build_containment_table(
+    colors: Dict[str, str],
+) -> Tuple[List[str], Dict[str, int], np.ndarray | None]:
+    """Build pairwise containment coherence table for unique cut-strings.
+
+    Strict coherence is just index equality (unique strings are unique by
+    construction), so no table is needed for it.
+
+    Returns:
+        unique_cuts   -- list of M unique cut-strings
+        cut_to_idx    -- mapping from cut-string to index in unique_cuts
+        contain_table -- M×M bool array (set containment), or None if M > 50,000
+    """
+    # Collect unique cut-strings
+    cut_counts: Dict[str, int] = defaultdict(int)
+    for cs in colors.values():
+        cut_counts[cs] += 1
+
+    unique_cuts = list(cut_counts.keys())
+    cut_to_idx = {cs: i for i, cs in enumerate(unique_cuts)}
+    M = len(unique_cuts)
+
+    logger.info("Unique cut-strings: {:,}", M)
+
+    if M > 50_000:
+        logger.warning(
+            "M = {:,} > 50,000; skipping precompute of M² containment table. "
+            "Will use on-the-fly checks (slower BFS).", M)
+        return unique_cuts, cut_to_idx, None
+
+    # Pre-parse all cut-strings
+    parsed = [_parse_cutstring(cs) for cs in unique_cuts]
+
+    # Build containment table
+    contain_table = np.eye(M, dtype=np.bool_)
+
+    t0 = time.time()
+    for i in range(M):
+        for j in range(i + 1, M):
+            if _containment_check(parsed[i], parsed[j]):
+                contain_table[i, j] = True
+                contain_table[j, i] = True
+
+    elapsed = time.time() - t0
+    n_contain = int(contain_table.sum()) - M  # exclude diagonal
+    logger.info(
+        "Containment table built in {:.1f}s: {:,} coherent pairs "
+        "(of {:,} off-diagonal)", elapsed, n_contain // 2, M * (M - 1) // 2)
+
+    return unique_cuts, cut_to_idx, contain_table
+
+
+# ---------------------------------------------------------------------------
 # BFS coherence measurement
 # ---------------------------------------------------------------------------
 
 def _bfs_coherence(
     seed: str,
     adj: Dict[str, List[str]],
-    colors: Dict[str, str],
+    unitig_to_cut_idx: Dict[str, int],
     max_hops: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+    contain_table: np.ndarray | None,
+    parsed_cuts: List[List[FrozenSet[str]]] | None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """BFS from *seed* up to *max_hops*, counting concordant neighbours.
 
-    Returns two int arrays of length max_hops (index 0 = hop 1):
-        n_reached    -- total unitigs reached at each hop distance
-        n_concordant -- of those, how many share the seed's cut-string
+    Returns three int arrays of length max_hops (index 0 = hop 1):
+        n_reached           -- total unitigs reached at each hop distance
+        n_strict_concordant -- strict equality (index identity)
+        n_contain_concordant -- set containment matches
     """
-    seed_color = colors.get(seed, "None")
+    seed_idx = unitig_to_cut_idx.get(seed)
     n_reached = np.zeros(max_hops, dtype=np.int64)
-    n_concordant = np.zeros(max_hops, dtype=np.int64)
+    n_strict = np.zeros(max_hops, dtype=np.int64)
+    n_contain = np.zeros(max_hops, dtype=np.int64)
+
+    if seed_idx is None:
+        return n_reached, n_strict, n_contain
+
+    if contain_table is not None:
+        seed_contain_row = contain_table[seed_idx]
+    else:
+        seed_parsed = parsed_cuts[seed_idx]
 
     visited = {seed}
     frontier = [seed]
@@ -120,17 +224,56 @@ def _bfs_coherence(
                     visited.add(nb)
                     next_frontier.append(nb)
                     n_reached[h] += 1
-                    if colors.get(nb, "None") == seed_color:
-                        n_concordant[h] += 1
+                    nb_idx = unitig_to_cut_idx.get(nb)
+                    if nb_idx is None:
+                        continue
+                    if nb_idx == seed_idx:
+                        n_strict[h] += 1
+                        n_contain[h] += 1
+                    elif contain_table is not None:
+                        if seed_contain_row[nb_idx]:
+                            n_contain[h] += 1
+                    else:
+                        if _containment_check(seed_parsed, parsed_cuts[nb_idx]):
+                            n_contain[h] += 1
         frontier = next_frontier
         if not frontier:
-            break  # no more reachable nodes
+            break
 
-    return n_reached, n_concordant
+    return n_reached, n_strict, n_contain
 
 
 # ---------------------------------------------------------------------------
-# Null expectation
+# Worker function for multiprocessing
+# ---------------------------------------------------------------------------
+
+def _worker_bfs(args_tuple):
+    """Process a batch of seeds. Called by ProcessPoolExecutor."""
+    (seeds, adj, unitig_to_cut_idx, max_hops,
+     contain_table, parsed_cuts, worker_id) = args_tuple
+
+    total_reached = np.zeros(max_hops, dtype=np.int64)
+    total_strict = np.zeros(max_hops, dtype=np.int64)
+    total_contain = np.zeros(max_hops, dtype=np.int64)
+
+    for i, s in enumerate(seeds):
+        reached, strict, contain = _bfs_coherence(
+            s, adj, unitig_to_cut_idx, max_hops,
+            contain_table, parsed_cuts)
+        total_reached += reached
+        total_strict += strict
+        total_contain += contain
+
+        if (i + 1) % 1000 == 0:
+            logger.info(
+                "Worker {}: BFS {}/{} seeds ({:.0f}%)",
+                worker_id, i + 1, len(seeds), (i + 1) / len(seeds) * 100)
+
+    return total_reached, total_strict, total_contain
+
+
+# ---------------------------------------------------------------------------
+# Null expectations
 # ---------------------------------------------------------------------------
 
 def _simpson_index(colors: Dict[str, str]) -> float:
@@ -148,35 +291,77 @@ def _simpson_index(colors: Dict[str, str]) -> float:
     return sum((c / total) ** 2 for c in counts.values())
 
 
+def _containment_null(
+    colors: Dict[str, str],
+    unique_cuts: List[str],
+    contain_table: np.ndarray | None,
+    parsed_cuts: List[List[FrozenSet[str]]] | None,
+) -> float:
+    """Null expectation for containment coherence: Σ_{i,j coherent} f_i * f_j."""
+    total = len(colors)
+    if total == 0:
+        return 0.0
+
+    counts: Dict[str, int] = defaultdict(int)
+    for cs in colors.values():
+        counts[cs] += 1
+
+    freqs = np.array([counts[cs] / total for cs in unique_cuts])
+
+    if contain_table is not None:
+        # Vectorized: f^T @ C @ f
+        return float(freqs @ contain_table.astype(np.float64) @ freqs)
+
+    # On-the-fly fallback
+    M = len(unique_cuts)
+    null_val = 0.0
+    for i in range(M):
+        null_val += freqs[i] * freqs[i]  # diagonal (i == j)
+        for j in range(i + 1, M):
+            if _containment_check(parsed_cuts[i], parsed_cuts[j]):
+                null_val += 2.0 * freqs[i] * freqs[j]
+    return null_val
+
+
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
 def _plot_decay(
     hops: np.ndarray,
-    coherence: np.ndarray,
-    null_exp: float,
+    coherence_strict: np.ndarray,
+    coherence_contain: np.ndarray,
+    null_strict: float,
+    null_contain: float,
     output_path: Path,
 ) -> None:
-    """Save a coherence-decay PNG."""
+    """Save a coherence-decay plot (SVG)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    sns.set_theme(style="whitegrid", context="notebook")
+    sns.set_theme(style="white", context="notebook")
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    sns.lineplot(x=hops, y=coherence, marker="o", linewidth=1.5,
-                 markersize=4, label="Observed coherence", ax=ax)
-    ax.axhline(null_exp, color="grey", linestyle="--", linewidth=1,
-               label=f"Null (Simpson index = {null_exp:.4f})")
+
+    ax.plot(hops, coherence_contain, marker="o", linewidth=1.5,
+            markersize=4, label="Containment coherence", color="tab:blue")
+    ax.plot(hops, coherence_strict, marker="s", linewidth=1.5,
+            markersize=3, linestyle="--", label="Strict coherence",
+            color="tab:orange")
+    ax.axhline(null_contain, color="tab:blue", linestyle=":", linewidth=1,
+               alpha=0.7, label=f"Null containment = {null_contain:.4f}")
+    ax.axhline(null_strict, color="tab:orange", linestyle=":", linewidth=1,
+               alpha=0.7, label=f"Null strict = {null_strict:.4f}")
+
     ax.set_xlabel("Hop distance")
-    ax.set_ylabel("Coherence (fraction same cut-string)")
+    ax.set_ylabel("Coherence fraction")
     ax.set_title("Phylogenetic coherence decay")
     ax.set_ylim(bottom=0)
     ax.legend()
+    sns.despine(ax=ax, top=True, right=True)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
+    fig.savefig(output_path, format="svg")
     plt.close(fig)
     logger.info("Plot saved to {}", output_path)
 
@@ -205,7 +390,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Output TSV path.")
     parser.add_argument(
         "--plot", type=Path, default=None,
-        help="Optional path for a PNG decay-curve plot.")
+        help="Optional path for an SVG decay-curve plot.")
+    parser.add_argument(
+        "--jobs", type=int, default=1,
+        help="Number of parallel workers (default: 1).")
     parser.add_argument(
         "-v", "--verbose", action="count", default=0,
         help="Increase verbosity (-v for INFO, -vv for DEBUG).")
@@ -215,6 +403,20 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # -- Load graph ----------------------------------------------------------
     adj, colors = _load_graph_and_colors(args.db)
+
+    # -- Build containment lookup table --------------------------------------
+    unique_cuts, cut_to_idx, contain_table = \
+        _build_containment_table(colors)
+
+    # Map unitigs to cut-string indices
+    unitig_to_cut_idx: Dict[str, int] = {}
+    for uid, cs in colors.items():
+        unitig_to_cut_idx[uid] = cut_to_idx[cs]
+
+    # Pre-parse for on-the-fly mode (when M > 50k, no precomputed table)
+    parsed_cuts: List[List[FrozenSet[str]]] | None = None
+    if contain_table is None:
+        parsed_cuts = [_parse_cutstring(cs) for cs in unique_cuts]
 
     # -- Select seeds --------------------------------------------------------
     rng = np.random.default_rng(args.seed)
@@ -229,73 +431,102 @@ def main(argv: Sequence[str] | None = None) -> None:
         logger.info("Sampled {:,} seed unitigs", n_seeds)
 
     # -- BFS from each seed --------------------------------------------------
-    total_reached = np.zeros(args.max_hops, dtype=np.int64)
-    total_concordant = np.zeros(args.max_hops, dtype=np.int64)
-
     t0 = time.time()
-    for i, s in enumerate(seeds):
-        reached, concordant = _bfs_coherence(s, adj, colors, args.max_hops)
-        total_reached += reached
-        total_concordant += concordant
+    n_jobs = max(1, args.jobs)
 
-        if (i + 1) % 1000 == 0:
-            logger.info(
-                "BFS {}/{} seeds ({:.0f}%) [{:.1f}s]",
-                i + 1, n_seeds, (i + 1) / n_seeds * 100,
-                time.time() - t0)
+    if n_jobs == 1:
+        # Single-threaded: run directly
+        total_reached, total_strict, total_contain = _worker_bfs(
+            (seeds, adj, unitig_to_cut_idx, args.max_hops,
+             contain_table, parsed_cuts, 0))
+    else:
+        # Partition seeds across workers
+        chunks = np.array_split(seeds, n_jobs)
+        worker_args = [
+            (list(chunk), adj, unitig_to_cut_idx, args.max_hops,
+             contain_table, parsed_cuts, i)
+            for i, chunk in enumerate(chunks) if len(chunk) > 0
+        ]
+
+        total_reached = np.zeros(args.max_hops, dtype=np.int64)
+        total_strict = np.zeros(args.max_hops, dtype=np.int64)
+        total_contain = np.zeros(args.max_hops, dtype=np.int64)
+
+        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+            for reached, strict, contain in executor.map(
+                _worker_bfs, worker_args
+            ):
+                total_reached += reached
+                total_strict += strict
+                total_contain += contain
 
     logger.info(
         "BFS complete: {:,} seeds in {:.1f}s", n_seeds, time.time() - t0)
 
     # -- Compute coherence and null ------------------------------------------
     with np.errstate(divide="ignore", invalid="ignore"):
-        coherence = np.where(
+        coherence_strict = np.where(
             total_reached > 0,
-            total_concordant / total_reached,
+            total_strict / total_reached,
+            np.nan)
+        coherence_contain = np.where(
+            total_reached > 0,
+            total_contain / total_reached,
             np.nan)
 
-    null_exp = _simpson_index(colors)
-    logger.info("Null expectation (Simpson index): {:.6f}", null_exp)
+    null_strict = _simpson_index(colors)
+    null_contain = _containment_null(
+        colors, unique_cuts, contain_table, parsed_cuts)
+
+    logger.info("Null strict (Simpson index): {:.6f}", null_strict)
+    logger.info("Null containment: {:.6f}", null_contain)
 
     # -- Write output --------------------------------------------------------
     args.output.parent.mkdir(parents=True, exist_ok=True)
     hops = np.arange(1, args.max_hops + 1)
 
     with args.output.open("w") as out:
-        out.write("hop_distance\tn_pairs\tn_concordant\tcoherence\t"
-                  "null_expectation\n")
+        out.write("hop_distance\tn_pairs\tstrict_coherence\t"
+                  "containment_coherence\tnull_strict\tnull_containment\n")
         for h in range(args.max_hops):
-            coh_str = f"{coherence[h]:.6f}" if not np.isnan(coherence[h]) else "NA"
+            s_str = f"{coherence_strict[h]:.6f}" if not np.isnan(coherence_strict[h]) else "NA"
+            c_str = f"{coherence_contain[h]:.6f}" if not np.isnan(coherence_contain[h]) else "NA"
             out.write(
-                f"{hops[h]}\t{total_reached[h]}\t{total_concordant[h]}\t"
-                f"{coh_str}\t{null_exp:.6f}\n")
+                f"{hops[h]}\t{total_reached[h]}\t{s_str}\t"
+                f"{c_str}\t{null_strict:.6f}\t{null_contain:.6f}\n")
 
     logger.info("Output written to {}", args.output)
 
     # -- Plot ----------------------------------------------------------------
     if args.plot is not None:
-        # Only plot hops where data exists
-        valid = ~np.isnan(coherence)
+        valid = ~np.isnan(coherence_strict) & ~np.isnan(coherence_contain)
         if np.any(valid):
             args.plot.parent.mkdir(parents=True, exist_ok=True)
-            _plot_decay(hops[valid], coherence[valid], null_exp, args.plot)
+            _plot_decay(
+                hops[valid], coherence_strict[valid], coherence_contain[valid],
+                null_strict, null_contain, args.plot)
         else:
             logger.warning("No valid coherence data to plot")
 
     # -- Summary to stderr ---------------------------------------------------
     print("\n--- Phylogenetic Coherence Decay ---", file=sys.stderr)
-    print(f"Seeds:            {n_seeds:,}", file=sys.stderr)
-    print(f"Max hops:         {args.max_hops}", file=sys.stderr)
-    print(f"Null expectation: {null_exp:.6f}", file=sys.stderr)
-    if not np.isnan(coherence[0]):
-        print(f"Coherence (h=1):  {coherence[0]:.6f}", file=sys.stderr)
-    # Find hop where coherence first drops below null
-    crossover = np.where((coherence <= null_exp) & ~np.isnan(coherence))[0]
-    if len(crossover) > 0:
-        print(
-            f"Crosses null at:  hop {hops[crossover[0]]}", file=sys.stderr)
-    else:
-        print("Crosses null at:  never (within max-hops)", file=sys.stderr)
+    print(f"Seeds:                {n_seeds:,}", file=sys.stderr)
+    print(f"Max hops:             {args.max_hops}", file=sys.stderr)
+    print(f"Unique cut-strings:   {len(unique_cuts):,}", file=sys.stderr)
+    print(f"Null strict:          {null_strict:.6f}", file=sys.stderr)
+    print(f"Null containment:     {null_contain:.6f}", file=sys.stderr)
+    if not np.isnan(coherence_strict[0]):
+        print(f"Strict (h=1):         {coherence_strict[0]:.6f}", file=sys.stderr)
+        print(f"Containment (h=1):    {coherence_contain[0]:.6f}", file=sys.stderr)
+    # Find hop where each curve first drops below its null
+    cross_s = np.where((coherence_strict <= null_strict) & ~np.isnan(coherence_strict))[0]
+    cross_c = np.where((coherence_contain <= null_contain) & ~np.isnan(coherence_contain))[0]
+    print(f"Strict crosses null:  "
+          f"{'hop ' + str(hops[cross_s[0]]) if len(cross_s) > 0 else 'never (within max-hops)'}",
+          file=sys.stderr)
+    print(f"Contain crosses null: "
+          f"{'hop ' + str(hops[cross_c[0]]) if len(cross_c) > 0 else 'never (within max-hops)'}",
+          file=sys.stderr)
     print("------------------------------------", file=sys.stderr)
 
 
