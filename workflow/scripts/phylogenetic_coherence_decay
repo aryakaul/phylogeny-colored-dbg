@@ -4,19 +4,64 @@
 Measures how rapidly phylogenetic assignment (cut-string) changes as
 you walk outward from a unitig in the compacted colored de Bruijn graph.
 
-For a sample of seed unitigs, BFS explores neighbors up to ``--max-hops``
-edges away.  At each hop distance *h*, the fraction of reached unitigs
-that share the seed's phylogenetic assignment is recorded ("coherence").
+Algorithm
+---------
+1. Load the undirected graph and cut-string assignments from SQLite.
+2. Sample seed unitigs uniformly at random (or use all if fewer than
+   ``--samples``).
+3. For each seed, run BFS up to ``--max-hops`` edges.  At each hop
+   distance *h*, record how many reached unitigs are "coherent" with
+   the seed under two definitions (see below).
+4. Aggregate across all seeds: coherence(h) = total_coherent(h) /
+   total_reached(h).
+5. Compute a null expectation for each definition — the probability
+   that two randomly chosen unitigs would be coherent by chance.
+6. Output a TSV of coherence vs. hop distance and an optional SVG plot
+   showing both curves against their respective nulls.
 
-Two coherence definitions are reported:
+Coherence definitions
+---------------------
+Cut-strings encode where on the phylogeny a unitig's presence/absence
+pattern changes state.  They are parsed as:
 
-- **Strict**: cut-strings must be identical as strings.
-- **Containment**: for at least one pair of alternative solutions,
-  one node-set is a subset of (or equal to) the other.  This captures
-  unitigs that share a primary evolutionary event but differ in secondary
-  refinements (e.g., partial loss within a subclade).
+- ``"NodeA"``            → one solution: {NodeA}
+- ``"NodeA,NodeB"``      → one solution with two cuts: {NodeA, NodeB}
+- ``"NodeA OR NodeB,NodeC"`` → two alternatives: {NodeA} and {NodeB, NodeC}
 
-A null expectation for each definition is reported as a baseline.
+**Strict coherence**: two unitigs are coherent iff their raw cut-strings
+are identical.  Null = Simpson index (Σ fᵢ²).
+
+**Containment coherence**: two unitigs are coherent if, for at least one
+pair of their alternative solutions, one solution's node-set is a subset
+of (or equal to) the other's.  This captures unitigs that share a
+primary evolutionary event but differ in secondary refinements (e.g.,
+a gain at NodeA vs. a gain at NodeA followed by partial loss at NodeB).
+Null = Σ_{(i,j) coherent} fᵢ·fⱼ (computed exactly when M ≤ 50k,
+estimated from 1M frequency-weighted random pairs otherwise).
+
+The gap between the two curves indicates how prevalent secondary events
+are.  Each curve should be compared against its own null, not the other's.
+
+Performance
+-----------
+- If M (unique cut-strings) ≤ 50,000: precomputes an M×M containment
+  table.  BFS coherence checks are O(1) table lookups.
+- If M > 50,000: skips the table and checks containment on the fly
+  (Python-level frozenset subset tests per BFS neighbor).
+- BFS is parallelized across ``--jobs`` workers via fork-based
+  multiprocessing.  Shared data (graph, indices, tables) is inherited
+  via copy-on-write — only the seed list is sent to each worker.
+
+Inputs
+------
+- SQLite database with ``unitigs`` (unitig_id, colors) and ``adjacency``
+  (unitig_id, unitig_direction, neighbor_id, neighbor_direction) tables.
+
+Outputs
+-------
+- TSV: hop_distance, n_pairs, strict_coherence, containment_coherence,
+  null_strict, null_containment.
+- SVG plot (optional): both decay curves + both null reference lines.
 """
 
 from __future__ import annotations

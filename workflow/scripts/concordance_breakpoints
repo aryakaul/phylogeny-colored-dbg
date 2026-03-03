@@ -1,17 +1,46 @@
 #!/usr/bin/env python3
-"""
-Detect concordance breakpoints in a phylogeny-colored de Bruijn graph.
+"""Binary concordance breakpoint detection.
 
-A concordance breakpoint is an edge where adjacent unitigs have discordant
-phylogenetic assignments - indicating a boundary between regions with
-different evolutionary histories.
+Scans every directed edge in the pcDBG adjacency table and reports
+those where the two endpoints have different primary phylogenetic
+assignments — indicating a boundary between regions with different
+evolutionary histories.
 
-Input:
-  - SQLite database with unitigs (colors) and adjacency tables
-  - Newick tree with named internal nodes
+Algorithm
+---------
+1. Load the phylogenetic tree and build a node-name → depth map
+   (distance from root in edges) and a node-name → Tree-object lookup.
+2. Load all edges from SQLite via a JOIN of the adjacency table with
+   the unitigs table (to get cut-strings and sequence lengths for both
+   endpoints in one query).
+3. For each edge, extract the **primary assignment** from each
+   endpoint's cut-string: the first node name in the first alternative
+   (i.e., text before the first comma or " OR ").
+   - If either endpoint has no assignment ("None" / empty) → skip.
+   - If both primary assignments are identical → concordant, skip.
+4. For discordant edges, compute the topological distance between the
+   two primary assignments by walking up to their MRCA and summing
+   edge counts.  Report the edge if distance ≥ ``--min-distance``.
 
-Output:
-  - TSV with breakpoint edges and discordance metrics
+This is the simpler predecessor to ``concordance_breakpoints_stratified``,
+which replaces the binary call with a continuous distance metric and a
+permutation null model.  This script is faster (no permutations, no
+matrix precompute) and useful for a quick first look, but it does not
+handle multi-node cut-strings or OR-ambiguity — it always takes the
+first node from the first alternative.
+
+Inputs
+------
+- SQLite database with ``unitigs`` (unitig_id, colors, length) and
+  ``adjacency`` (unitig_id, unitig_direction, neighbor_id,
+  neighbor_direction) tables.
+- Newick tree with named internal nodes.
+
+Outputs
+-------
+- TSV of discordant edges only: unitig_a, dir_a, unitig_b, dir_b,
+  assignment_a, assignment_b, depth_a, depth_b, tree_distance, mrca,
+  len_a, len_b.
 """
 
 from __future__ import annotations
