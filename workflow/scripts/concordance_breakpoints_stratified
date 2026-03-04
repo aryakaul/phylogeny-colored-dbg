@@ -1,88 +1,25 @@
 #!/usr/bin/env python3
-"""Stratified concordance breakpoints with permutation null model.
+"""Concordance breakpoints with permutation null model.
 
-Identifies breakpoint edges in the pcDBG — edges where adjacent unitigs
-have containment-discordant phylogenetic assignments — and scores each
-with a continuous tree distance and a permutation p-value.
+For every edge in the phylogeny-colored de Bruijn graph, determines
+whether the two flanking unitigs are concordant (via set containment)
+or discordant.  For discordant edges, computes the phylogenetic tree
+distance between assignments and a permutation-based p-value.
 
-Algorithm
----------
-1. Load the phylogenetic tree and compute all-pairs topological
-   distances between named nodes via BFS.  Store as an N×N int16 numpy
-   matrix (N = named tree nodes, typically ~2000; matrix is ~8 MB).
-2. Load cut-string assignments and directed edges from SQLite.
-   Filter to edges where both endpoints have a non-None assignment.
-3. Parse each unique cut-string into its solution sets and classify as
-   "simple" (exactly one solution with one tree node) or "complex"
-   (multi-node or OR-ambiguous).
-4. Identify breakpoint edges using containment coherence:
-   - Two unitigs are coherent if, for at least one pair of their
-     alternative solutions, one node-set is a subset of (or equal to)
-     the other's.  This captures unitigs that share a primary
-     evolutionary event but differ in secondary refinements.
-   - Breakpoints are edges that FAIL this test — the two endpoints
-     have genuinely different evolutionary histories.
-   Containment is checked per unique cut-string pair (deduplicated),
-   then mapped back to edges.
-5. Score only the breakpoint edges with a tree distance:
-   - Both endpoints simple → vectorized N×N matrix lookup.
-   - At least one complex → directed Hausdorff averaged distance
-     (multi-node) or minimum across alternatives (OR).
-   - Normalize by tree diameter.
-6. Run a permutation null model (``--permutations``, default 1000)
-   on the breakpoint edge set only: shuffle the unitig → cut-string
-   mapping, recompute distances for the fixed set of breakpoint graph
-   edges, and accumulate a quantized histogram.  Convert to a survival
-   function: P(permuted distance ≥ d).
-7. For each breakpoint edge, look up its p-value from the survival
-   function.
+Concordance definition: two cut-strings are concordant if, for at least
+one pair of their alternative solutions, one solution's node-set is a
+subset of (or equal to) the other's.
 
-Distance metric
----------------
-Cut-strings encode where on the phylogeny a unitig's presence/absence
-pattern changes state:
-
-- ``"NodeA"``            → one solution: {NodeA}
-- ``"NodeA,NodeB"``      → one solution with two cuts: {NodeA, NodeB}
-- ``"NodeA OR NodeB,NodeC"`` → two alternatives: {NodeA} and {NodeB, NodeC}
-
-Three cases for distance(A, B):
-
-- **Single node vs. single node**: topological distance (edge count)
-  between the two nodes on the tree.  Looked up in the N×N numpy
-  matrix (fast path, vectorized).
-- **Multi-cut vs. any** (e.g. {NodeA, NodeB} vs. {NodeC}): directed
-  Hausdorff averaged — for each node in set A, find the minimum
-  distance to any node in B, average those minima; repeat in the other
-  direction; average both directions.
-- **OR-ambiguous**: compute the above for every pair of alternative
-  solutions and take the minimum.  If any alternative in A equals one
-  in B, distance is 0.
-
-Performance
------------
-- No U×U matrix is built (U = unique cut-strings can exceed 500k).
-  All distances are computed on the fly from the small N×N node matrix.
-- Containment filtering typically removes 80-90% of edges, so the
-  distance computation and permutation test operate on a much smaller
-  edge set.
-- Permutations are parallelized across ``--jobs`` workers via fork-based
-  multiprocessing.  Shared data is inherited via copy-on-write.
-
-Inputs
+Output
 ------
-- SQLite database with ``unitigs`` (unitig_id, colors) and ``adjacency``
-  (unitig_id, unitig_direction, neighbor_id, neighbor_direction) tables.
-- Newick tree with named internal nodes.
-- GFA file (accepted for pipeline compatibility; data is read from the
-  database).
+TSV with one row per edge (both concordant and discordant):
 
-Outputs
--------
-- TSV of breakpoint edges only: unitig_A, dir_A, unitig_B, dir_B,
-  cutstring_A, cutstring_B, tree_distance, normalized_distance,
-  permutation_pvalue.  Edges with unresolvable distances (missing tree
-  nodes) are omitted.
+    unitig_a  unitig_b  cutstring_a  cutstring_b  tree_distance
+    normalized_distance  concordant  permutation_pvalue
+
+Concordant edges have tree_distance=0, normalized_distance=0, and
+permutation_pvalue=NA.  Discordant edges with unresolvable distances
+(tree nodes missing from the tree) are omitted.
 """
 
 from __future__ import annotations
@@ -97,11 +34,19 @@ from pathlib import Path
 from typing import Dict, FrozenSet, List, Sequence, Tuple
 
 import numpy as np
-from ete4 import Tree
-from loguru import logger
+
+try:
+    from ete4 import Tree
+except ImportError:
+    from ete3 import Tree
+
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
 
 # Distances are quantized to int(d * _Q) for the permutation histogram.
-# 0.01 resolution covers all Hausdorff-average fractional values.
 _Q = 100
 
 
@@ -111,10 +56,18 @@ _Q = 100
 
 def _configure_logger(verbosity: int) -> None:
     """0 → WARNING, 1 → INFO, 2+ → DEBUG."""
-    logger.remove()
-    level = "WARNING" if verbosity == 0 else (
-        "INFO" if verbosity == 1 else "DEBUG")
-    logger.add(sys.stderr, level=level)
+    try:
+        from loguru import logger as _lg
+        _lg.remove()
+        level = "WARNING" if verbosity == 0 else (
+            "INFO" if verbosity == 1 else "DEBUG")
+        _lg.add(sys.stderr, level=level)
+    except ImportError:
+        import logging
+        level = (logging.WARNING if verbosity == 0
+                 else logging.INFO if verbosity == 1
+                 else logging.DEBUG)
+        logging.basicConfig(level=level, stream=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -126,12 +79,14 @@ def _build_node_distances(
 ) -> Tuple[List[str], np.ndarray, int]:
     """Pairwise topological distances between all named tree nodes.
 
+    Uses BFS from every named node on the tree adjacency list.
+    Produces an N×N int16 matrix for O(1) distance lookups.
+
     Returns:
         node_names -- sorted list of named node names
         dist_np    -- N×N int16 numpy array of pairwise distances
         diam       -- max(dist[a][b]) across all named pairs
     """
-    # Assign stable keys to all nodes (name, or placeholder for unnamed)
     node_key: Dict[int, str] = {}
     named_keys: set[str] = set()
     for node in tree.traverse():
@@ -205,12 +160,7 @@ def _containment_check(
     sols_a: List[FrozenSet[str]],
     sols_b: List[FrozenSet[str]],
 ) -> bool:
-    """True if any pair of solutions satisfies set containment.
-
-    Two unitigs are containment-coherent if one solution's node-set is a
-    subset of (or equal to) the other's.  This captures shared primary
-    evolutionary events while tolerating secondary refinements.
-    """
+    """True if any pair of solutions satisfies set containment."""
     for sa in sols_a:
         for sb in sols_b:
             if sa <= sb or sb <= sa:
@@ -258,27 +208,23 @@ def _identify_breakpoints(
 ) -> Tuple[np.ndarray, int, int]:
     """Identify containment-discordant edges (breakpoints).
 
-    For each edge, checks whether the two endpoints' cut-strings are
-    containment-coherent.  Deduplicates by unique (cs_a, cs_b) pair
-    so each pair is checked at most once.
-
     Returns:
         is_breakpoint  -- bool array [E], True for breakpoint edges
-        n_concordant   -- edges with identical cut-strings
-        n_coherent     -- edges that are containment-coherent but not identical
+        n_concordant   -- edges that are containment-coherent (incl. identical)
+        n_breakpoints  -- edges that fail containment
     """
     E = len(obs_cs_a)
 
     # Same cut-string → trivially coherent
     same = obs_cs_a == obs_cs_b
-    n_concordant = int(same.sum())
+    n_same = int(same.sum())
 
     # Deduplicate unique pairs for containment checking
     diff_mask = ~same
     diff_indices = np.where(diff_mask)[0]
 
     if len(diff_indices) == 0:
-        return np.zeros(E, dtype=np.bool_), n_concordant, 0
+        return np.zeros(E, dtype=np.bool_), n_same, 0
 
     pairs = np.column_stack([obs_cs_a[diff_indices], obs_cs_b[diff_indices]])
     unique_pairs, inverse = np.unique(pairs, axis=0, return_inverse=True)
@@ -298,15 +244,16 @@ def _identify_breakpoints(
     edge_coherent[same] = True
     edge_coherent[diff_indices] = pair_coherent[inverse]
 
-    n_coherent = int(pair_coherent[inverse].sum())  # coherent but not identical
+    n_contain_only = int(pair_coherent[inverse].sum())
+    n_concordant = n_same + n_contain_only
     is_breakpoint = ~edge_coherent
 
     logger.info(
-        "Edge breakdown: {:,} concordant, {:,} containment-coherent, "
+        "Edge breakdown: {:,} identical, {:,} containment-coherent, "
         "{:,} breakpoints",
-        n_concordant, n_coherent, int(is_breakpoint.sum()))
+        n_same, n_contain_only, int(is_breakpoint.sum()))
 
-    return is_breakpoint, n_concordant, n_coherent
+    return is_breakpoint, n_concordant, int(is_breakpoint.sum())
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +283,7 @@ def _solution_distance(
     if len(idx_a) == 1 and len(idx_b) == 1:
         return float(node_dist_np[idx_a[0], idx_b[0]])
 
-    # General case: directed Hausdorff averaged
+    # General case: bidirectional mean nearest-neighbor
     ia = np.array(idx_a, dtype=np.int32)
     ib = np.array(idx_b, dtype=np.int32)
     sub = node_dist_np[np.ix_(ia, ib)].astype(np.float64)
@@ -351,8 +298,10 @@ def _assignment_distance(
     node_dist_np: np.ndarray,
     name_to_nidx: Dict[str, int],
 ) -> float:
-    """Distance between two full assignments, handling OR-ambiguity."""
-    # Quick concordance check: shared alternative
+    """Distance between two full assignments, handling OR-ambiguity.
+
+    Takes the minimum distance across all pairs of alternative solutions.
+    """
     set_a = set(alts_a)
     if any(sb in set_a for sb in alts_b):
         return 0.0
@@ -377,9 +326,6 @@ def _compute_edge_distances(
 ) -> np.ndarray:
     """Compute tree distances for edges, vectorized where possible.
 
-    Args:
-        cs_a, cs_b: cut-string indices for each edge endpoint [E]
-
     Returns:
         dists: float32 array [E], -1.0 for invalid distances
     """
@@ -397,14 +343,22 @@ def _compute_edge_distances(
         nb = simple_node_idx[cs_b[both_simple]]
         dists[both_simple] = node_dist_np[na, nb].astype(np.float32)
 
-    # Complex pairs: Python loop
+    # Complex pairs: deduplicate by unique (cs_a, cs_b) pair
     need_complex = ~same & ~both_simple
-    for idx in np.where(need_complex)[0]:
-        p_a = parsed_cs[cs_a[idx]]
-        p_b = parsed_cs[cs_b[idx]]
-        if p_a and p_b:
-            dists[idx] = _assignment_distance(
-                p_a, p_b, node_dist_np, name_to_nidx)
+    complex_idx = np.where(need_complex)[0]
+    if len(complex_idx) > 0:
+        cpairs = np.column_stack(
+            [cs_a[complex_idx], cs_b[complex_idx]])
+        unique_cpairs, inv = np.unique(
+            cpairs, axis=0, return_inverse=True)
+        unique_dists = np.full(
+            len(unique_cpairs), -1.0, dtype=np.float32)
+        for k, (i, j) in enumerate(unique_cpairs):
+            p_a, p_b = parsed_cs[i], parsed_cs[j]
+            if p_a and p_b:
+                unique_dists[k] = _assignment_distance(
+                    p_a, p_b, node_dist_np, name_to_nidx)
+        dists[complex_idx] = unique_dists[inv]
 
     return dists
 
@@ -421,7 +375,7 @@ _SHARED: Dict = {}
 # ---------------------------------------------------------------------------
 
 def _permutation_worker(args_tuple):
-    """Run a batch of permutations. Reads shared data from _SHARED."""
+    """Run a batch of permutations.  Reads shared data from _SHARED."""
     perm_start, perm_end, seed = args_tuple
 
     assignment_indices = _SHARED["assignment_indices"]
@@ -438,6 +392,7 @@ def _permutation_worker(args_tuple):
     hist = np.zeros(max_q + 1, dtype=np.int64)
     total_valid = 0
     total_sum = 0.0
+    total_sum_sq = 0.0
 
     for p in range(perm_start, perm_end):
         perm = assignment_indices.copy()
@@ -457,13 +412,14 @@ def _permutation_worker(args_tuple):
         hist += np.bincount(quantized, minlength=max_q + 1)
         total_valid += int(valid_mask.sum())
         total_sum += float(valid_dists.sum())
+        total_sum_sq += float((valid_dists ** 2).sum())
 
         n_done = p - perm_start + 1
         if n_done % 100 == 0:
             logger.info(
                 "Permutation worker: {}/{}", n_done, perm_end - perm_start)
 
-    return hist, total_valid, total_sum
+    return hist, total_valid, total_sum, total_sum_sq
 
 
 def _run_permutation_test(
@@ -471,22 +427,18 @@ def _run_permutation_test(
     n_jobs: int,
     max_dist: float,
     rng: np.random.Generator,
-) -> Tuple[np.ndarray, float]:
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """Permutation null model for breakpoint edge tree-distances.
-
-    The edge set is fixed (breakpoints from the observed labeling).
-    Each permutation shuffles labels and recomputes distances for those
-    same graph edges.
 
     Returns:
         survival   -- survival[q] = P(permuted_distance ≥ q/_Q).
-                      Index with int(round(distance * _Q)).
+        hist       -- raw histogram of permuted distances (for plotting).
         mean_perm  -- mean distance across all valid permuted edges.
+        sd_perm    -- standard deviation of permuted distances.
     """
     max_q = int(max_dist * _Q) + 1
     _SHARED["max_q"] = max_q
 
-    # Assign each worker a contiguous range of permutations + unique seed
     chunk_size = (n_permutations + n_jobs - 1) // n_jobs
     worker_args = []
     for i in range(n_jobs):
@@ -498,30 +450,36 @@ def _run_permutation_test(
         worker_args.append((start, end, worker_seed))
 
     if n_jobs == 1:
-        hist, total_valid, total_sum = _permutation_worker(worker_args[0])
+        hist, total_valid, total_sum, total_sum_sq = \
+            _permutation_worker(worker_args[0])
     else:
         hist = np.zeros(max_q + 1, dtype=np.int64)
         total_valid = 0
         total_sum = 0.0
+        total_sum_sq = 0.0
 
         ctx = mp.get_context("fork")
         with ctx.Pool(n_jobs) as pool:
-            for w_hist, w_valid, w_sum in pool.imap_unordered(
+            for w_hist, w_valid, w_sum, w_sum_sq in pool.imap_unordered(
                 _permutation_worker, worker_args
             ):
                 hist += w_hist
                 total_valid += w_valid
                 total_sum += w_sum
+                total_sum_sq += w_sum_sq
 
     # Survival function: P(distance ≥ threshold)
     survival = np.cumsum(hist[::-1])[::-1].astype(np.float64)
     if total_valid > 0:
         survival /= total_valid
         mean_perm = total_sum / total_valid
+        var_perm = total_sum_sq / total_valid - mean_perm ** 2
+        sd_perm = float(np.sqrt(max(0.0, var_perm)))
     else:
         mean_perm = 0.0
+        sd_perm = 0.0
 
-    return survival, mean_perm
+    return survival, hist, mean_perm, sd_perm
 
 
 def _lookup_pvalue(distance: float, survival: np.ndarray) -> float:
@@ -535,18 +493,82 @@ def _lookup_pvalue(distance: float, survival: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Plot
+# ---------------------------------------------------------------------------
+
+def _plot_breakpoints(
+    observed_dists: np.ndarray,
+    pvalues: np.ndarray,
+    n_concordant: int,
+    perm_hist: np.ndarray | None,
+    output_path: Path,
+) -> None:
+    """Two-panel figure: distance histogram + p-value histogram."""
+    import matplotlib
+    matplotlib.use("Agg")
+    matplotlib.rcParams["svg.fonttype"] = "none"
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_theme(style="white", context="notebook")
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    # -- Left panel: observed vs permuted distance histogram --
+    valid_obs = observed_dists[observed_dists > 0]
+    if len(valid_obs) > 0:
+        ax1.hist(valid_obs, bins=50, density=True, alpha=0.8,
+                 color="tab:blue", label="Observed", edgecolor="none")
+
+        # Overlay mean permuted distribution
+        if perm_hist is not None and perm_hist.sum() > 0:
+            bin_centers = np.arange(len(perm_hist), dtype=np.float64) / _Q
+            # Skip bin 0 (concordant under permutation)
+            pdf = perm_hist.astype(np.float64)
+            pdf[0] = 0
+            total = pdf.sum()
+            if total > 0:
+                bin_width = 1.0 / _Q
+                pdf = pdf / (total * bin_width)
+                ax1.plot(bin_centers, pdf, color="grey", alpha=0.5,
+                         linewidth=1.5, label="Permuted (null)")
+
+    ax1.set_xlabel("Tree distance")
+    ax1.set_ylabel("Density")
+    ax1.set_title(
+        f"Discordant edge distances\n"
+        f"({n_concordant:,} concordant edges excluded)")
+    ax1.legend()
+    sns.despine(ax=ax1, top=True, right=True)
+
+    # -- Right panel: p-value histogram --
+    valid_pvals = pvalues[np.isfinite(pvalues)]
+    if len(valid_pvals) > 0:
+        ax2.hist(valid_pvals, bins=50, density=True, alpha=0.8,
+                 color="tab:orange", edgecolor="none")
+        ax2.axhline(1.0, color="grey", linestyle="--", linewidth=1,
+                     alpha=0.5, label="Uniform")
+    ax2.set_xlabel("Permutation p-value")
+    ax2.set_ylabel("Density")
+    ax2.set_title("P-value distribution (discordant edges)")
+    ax2.legend()
+    sns.despine(ax=ax2, top=True, right=True)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, format="svg")
+    plt.close(fig)
+    logger.info("Plot saved to {}", output_path)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Stratified concordance breakpoints with permutation null model."
+            "Concordance breakpoints with permutation null model."
         ))
-    parser.add_argument(
-        "--gfa", type=Path, required=True,
-        help="Colored GFA1 file (accepted for pipeline compatibility; "
-             "data is read from --db).")
     parser.add_argument(
         "--tree", type=Path, required=True,
         help="Postprocessed Newick tree with named internal nodes.")
@@ -559,6 +581,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument(
         "--output", type=Path, required=True,
         help="Output TSV path.")
+    parser.add_argument(
+        "--plot", type=Path, default=None,
+        help="Optional SVG plot path (two-panel: distances + p-values).")
     parser.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for reproducibility (default: 42).")
@@ -596,13 +621,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     for uid, colors in conn.execute("SELECT unitig_id, colors FROM unitigs"):
         unitig_colors[uid] = colors if colors else "None"
 
-    edges_raw: List[Tuple[str, str, str, str]] = list(conn.execute(
-        "SELECT unitig_id, unitig_direction, neighbor_id, neighbor_direction "
-        "FROM adjacency"))
+    # Deduplicate edges: each undirected edge appears twice, keep one copy
+    edges_seen: set = set()
+    edges_dedup: List[Tuple[str, str]] = []
+    for uid_a, _, uid_b, _ in conn.execute(
+        "SELECT unitig_id, unitig_direction, neighbor_id, "
+        "neighbor_direction FROM adjacency"
+    ):
+        key = (uid_a, uid_b) if uid_a <= uid_b else (uid_b, uid_a)
+        if key not in edges_seen:
+            edges_seen.add(key)
+            edges_dedup.append((uid_a, uid_b))
     conn.close()
+    del edges_seen
 
     logger.info(
-        "Loaded {:,} unitigs, {:,} edges", len(unitig_colors), len(edges_raw))
+        "Loaded {:,} unitigs, {:,} undirected edges",
+        len(unitig_colors), len(edges_dedup))
 
     # -- Index: unitigs → integers, cut-strings → integers -------------------
     assigned_unitigs = {
@@ -629,16 +664,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     # -- Filter edges: both endpoints must be assigned -----------------------
     edge_a_flat: List[int] = []
     edge_b_flat: List[int] = []
-    edge_meta: List[Tuple[str, str, str, str, str, str]] = []
+    edge_meta: List[Tuple[str, str, str, str]] = []  # uid_a, uid_b, cs_a, cs_b
 
-    for uid_a, dir_a, uid_b, dir_b in edges_raw:
+    for uid_a, uid_b in edges_dedup:
         if uid_a not in unitig_to_flat or uid_b not in unitig_to_flat:
             continue
         cs_a = unitig_colors[uid_a]
         cs_b = unitig_colors[uid_b]
         edge_a_flat.append(unitig_to_flat[uid_a])
         edge_b_flat.append(unitig_to_flat[uid_b])
-        edge_meta.append((uid_a, dir_a, uid_b, dir_b, cs_a, cs_b))
+        edge_meta.append((uid_a, uid_b, cs_a, cs_b))
 
     all_edge_a_idx = np.array(edge_a_flat, dtype=np.int32)
     all_edge_b_idx = np.array(edge_b_flat, dtype=np.int32)
@@ -649,31 +684,31 @@ def main(argv: Sequence[str] | None = None) -> None:
     t0 = time.time()
     all_cs_a = assignment_indices[all_edge_a_idx]
     all_cs_b = assignment_indices[all_edge_b_idx]
-    is_breakpoint, n_concordant, n_coherent = \
+    is_breakpoint, n_concordant, n_breakpoints = \
         _identify_breakpoints(all_cs_a, all_cs_b, parsed_cs)
     logger.info("Breakpoint identification in {:.1f}s", time.time() - t0)
 
-    # Narrow to breakpoint edges only
+    # Narrow to breakpoint edges for distance computation
     bp_indices = np.where(is_breakpoint)[0]
-    edge_a_idx = all_edge_a_idx[bp_indices]
-    edge_b_idx = all_edge_b_idx[bp_indices]
-    bp_meta = [edge_meta[i] for i in bp_indices]
-    E = len(bp_meta)
-    logger.info("{:,} breakpoint edges to score", E)
+    edge_a_bp = all_edge_a_idx[bp_indices]
+    edge_b_bp = all_edge_b_idx[bp_indices]
+    E_bp = len(bp_indices)
+    logger.info("{:,} breakpoint edges to score", E_bp)
 
     # -- Observed distances (breakpoints only) -------------------------------
     t0 = time.time()
-    obs_cs_a = assignment_indices[edge_a_idx]
-    obs_cs_b = assignment_indices[edge_b_idx]
-    observed = _compute_edge_distances(
-        obs_cs_a, obs_cs_b, is_simple, simple_node_idx,
+    obs_cs_a_bp = assignment_indices[edge_a_bp]
+    obs_cs_b_bp = assignment_indices[edge_b_bp]
+    bp_distances = _compute_edge_distances(
+        obs_cs_a_bp, obs_cs_b_bp, is_simple, simple_node_idx,
         node_dist_np, parsed_cs, name_to_nidx)
     logger.info("Observed distances computed in {:.1f}s", time.time() - t0)
 
-    n_valid = int(np.sum(observed >= 0))
-    n_invalid = int(np.sum(observed < 0))
+    n_valid = int(np.sum(bp_distances >= 0))
+    n_invalid = int(np.sum(bp_distances < 0))
     mean_obs = (
-        float(np.mean(observed[observed >= 0])) if n_valid > 0 else 0.0)
+        float(np.mean(bp_distances[bp_distances >= 0]))
+        if n_valid > 0 else 0.0)
 
     logger.info(
         "Breakpoints: {:,} valid, {:,} invalid (missing tree nodes)",
@@ -682,12 +717,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     # -- Permutation test (breakpoint edges only) ----------------------------
     rng = np.random.default_rng(args.seed)
     n_jobs = max(1, args.jobs)
+    survival = None
+    perm_hist = None
+    mean_perm = 0.0
+    sd_perm = 0.0
 
-    if args.permutations > 0 and E > 0:
-        # Populate shared state before forking
+    if args.permutations > 0 and E_bp > 0:
         _SHARED["assignment_indices"] = assignment_indices
-        _SHARED["edge_a_idx"] = edge_a_idx
-        _SHARED["edge_b_idx"] = edge_b_idx
+        _SHARED["edge_a_idx"] = edge_a_bp
+        _SHARED["edge_b_idx"] = edge_b_bp
         _SHARED["is_simple"] = is_simple
         _SHARED["simple_node_idx"] = simple_node_idx
         _SHARED["node_dist_np"] = node_dist_np
@@ -699,62 +737,85 @@ def main(argv: Sequence[str] | None = None) -> None:
         t0 = time.time()
         logger.info(
             "Running {:,} permutations across {} workers on {:,} edges...",
-            args.permutations, n_jobs, E)
-        survival, mean_perm = _run_permutation_test(
+            args.permutations, n_jobs, E_bp)
+        survival, perm_hist, mean_perm, sd_perm = _run_permutation_test(
             args.permutations, n_jobs, max_dist, rng)
         logger.info("Permutations done in {:.1f}s", time.time() - t0)
-    else:
-        survival = np.ones(1, dtype=np.float64)
-        mean_perm = 0.0
 
     # -- Write output --------------------------------------------------------
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     columns = [
-        "unitig_A", "dir_A", "unitig_B", "dir_B",
-        "cutstring_A", "cutstring_B",
+        "unitig_a", "unitig_b",
+        "cutstring_a", "cutstring_b",
         "tree_distance", "normalized_distance",
-        "permutation_pvalue",
+        "concordant", "permutation_pvalue",
     ]
+
+    # Build per-breakpoint p-values
+    bp_pvalues = np.full(E_bp, np.nan, dtype=np.float64)
+    if survival is not None:
+        for i in range(E_bp):
+            d = float(bp_distances[i])
+            if d >= 0:
+                bp_pvalues[i] = _lookup_pvalue(d, survival)
 
     n_written = 0
     with args.output.open("w") as out:
         out.write("\t".join(columns) + "\n")
-        for i, (uid_a, dir_a, uid_b, dir_b, cs_a, cs_b) in enumerate(
-                bp_meta):
-            d = float(observed[i])
-            if d < 0:
-                continue  # skip edges with unresolvable distance
-            norm_d = d / diameter
-            if args.permutations > 0:
-                pval_str = f"{_lookup_pvalue(d, survival):.6g}"
-            else:
-                pval_str = "NA"
-            out.write(
-                f"{uid_a}\t{dir_a}\t{uid_b}\t{dir_b}\t"
-                f"{cs_a}\t{cs_b}\t"
-                f"{d:.4g}\t{norm_d:.6f}\t{pval_str}\n")
-            n_written += 1
+        bp_cursor = 0  # index into bp_indices
 
-    logger.info("Wrote {:,} scored breakpoints to {}", n_written, args.output)
+        for edge_i in range(E_all):
+            uid_a, uid_b, cs_a, cs_b = edge_meta[edge_i]
+
+            if not is_breakpoint[edge_i]:
+                # Concordant edge
+                out.write(
+                    f"{uid_a}\t{uid_b}\t{cs_a}\t{cs_b}\t"
+                    f"0\t0\tTrue\tNA\n")
+                n_written += 1
+            else:
+                # Find this edge's position in the breakpoint arrays
+                # bp_indices is sorted, so bp_cursor tracks position
+                while bp_cursor < E_bp and bp_indices[bp_cursor] < edge_i:
+                    bp_cursor += 1
+                if bp_cursor < E_bp and bp_indices[bp_cursor] == edge_i:
+                    d = float(bp_distances[bp_cursor])
+                    if d < 0:
+                        bp_cursor += 1
+                        continue  # skip unresolvable
+                    norm_d = d / diameter
+                    pval = bp_pvalues[bp_cursor]
+                    pval_str = f"{pval:.6g}" if np.isfinite(pval) else "NA"
+                    out.write(
+                        f"{uid_a}\t{uid_b}\t{cs_a}\t{cs_b}\t"
+                        f"{d:.4g}\t{norm_d:.6f}\tFalse\t{pval_str}\n")
+                    n_written += 1
+                    bp_cursor += 1
+
+    logger.info("Wrote {:,} scored edges to {}", n_written, args.output)
 
     # -- Summary to stderr ---------------------------------------------------
     print("\n--- Concordance Breakpoint Summary ---", file=sys.stderr)
     print(f"Total edges (both assigned):  {E_all:,}", file=sys.stderr)
-    print(f"  Concordant (same string):   {n_concordant:,}", file=sys.stderr)
-    print(f"  Containment-coherent:       {n_coherent:,}", file=sys.stderr)
-    print(f"  Breakpoints (discordant):   {E:,}", file=sys.stderr)
+    print(
+        f"  Concordant:                 {n_concordant:,} "
+        f"({100.0 * n_concordant / max(E_all, 1):.1f}%)", file=sys.stderr)
+    print(f"  Discordant (breakpoints):   {n_breakpoints:,}", file=sys.stderr)
     if n_invalid:
         print(
             f"    Invalid (missing nodes):  {n_invalid:,}", file=sys.stderr)
-    print(f"Mean breakpoint tree dist:    {mean_obs:.4f}", file=sys.stderr)
+    print(f"Mean observed tree dist:      {mean_obs:.4f}", file=sys.stderr)
 
-    if args.permutations > 0 and E > 0:
+    if args.permutations > 0 and E_bp > 0:
         print(
-            f"Mean permuted tree dist:      {mean_perm:.4f}", file=sys.stderr)
+            f"Mean permuted tree dist:      {mean_perm:.4f} "
+            f"(\u00b1 {sd_perm:.4f})", file=sys.stderr)
         sig_count = sum(
-            1 for d in observed
-            if d >= 0 and _lookup_pvalue(d, survival) < 0.05
+            1 for i in range(E_bp)
+            if bp_distances[i] >= 0
+            and np.isfinite(bp_pvalues[i])
+            and bp_pvalues[i] < 0.05
         )
         frac_sig = sig_count / n_valid if n_valid > 0 else 0.0
         print(
@@ -763,6 +824,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             file=sys.stderr)
 
     print("--------------------------------------", file=sys.stderr)
+
+    # -- Plot (if --plot) ----------------------------------------------------
+    if args.plot is not None and E_bp > 0:
+        valid_bp_dists = bp_distances[bp_distances >= 0]
+        valid_bp_pvals = bp_pvalues[np.isfinite(bp_pvalues)]
+        _plot_breakpoints(
+            valid_bp_dists, valid_bp_pvals, n_concordant,
+            perm_hist, args.plot)
 
 
 if __name__ == "__main__":

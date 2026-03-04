@@ -4,64 +4,29 @@
 Measures how rapidly phylogenetic assignment (cut-string) changes as
 you walk outward from a unitig in the compacted colored de Bruijn graph.
 
-Algorithm
----------
-1. Load the undirected graph and cut-string assignments from SQLite.
-2. Sample seed unitigs uniformly at random (or use all if fewer than
-   ``--samples``).
-3. For each seed, run BFS up to ``--max-hops`` edges.  At each hop
-   distance *h*, record how many reached unitigs are "coherent" with
-   the seed under two definitions (see below).
-4. Aggregate across all seeds: coherence(h) = total_coherent(h) /
-   total_reached(h).
-5. Compute a null expectation for each definition — the probability
-   that two randomly chosen unitigs would be coherent by chance.
-6. Output a TSV of coherence vs. hop distance and an optional SVG plot
-   showing both curves against their respective nulls.
+Reports two coherence metrics at each hop distance:
 
-Coherence definitions
----------------------
-Cut-strings encode where on the phylogeny a unitig's presence/absence
-pattern changes state.  They are parsed as:
+- **Strict coherence**: fraction of reached unitigs with the same
+  cut-string as the seed (integer index equality).
+- **Containment coherence**: fraction where one cut-string's solution
+  set contains the other's.  This captures unitigs that share a primary
+  evolutionary event but differ in secondary refinements.
 
-- ``"NodeA"``            → one solution: {NodeA}
-- ``"NodeA,NodeB"``      → one solution with two cuts: {NodeA, NodeB}
-- ``"NodeA OR NodeB,NodeC"`` → two alternatives: {NodeA} and {NodeB, NodeC}
+Each metric has its own null expectation (constant across hops):
 
-**Strict coherence**: two unitigs are coherent iff their raw cut-strings
-are identical.  Null = Simpson index (Σ fᵢ²).
+- Strict null = Simpson index: Σ fᵢ².
+- Containment null = Σ_{(i,j) coherent} fᵢ·fⱼ, estimated by sampling
+  when the number of unique cut-strings is large.
 
-**Containment coherence**: two unitigs are coherent if, for at least one
-pair of their alternative solutions, one solution's node-set is a subset
-of (or equal to) the other's.  This captures unitigs that share a
-primary evolutionary event but differ in secondary refinements (e.g.,
-a gain at NodeA vs. a gain at NodeA followed by partial loss at NodeB).
-Null = Σ_{(i,j) coherent} fᵢ·fⱼ (computed exactly when M ≤ 50k,
-estimated from 1M frequency-weighted random pairs otherwise).
+The gap between the two curves quantifies how much of the pangenome
+has been secondarily modified after initial acquisition.
 
-The gap between the two curves indicates how prevalent secondary events
-are.  Each curve should be compared against its own null, not the other's.
-
-Performance
------------
-- If M (unique cut-strings) ≤ 50,000: precomputes an M×M containment
-  table.  BFS coherence checks are O(1) table lookups.
-- If M > 50,000: skips the table and checks containment on the fly
-  (Python-level frozenset subset tests per BFS neighbor).
-- BFS is parallelized across ``--jobs`` workers via fork-based
-  multiprocessing.  Shared data (graph, indices, tables) is inherited
-  via copy-on-write — only the seed list is sent to each worker.
-
-Inputs
+Output
 ------
-- SQLite database with ``unitigs`` (unitig_id, colors) and ``adjacency``
-  (unitig_id, unitig_direction, neighbor_id, neighbor_direction) tables.
+TSV with columns:
 
-Outputs
--------
-- TSV: hop_distance, n_pairs, strict_coherence, containment_coherence,
-  null_strict, null_containment.
-- SVG plot (optional): both decay curves + both null reference lines.
+    hop_distance  n_pairs  n_strict_coherent  n_containment_coherent
+    strict_coherence  containment_coherence  null_strict  null_containment
 """
 
 from __future__ import annotations
@@ -76,7 +41,17 @@ from pathlib import Path
 from typing import Dict, FrozenSet, List, Sequence, Tuple
 
 import numpy as np
-from loguru import logger
+
+try:
+    from ete4 import Tree
+except ImportError:
+    from ete3 import Tree
+
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +60,18 @@ from loguru import logger
 
 def _configure_logger(verbosity: int) -> None:
     """0 → WARNING, 1 → INFO, 2+ → DEBUG."""
-    logger.remove()
-    level = "WARNING" if verbosity == 0 else (
-        "INFO" if verbosity == 1 else "DEBUG")
-    logger.add(sys.stderr, level=level)
+    try:
+        from loguru import logger as _lg
+        _lg.remove()
+        level = "WARNING" if verbosity == 0 else (
+            "INFO" if verbosity == 1 else "DEBUG")
+        _lg.add(sys.stderr, level=level)
+    except ImportError:
+        import logging
+        level = (logging.WARNING if verbosity == 0
+                 else logging.INFO if verbosity == 1
+                 else logging.DEBUG)
+        logging.basicConfig(level=level, stream=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -134,9 +117,6 @@ def _load_graph_and_colors(
 ) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
     """Load adjacency list and cut-string assignments from SQLite.
 
-    The graph is treated as **undirected**: for every (A→B) edge we also
-    record (B→A), and strand orientation is ignored.
-
     Returns:
         adj    -- adj[uid] = list of neighbor uids (undirected)
         colors -- colors[uid] = raw cut-string (or "None")
@@ -171,23 +151,71 @@ def _load_graph_and_colors(
 
 
 # ---------------------------------------------------------------------------
-# Precompute coherence lookup
+# Integer-indexed CSR graph for fast BFS
+# ---------------------------------------------------------------------------
+
+def _build_csr_graph(
+    adj: Dict[str, List[str]],
+    colors: Dict[str, str],
+) -> Tuple[List[str], Dict[str, int], np.ndarray, np.ndarray]:
+    """Convert string-keyed graph to integer-indexed CSR arrays.
+
+    Eliminates hash lookups in the BFS hot loop.
+
+    Returns:
+        unitig_list   -- sorted list of unitig IDs
+        uid_to_int    -- mapping from unitig ID to integer index
+        csr_offsets   -- int64 array [N+1], row pointers into csr_neighbors
+        csr_neighbors -- int32 array, concatenated neighbor indices
+    """
+    unitig_list = sorted(colors.keys())
+    uid_to_int = {uid: i for i, uid in enumerate(unitig_list)}
+    N = len(unitig_list)
+
+    offsets = np.zeros(N + 1, dtype=np.int64)
+    nb_list: List[int] = []
+    for i, uid in enumerate(unitig_list):
+        nbs = adj.get(uid, [])
+        nb_list.extend(uid_to_int[nb] for nb in nbs)
+        offsets[i + 1] = len(nb_list)
+
+    csr_neighbors = (
+        np.array(nb_list, dtype=np.int32)
+        if nb_list else np.empty(0, dtype=np.int32))
+
+    logger.info(
+        "CSR graph: {:,} nodes, {:,} directed entries",
+        N, len(csr_neighbors))
+    return unitig_list, uid_to_int, offsets, csr_neighbors
+
+
+# ---------------------------------------------------------------------------
+# Precompute coherence lookup (top-K approach)
 # ---------------------------------------------------------------------------
 
 def _build_containment_table(
     colors: Dict[str, str],
-) -> Tuple[List[str], Dict[str, int], np.ndarray | None]:
-    """Build pairwise containment coherence table for unique cut-strings.
+) -> Tuple[
+    List[str], Dict[str, int],
+    np.ndarray | None, set | None, List[int] | None, Dict[int, int] | None,
+    List[List[FrozenSet[str]]],
+]:
+    """Build containment coherence table for the top-K most frequent cut-strings.
 
-    Strict coherence is just index equality (unique strings are unique by
-    construction), so no table is needed for it.
+    Strategy:
+    - Find the K most frequent cut-string indices covering ~90% of unitigs.
+    - Precompute containment for all K×K pairs (stored as K×K bool matrix).
+    - For pairs involving rare cut-strings, fall back to on-the-fly checks.
 
     Returns:
-        unique_cuts   -- list of M unique cut-strings
-        cut_to_idx    -- mapping from cut-string to index in unique_cuts
-        contain_table -- M×M bool array (set containment), or None if M > 50,000
+        unique_cuts      -- list of M unique cut-strings
+        cut_to_idx       -- mapping from cut-string to index
+        contain_table    -- K×K bool array (or M×M if M is small), or None
+        top_k_set        -- set of top-K global indices (None if full table)
+        top_k_list       -- sorted list of top-K global indices (None if full)
+        top_k_to_local   -- global index → local index in contain_table
+        parsed_cuts      -- parsed form of each unique cut-string
     """
-    # Collect unique cut-strings
     cut_counts: Dict[str, int] = defaultdict(int)
     for cs in colors.values():
         cut_counts[cs] += 1
@@ -198,32 +226,65 @@ def _build_containment_table(
 
     logger.info("Unique cut-strings: {:,}", M)
 
-    if M > 50_000:
-        logger.warning(
-            "M = {:,} > 50,000; skipping precompute of M² containment table. "
-            "Will use on-the-fly checks.", M)
-        return unique_cuts, cut_to_idx, None
+    parsed_cuts = [_parse_cutstring(cs) for cs in unique_cuts]
 
-    # Pre-parse all cut-strings
-    parsed = [_parse_cutstring(cs) for cs in unique_cuts]
+    # If M is small enough, build the full M×M table
+    if M <= 50_000:
+        contain_table = np.eye(M, dtype=np.bool_)
+        t0 = time.time()
+        for i in range(M):
+            for j in range(i + 1, M):
+                if _containment_check(parsed_cuts[i], parsed_cuts[j]):
+                    contain_table[i, j] = True
+                    contain_table[j, i] = True
+        elapsed = time.time() - t0
+        n_contain = int(contain_table.sum()) - M
+        logger.info(
+            "Full containment table built in {:.1f}s: {:,} coherent pairs "
+            "(of {:,} off-diagonal)",
+            elapsed, n_contain // 2, M * (M - 1) // 2)
+        return (unique_cuts, cut_to_idx, contain_table,
+                None, None, None, parsed_cuts)
 
-    # Build containment table
-    contain_table = np.eye(M, dtype=np.bool_)
+    # Large M: build top-K table covering ~90% of unitigs
+    total = sum(cut_counts.values())
+    sorted_by_freq = sorted(
+        range(M), key=lambda i: cut_counts[unique_cuts[i]], reverse=True)
 
-    t0 = time.time()
-    for i in range(M):
-        for j in range(i + 1, M):
-            if _containment_check(parsed[i], parsed[j]):
-                contain_table[i, j] = True
-                contain_table[j, i] = True
+    cumsum = 0
+    top_k_list: List[int] = []
+    for idx in sorted_by_freq:
+        cumsum += cut_counts[unique_cuts[idx]]
+        top_k_list.append(idx)
+        if cumsum >= 0.9 * total:
+            break
 
-    elapsed = time.time() - t0
-    n_contain = int(contain_table.sum()) - M  # exclude diagonal
+    top_k_list.sort()
+    top_k_set = set(top_k_list)
+    top_k_to_local = {g: l for l, g in enumerate(top_k_list)}
+    K = len(top_k_list)
+
     logger.info(
-        "Containment table built in {:.1f}s: {:,} coherent pairs "
-        "(of {:,} off-diagonal)", elapsed, n_contain // 2, M * (M - 1) // 2)
+        "Top-K containment: K={:,} covers {:.1f}% of {:,} unitigs",
+        K, 100.0 * cumsum / total, total)
 
-    return unique_cuts, cut_to_idx, contain_table
+    contain_table = np.eye(K, dtype=np.bool_)
+    t0 = time.time()
+    for i_local in range(K):
+        i_global = top_k_list[i_local]
+        for j_local in range(i_local + 1, K):
+            j_global = top_k_list[j_local]
+            if _containment_check(parsed_cuts[i_global], parsed_cuts[j_global]):
+                contain_table[i_local, j_local] = True
+                contain_table[j_local, i_local] = True
+    elapsed = time.time() - t0
+    n_contain = int(contain_table.sum()) - K
+    logger.info(
+        "Top-K containment table built in {:.1f}s: {:,} coherent pairs",
+        elapsed, n_contain // 2)
+
+    return (unique_cuts, cut_to_idx, contain_table,
+            top_k_set, top_k_list, top_k_to_local, parsed_cuts)
 
 
 # ---------------------------------------------------------------------------
@@ -231,56 +292,84 @@ def _build_containment_table(
 # ---------------------------------------------------------------------------
 
 def _bfs_coherence(
-    seed: str,
-    adj: Dict[str, List[str]],
-    unitig_to_cut_idx: Dict[str, int],
+    seed_int: int,
+    csr_offsets: np.ndarray,
+    csr_neighbors: np.ndarray,
+    cut_idx_array: np.ndarray,
+    n_unitigs: int,
     max_hops: int,
     contain_table: np.ndarray | None,
-    parsed_cuts: List[List[FrozenSet[str]]] | None,
+    parsed_cuts: List[List[FrozenSet[str]]],
+    is_simple_cs: np.ndarray | None,
+    top_k_set: set | None,
+    top_k_to_local: Dict[int, int] | None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """BFS from *seed* up to *max_hops*, counting concordant neighbours.
+    """BFS from *seed_int* up to *max_hops*, counting concordant neighbours.
 
     Returns three int arrays of length max_hops (index 0 = hop 1):
         n_reached           -- total unitigs reached at each hop distance
         n_strict_concordant -- strict equality (index identity)
         n_contain_concordant -- set containment matches
     """
-    seed_idx = unitig_to_cut_idx.get(seed)
+    seed_cidx = cut_idx_array[seed_int]
     n_reached = np.zeros(max_hops, dtype=np.int64)
     n_strict = np.zeros(max_hops, dtype=np.int64)
     n_contain = np.zeros(max_hops, dtype=np.int64)
 
-    if seed_idx is None:
-        return n_reached, n_strict, n_contain
+    # Determine seed's containment lookup strategy
+    use_full_table = (top_k_set is None and contain_table is not None)
+    seed_in_topk = (top_k_set is not None and seed_cidx in top_k_set)
 
-    if contain_table is not None:
-        seed_contain_row = contain_table[seed_idx]
+    if use_full_table:
+        seed_contain_row = contain_table[seed_cidx]
+    elif seed_in_topk:
+        seed_local = top_k_to_local[seed_cidx]
+        seed_contain_row = contain_table[seed_local]
     else:
-        seed_parsed = parsed_cuts[seed_idx]
+        seed_contain_row = None
 
-    visited = {seed}
-    frontier = [seed]
+    seed_parsed = parsed_cuts[seed_cidx]
+    seed_is_simple = is_simple_cs[seed_cidx] if is_simple_cs is not None else False
+
+    visited = np.zeros(n_unitigs, dtype=np.bool_)
+    visited[seed_int] = True
+    frontier = [seed_int]
 
     for h in range(max_hops):
-        next_frontier: List[str] = []
-        for uid in frontier:
-            for nb in adj.get(uid, []):
-                if nb not in visited:
-                    visited.add(nb)
-                    next_frontier.append(nb)
+        next_frontier: List[int] = []
+        for uid_int in frontier:
+            start = csr_offsets[uid_int]
+            end = csr_offsets[uid_int + 1]
+            for j in range(start, end):
+                nb_int = csr_neighbors[j]
+                if not visited[nb_int]:
+                    visited[nb_int] = True
+                    next_frontier.append(nb_int)
                     n_reached[h] += 1
-                    nb_idx = unitig_to_cut_idx.get(nb)
-                    if nb_idx is None:
-                        continue
-                    if nb_idx == seed_idx:
+                    nb_cidx = cut_idx_array[nb_int]
+
+                    if nb_cidx == seed_cidx:
                         n_strict[h] += 1
                         n_contain[h] += 1
-                    elif contain_table is not None:
-                        if seed_contain_row[nb_idx]:
+                    elif use_full_table:
+                        # Full M×M table available
+                        if seed_contain_row[nb_cidx]:
+                            n_contain[h] += 1
+                    elif seed_in_topk and top_k_set is not None and nb_cidx in top_k_set:
+                        # Both in top-K: use precomputed table
+                        nb_local = top_k_to_local[nb_cidx]
+                        if seed_contain_row[nb_local]:
                             n_contain[h] += 1
                     else:
-                        if _containment_check(seed_parsed, parsed_cuts[nb_idx]):
+                        # Fall back to on-the-fly check
+                        # Different simple cut-strings can never be
+                        # containment-coherent ({A} ⊄ {B} when A≠B).
+                        if seed_is_simple and is_simple_cs is not None and is_simple_cs[nb_cidx]:
+                            pass  # not coherent
+                        elif _containment_check(
+                                seed_parsed, parsed_cuts[nb_cidx]):
                             n_contain[h] += 1
+
         frontier = next_frontier
         if not frontier:
             break
@@ -292,28 +381,32 @@ def _bfs_coherence(
 # Shared state for fork-based multiprocessing
 # ---------------------------------------------------------------------------
 
-# Populated by the parent process before forking; child processes inherit
-# these via copy-on-write without any pickling overhead.
 _SHARED: Dict = {}
 
 
 def _worker_bfs(args_tuple):
-    """Process a batch of seeds. Reads shared data from module-level _SHARED."""
-    seeds, worker_id = args_tuple
-    adj = _SHARED["adj"]
-    unitig_to_cut_idx = _SHARED["unitig_to_cut_idx"]
+    """Process a batch of seeds.  Reads shared data from _SHARED."""
+    seed_ints, worker_id = args_tuple
+    csr_offsets = _SHARED["csr_offsets"]
+    csr_neighbors = _SHARED["csr_neighbors"]
+    cut_idx_array = _SHARED["cut_idx_array"]
+    n_unitigs = _SHARED["n_unitigs"]
     max_hops = _SHARED["max_hops"]
     contain_table = _SHARED["contain_table"]
     parsed_cuts = _SHARED["parsed_cuts"]
+    is_simple_cs = _SHARED["is_simple_cs"]
+    top_k_set = _SHARED["top_k_set"]
+    top_k_to_local = _SHARED["top_k_to_local"]
 
     total_reached = np.zeros(max_hops, dtype=np.int64)
     total_strict = np.zeros(max_hops, dtype=np.int64)
     total_contain = np.zeros(max_hops, dtype=np.int64)
 
-    for i, s in enumerate(seeds):
+    for i, s in enumerate(seed_ints):
         reached, strict, contain = _bfs_coherence(
-            s, adj, unitig_to_cut_idx, max_hops,
-            contain_table, parsed_cuts)
+            s, csr_offsets, csr_neighbors, cut_idx_array,
+            n_unitigs, max_hops, contain_table, parsed_cuts,
+            is_simple_cs, top_k_set, top_k_to_local)
         total_reached += reached
         total_strict += strict
         total_contain += contain
@@ -321,7 +414,8 @@ def _worker_bfs(args_tuple):
         if (i + 1) % 1000 == 0:
             logger.info(
                 "Worker {}: BFS {}/{} seeds ({:.0f}%)",
-                worker_id, i + 1, len(seeds), (i + 1) / len(seeds) * 100)
+                worker_id, i + 1, len(seed_ints),
+                (i + 1) / len(seed_ints) * 100)
 
     return total_reached, total_strict, total_contain
 
@@ -333,8 +427,7 @@ def _worker_bfs(args_tuple):
 def _simpson_index(colors: Dict[str, str]) -> float:
     """Probability two randomly chosen unitigs have the same cut-string.
 
-    This is Σ fᵢ² (Simpson's index / Herfindahl index), where fᵢ is the
-    relative frequency of the i-th unique cut-string.
+    This is Σ fᵢ² (Simpson's index / Herfindahl index).
     """
     total = len(colors)
     if total == 0:
@@ -349,7 +442,8 @@ def _containment_null(
     colors: Dict[str, str],
     unique_cuts: List[str],
     contain_table: np.ndarray | None,
-    parsed_cuts: List[List[FrozenSet[str]]] | None,
+    parsed_cuts: List[List[FrozenSet[str]]],
+    top_k_set: set | None,
     rng: np.random.Generator | None = None,
 ) -> float:
     """Null expectation for containment coherence: Σ_{i,j coherent} f_i * f_j."""
@@ -363,18 +457,14 @@ def _containment_null(
 
     freqs = np.array([counts[cs] / total for cs in unique_cuts])
 
-    if contain_table is not None:
-        # Row-wise dot: O(M²) work but O(M) extra memory,
-        # avoids materializing an M×M float64 matrix.
+    # Full table available: exact computation
+    if contain_table is not None and top_k_set is None:
         return float(sum(
             freqs[i] * freqs[contain_table[i]].sum()
             for i in range(len(freqs))
         ))
 
-    # Large M: sample-based estimation.
-    # Drawing 1M frequency-weighted random pairs and checking containment
-    # gives a precise estimate (SE < 0.001) in seconds, vs. hours for the
-    # exhaustive M²/2 loop when M ≈ 500k.
+    # Large M or top-K table: sample-based estimation
     if rng is None:
         rng = np.random.default_rng(42)
     n_samples = 1_000_000
@@ -388,11 +478,11 @@ def _containment_null(
             n_coherent += 1
 
     estimate = n_coherent / n_samples
+    se = (estimate * (1 - estimate) / n_samples) ** 0.5
     logger.info(
         "Containment null estimated from {:,} samples: {:.6f} "
-        "(SE ≈ {:.6f})",
-        n_samples, estimate,
-        (estimate * (1 - estimate) / n_samples) ** 0.5)
+        "(SE \u2248 {:.6f})",
+        n_samples, estimate, se)
     return estimate
 
 
@@ -411,6 +501,7 @@ def _plot_decay(
     """Save a coherence-decay plot (SVG)."""
     import matplotlib
     matplotlib.use("Agg")
+    matplotlib.rcParams["svg.fonttype"] = "none"
     import matplotlib.pyplot as plt
     import seaborn as sns
 
@@ -478,49 +569,65 @@ def main(argv: Sequence[str] | None = None) -> None:
     adj, colors = _load_graph_and_colors(args.db)
 
     # -- Build containment lookup table --------------------------------------
-    unique_cuts, cut_to_idx, contain_table = \
+    (unique_cuts, cut_to_idx, contain_table,
+     top_k_set, top_k_list, top_k_to_local, parsed_cuts) = \
         _build_containment_table(colors)
 
-    # Map unitigs to cut-string indices
-    unitig_to_cut_idx: Dict[str, int] = {}
-    for uid, cs in colors.items():
-        unitig_to_cut_idx[uid] = cut_to_idx[cs]
+    # -- Build integer-indexed CSR graph -------------------------------------
+    unitig_list, uid_to_int, csr_offsets, csr_neighbors = \
+        _build_csr_graph(adj, colors)
+    N_unitigs = len(unitig_list)
 
-    # Pre-parse for on-the-fly mode (when M > 50k, no precomputed table)
-    parsed_cuts: List[List[FrozenSet[str]]] | None = None
-    if contain_table is None:
-        parsed_cuts = [_parse_cutstring(cs) for cs in unique_cuts]
+    # Cut-string index for each unitig (int array indexed by unitig integer)
+    cut_idx_array = np.array(
+        [cut_to_idx[colors[uid]] for uid in unitig_list], dtype=np.int32)
+
+    # Classify simple (single-node) cut-strings for on-the-fly optimization
+    is_simple_cs: np.ndarray | None = None
+    if top_k_set is not None or contain_table is None:
+        # Need simple classification for fallback on-the-fly checks
+        is_simple_cs = np.zeros(len(unique_cuts), dtype=np.bool_)
+        for i, p in enumerate(parsed_cuts):
+            if (len(p) == 1 and len(p[0]) == 1
+                    and "__UNASSIGNED__" not in p[0]):
+                is_simple_cs[i] = True
+        n_simple = int(is_simple_cs.sum())
+        logger.info(
+            "Simple cut-strings: {:,}/{:,} ({:.1f}%)",
+            n_simple, len(unique_cuts),
+            100.0 * n_simple / max(len(unique_cuts), 1))
 
     # -- Select seeds --------------------------------------------------------
     rng = np.random.default_rng(args.seed)
-    all_unitigs = list(colors.keys())
-    n_seeds = min(args.samples, len(all_unitigs))
-    if n_seeds == len(all_unitigs):
-        seeds = all_unitigs
+    n_seeds = min(args.samples, N_unitigs)
+    if n_seeds == N_unitigs:
+        seed_ints = list(range(N_unitigs))
         logger.info("Using all {:,} unitigs as seeds", n_seeds)
     else:
-        seed_indices = rng.choice(len(all_unitigs), size=n_seeds, replace=False)
-        seeds = [all_unitigs[i] for i in seed_indices]
+        seed_ints = list(
+            rng.choice(N_unitigs, size=n_seeds, replace=False))
         logger.info("Sampled {:,} seed unitigs", n_seeds)
 
     # -- BFS from each seed --------------------------------------------------
-    # Populate module-level shared state BEFORE forking so child processes
-    # inherit it via copy-on-write (zero serialization cost).
-    _SHARED["adj"] = adj
-    _SHARED["unitig_to_cut_idx"] = unitig_to_cut_idx
+    _SHARED["csr_offsets"] = csr_offsets
+    _SHARED["csr_neighbors"] = csr_neighbors
+    _SHARED["cut_idx_array"] = cut_idx_array
+    _SHARED["n_unitigs"] = N_unitigs
     _SHARED["max_hops"] = args.max_hops
     _SHARED["contain_table"] = contain_table
     _SHARED["parsed_cuts"] = parsed_cuts
+    _SHARED["is_simple_cs"] = is_simple_cs
+    _SHARED["top_k_set"] = top_k_set
+    _SHARED["top_k_to_local"] = top_k_to_local
 
     t0 = time.time()
     n_jobs = max(1, args.jobs)
 
     if n_jobs == 1:
         total_reached, total_strict, total_contain = _worker_bfs(
-            (seeds, 0))
+            (seed_ints, 0))
     else:
-        # Partition seeds across workers
-        chunks = np.array_split(seeds, n_jobs)
+        chunks = np.array_split(seed_ints, n_jobs)
         worker_args = [
             (list(chunk), i)
             for i, chunk in enumerate(chunks) if len(chunk) > 0
@@ -555,7 +662,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     null_strict = _simpson_index(colors)
     null_contain = _containment_null(
-        colors, unique_cuts, contain_table, parsed_cuts, rng)
+        colors, unique_cuts, contain_table, parsed_cuts, top_k_set, rng)
 
     logger.info("Null strict (Simpson index): {:.6f}", null_strict)
     logger.info("Null containment: {:.6f}", null_contain)
@@ -565,13 +672,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     hops = np.arange(1, args.max_hops + 1)
 
     with args.output.open("w") as out:
-        out.write("hop_distance\tn_pairs\tstrict_coherence\t"
-                  "containment_coherence\tnull_strict\tnull_containment\n")
+        out.write(
+            "hop_distance\tn_pairs\tn_strict_coherent\t"
+            "n_containment_coherent\tstrict_coherence\t"
+            "containment_coherence\tnull_strict\tnull_containment\n")
         for h in range(args.max_hops):
-            s_str = f"{coherence_strict[h]:.6f}" if not np.isnan(coherence_strict[h]) else "NA"
-            c_str = f"{coherence_contain[h]:.6f}" if not np.isnan(coherence_contain[h]) else "NA"
+            s_str = (f"{coherence_strict[h]:.6f}"
+                     if not np.isnan(coherence_strict[h]) else "NA")
+            c_str = (f"{coherence_contain[h]:.6f}"
+                     if not np.isnan(coherence_contain[h]) else "NA")
             out.write(
-                f"{hops[h]}\t{total_reached[h]}\t{s_str}\t"
+                f"{hops[h]}\t{total_reached[h]}\t{total_strict[h]}\t"
+                f"{total_contain[h]}\t{s_str}\t"
                 f"{c_str}\t{null_strict:.6f}\t{null_contain:.6f}\n")
 
     logger.info("Output written to {}", args.output)
@@ -595,17 +707,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"Null strict:          {null_strict:.6f}", file=sys.stderr)
     print(f"Null containment:     {null_contain:.6f}", file=sys.stderr)
     if not np.isnan(coherence_strict[0]):
-        print(f"Strict (h=1):         {coherence_strict[0]:.6f}", file=sys.stderr)
-        print(f"Containment (h=1):    {coherence_contain[0]:.6f}", file=sys.stderr)
+        print(
+            f"Strict (h=1):         {coherence_strict[0]:.6f}",
+            file=sys.stderr)
+        print(
+            f"Containment (h=1):    {coherence_contain[0]:.6f}",
+            file=sys.stderr)
     # Find hop where each curve first drops below its null
-    cross_s = np.where((coherence_strict <= null_strict) & ~np.isnan(coherence_strict))[0]
-    cross_c = np.where((coherence_contain <= null_contain) & ~np.isnan(coherence_contain))[0]
-    print(f"Strict crosses null:  "
-          f"{'hop ' + str(hops[cross_s[0]]) if len(cross_s) > 0 else 'never (within max-hops)'}",
-          file=sys.stderr)
-    print(f"Contain crosses null: "
-          f"{'hop ' + str(hops[cross_c[0]]) if len(cross_c) > 0 else 'never (within max-hops)'}",
-          file=sys.stderr)
+    cross_s = np.where(
+        (coherence_strict <= null_strict) & ~np.isnan(coherence_strict))[0]
+    cross_c = np.where(
+        (coherence_contain <= null_contain) & ~np.isnan(coherence_contain))[0]
+    print(
+        f"Strict crosses null:  "
+        f"{'hop ' + str(hops[cross_s[0]]) if len(cross_s) > 0 else 'never (within max-hops)'}",
+        file=sys.stderr)
+    print(
+        f"Contain crosses null: "
+        f"{'hop ' + str(hops[cross_c[0]]) if len(cross_c) > 0 else 'never (within max-hops)'}",
+        file=sys.stderr)
     print("------------------------------------", file=sys.stderr)
 
 
