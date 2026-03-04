@@ -50,6 +50,17 @@ def fn_breakpoints_stratified(batch: str | None = None, _batch: str | None = Non
     )
 
 
+def fn_breakpoints_stratified_plot(batch: str | None = None, _batch: str | None = None) -> str:
+    """Output path for stratified concordance breakpoints SVG plot."""
+    batch_id = batch if batch is not None else _batch
+    if batch_id is None:
+        raise ValueError("Batch identifier is required.")
+    label = parsimony_label()
+    return str(
+        dir_output() / "breakpoints" / f"{batch_id}_k{KMER_LENGTH}_{label}_breakpoints_stratified.svg"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rule 1: Original binary breakpoint detection
 # ---------------------------------------------------------------------------
@@ -125,9 +136,9 @@ rule stratified_concordance_breakpoints:
     input:
         sqldb=fn_sqldb(_batch="{batch}"),
         tree=fn_tree_sorted(_batch="{batch}"),
-        gfa=fn_pcdbg(_batch="{batch}"),
     output:
         breakpoints=fn_breakpoints_stratified(_batch="{batch}"),
+        plot=fn_breakpoints_stratified_plot(_batch="{batch}"),
     params:
         script=str(SCRIPTS_DIR / "concordance_breakpoints_stratified"),
         permutations=1000,
@@ -140,9 +151,9 @@ rule stratified_concordance_breakpoints:
         {params.script} \\
             --db {input.sqldb} \\
             --tree {input.tree} \\
-            --gfa {input.gfa} \\
             --permutations {params.permutations} \\
             --jobs {threads} \\
             --output {output.breakpoints} \\
+            --plot {output.plot} \\
             -v
         """

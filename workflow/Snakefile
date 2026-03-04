@@ -42,6 +42,7 @@ breakpoint_targets = (
     expand(fn_breakpoints(_batch="{batch}"), batch=get_batches())
     + expand(fn_breakpoint_summary(_batch="{batch}"), batch=get_batches())
     + expand(fn_breakpoints_stratified(_batch="{batch}"), batch=get_batches())
+    + expand(fn_breakpoints_stratified_plot(_batch="{batch}"), batch=get_batches())
     if PRODUCE_BREAKPOINTS
     else []
 )
