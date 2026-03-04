@@ -1,10 +1,10 @@
 """
-Concordance breakpoint detection.
+Boundary severity and legacy breakpoint analysis.
 
 Rules for:
-  1. Binary breakpoint detection (original concordance_breakpoints)
-  2. Stratified breakpoints with permutation null model
-  3. Summary statistics
+  1. Binary breakpoint detection (legacy concordance_breakpoints script)
+  2. Boundary severity with sampling-based null model
+  3. Summary statistics for legacy breakpoints
 """
 
 from pathlib import Path
@@ -18,7 +18,7 @@ SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 # ---------------------------------------------------------------------------
 
 def fn_breakpoints(batch: str | None = None, _batch: str | None = None) -> str:
-    """Output path for concordance breakpoints TSV."""
+    """Output path for legacy binary breakpoints TSV."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
@@ -29,7 +29,7 @@ def fn_breakpoints(batch: str | None = None, _batch: str | None = None) -> str:
 
 
 def fn_breakpoint_summary(batch: str | None = None, _batch: str | None = None) -> str:
-    """Output path for breakpoint summary statistics."""
+    """Output path for legacy breakpoint summary statistics."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
@@ -39,35 +39,36 @@ def fn_breakpoint_summary(batch: str | None = None, _batch: str | None = None) -
     )
 
 
-def fn_breakpoints_stratified(batch: str | None = None, _batch: str | None = None) -> str:
-    """Output path for stratified concordance breakpoints TSV."""
+def fn_boundary_severity(batch: str | None = None, _batch: str | None = None) -> str:
+    """Output path for boundary severity TSV."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "breakpoints" / f"{batch_id}_k{KMER_LENGTH}_{label}_breakpoints_stratified.tsv"
+        dir_output() / "severity" / f"{batch_id}_k{KMER_LENGTH}_{label}_boundary_severity.tsv"
     )
 
 
-def fn_breakpoints_stratified_plot(batch: str | None = None, _batch: str | None = None) -> str:
-    """Output path for stratified concordance breakpoints SVG plot."""
+def fn_boundary_severity_plot(batch: str | None = None, _batch: str | None = None) -> str:
+    """Output path for boundary severity SVG plot."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "breakpoints" / f"{batch_id}_k{KMER_LENGTH}_{label}_breakpoints_stratified.svg"
+        dir_output() / "severity" / f"{batch_id}_k{KMER_LENGTH}_{label}_boundary_severity.svg"
     )
 
 
 # ---------------------------------------------------------------------------
-# Rule 1: Original binary breakpoint detection
+# Rule 1: Legacy binary breakpoint detection
 # ---------------------------------------------------------------------------
 
 rule detect_concordance_breakpoints:
     """
     Detect edges where adjacent unitigs have discordant phylogenetic assignments.
+    (Legacy binary breakpoint script — kept for backward compatibility.)
     """
     input:
         sqldb=fn_sqldb(_batch="{batch}"),
@@ -93,7 +94,7 @@ rule detect_concordance_breakpoints:
 
 rule summarize_breakpoints:
     """
-    Compute summary statistics for detected breakpoints.
+    Compute summary statistics for legacy binary breakpoints.
     """
     input:
         breakpoints=fn_breakpoints(_batch="{batch}"),
@@ -125,35 +126,35 @@ rule summarize_breakpoints:
 
 
 # ---------------------------------------------------------------------------
-# Rule 2: Stratified breakpoints with permutation null model
+# Rule 2: Boundary severity with sampling-based null model
 # ---------------------------------------------------------------------------
 
-rule stratified_concordance_breakpoints:
+rule boundary_severity:
     """
-    Continuous tree-distance metric per edge with permutation p-values.
-    Replaces binary concordant/discordant with a distance + null model.
+    Characterize phylogenetic distance at evolutionary block boundaries.
+    Continuous tree-distance metric per edge with sampling-based null model.
     """
     input:
         sqldb=fn_sqldb(_batch="{batch}"),
         tree=fn_tree_sorted(_batch="{batch}"),
     output:
-        breakpoints=fn_breakpoints_stratified(_batch="{batch}"),
-        plot=fn_breakpoints_stratified_plot(_batch="{batch}"),
+        tsv=fn_boundary_severity(_batch="{batch}"),
+        plot=fn_boundary_severity_plot(_batch="{batch}"),
     params:
-        script=str(SCRIPTS_DIR / "concordance_breakpoints_stratified"),
-        permutations=1000,
+        script=str(SCRIPTS_DIR / "boundary_severity"),
+        null_samples=5000000,
     threads: MAX_THREADS
     conda:
         "../envs/ete4.yml"
     shell:
         """
-        mkdir -p $(dirname {output.breakpoints})
+        mkdir -p $(dirname {output.tsv})
         {params.script} \\
             --db {input.sqldb} \\
             --tree {input.tree} \\
-            --permutations {params.permutations} \\
+            --null-samples {params.null_samples} \\
             --jobs {threads} \\
-            --output {output.breakpoints} \\
+            --output {output.tsv} \\
             --plot {output.plot} \\
             -v
         """

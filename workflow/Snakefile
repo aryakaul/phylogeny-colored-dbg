@@ -23,11 +23,14 @@ include: "rules/bubblegun.smk"
 include: "rules/colored_deletions.smk"
 include: "rules/breakpoints.smk"
 include: "rules/coherence.smk"
+include: "rules/stratification.smk"
 
 
 PRODUCE_COLORED_DELETIONS = config.get("produce_colored_deletions", True)
 PRODUCE_BREAKPOINTS = config.get("produce_breakpoints", False)
-PRODUCE_COHERENCE_DECAY = config.get("produce_coherence_decay", False)
+PRODUCE_PERSISTENCE = config.get("produce_persistence",
+                                  config.get("produce_coherence_decay", False))
+PRODUCE_STRATIFICATION = config.get("produce_stratification", False)
 
 pcdbg_targets = expand(fn_pcdbg(_batch="{batch}"), batch=get_batches())
 compression_targets = expand(
@@ -41,15 +44,21 @@ deletion_targets = (
 breakpoint_targets = (
     expand(fn_breakpoints(_batch="{batch}"), batch=get_batches())
     + expand(fn_breakpoint_summary(_batch="{batch}"), batch=get_batches())
-    + expand(fn_breakpoints_stratified(_batch="{batch}"), batch=get_batches())
-    + expand(fn_breakpoints_stratified_plot(_batch="{batch}"), batch=get_batches())
+    + expand(fn_boundary_severity(_batch="{batch}"), batch=get_batches())
+    + expand(fn_boundary_severity_plot(_batch="{batch}"), batch=get_batches())
     if PRODUCE_BREAKPOINTS
     else []
 )
-coherence_targets = (
-    expand(fn_coherence_decay(_batch="{batch}"), batch=get_batches())
-    + expand(fn_coherence_decay_plot(_batch="{batch}"), batch=get_batches())
-    if PRODUCE_COHERENCE_DECAY
+persistence_targets = (
+    expand(fn_evolutionary_persistence(_batch="{batch}"), batch=get_batches())
+    + expand(fn_evolutionary_persistence_plot(_batch="{batch}"), batch=get_batches())
+    if PRODUCE_PERSISTENCE
+    else []
+)
+stratification_targets = (
+    expand(fn_evolutionary_stratification(_batch="{batch}"), batch=get_batches())
+    + expand(fn_evolutionary_stratification_plot(_batch="{batch}"), batch=get_batches())
+    if PRODUCE_STRATIFICATION
     else []
 )
 
@@ -62,4 +71,4 @@ wildcard_constraints:
 
 rule all:
     input:
-        pcdbg_targets + compression_targets + deletion_targets + breakpoint_targets + coherence_targets,
+        pcdbg_targets + compression_targets + deletion_targets + breakpoint_targets + persistence_targets + stratification_targets,

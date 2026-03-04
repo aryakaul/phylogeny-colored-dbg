@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Phylogenetic coherence decay along graph walks.
+"""Evolutionary persistence — coherence decay along graph walks.
 
-Measures how rapidly phylogenetic assignment (cut-string) changes as
-you walk outward from a unitig in the compacted colored de Bruijn graph.
+Measures the spatial extent over which evolutionary history is conserved
+as you walk outward from a unitig in the compacted colored de Bruijn graph.
 
 Reports two coherence metrics at each hop distance:
 
@@ -520,7 +520,7 @@ def _plot_decay(
 
     ax.set_xlabel("Hop distance")
     ax.set_ylabel("Coherence fraction")
-    ax.set_title("Phylogenetic coherence decay")
+    ax.set_title("Evolutionary persistence")
     ax.set_ylim(bottom=0)
     ax.legend()
     sns.despine(ax=ax, top=True, right=True)
@@ -536,7 +536,7 @@ def _plot_decay(
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Phylogenetic coherence decay along graph walks.")
+        description="Evolutionary persistence — coherence decay along graph walks.")
     parser.add_argument(
         "--db", type=Path, required=True,
         help="SQLite database with unitigs and adjacency tables.")
@@ -700,7 +700,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             logger.warning("No valid coherence data to plot")
 
     # -- Summary to stderr ---------------------------------------------------
-    print("\n--- Phylogenetic Coherence Decay ---", file=sys.stderr)
+    print("\n--- Evolutionary Persistence ---", file=sys.stderr)
     print(f"Seeds:                {n_seeds:,}", file=sys.stderr)
     print(f"Max hops:             {args.max_hops}", file=sys.stderr)
     print(f"Unique cut-strings:   {len(unique_cuts):,}", file=sys.stderr)

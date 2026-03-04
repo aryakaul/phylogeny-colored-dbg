@@ -1,9 +1,8 @@
 """
-Phylogenetic coherence decay analysis.
+Evolutionary persistence analysis.
 
-Measures how rapidly phylogenetic assignment (cut-string) changes as
-you walk outward from a unitig in the pcDBG. Produces a decay curve
-and optional plot.
+Measures the spatial extent over which evolutionary history is conserved
+along graph walks via strict and containment coherence decay curves.
 """
 
 from pathlib import Path
@@ -16,44 +15,44 @@ SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 # Output path helpers
 # ---------------------------------------------------------------------------
 
-def fn_coherence_decay(batch: str | None = None, _batch: str | None = None) -> str:
-    """Output path for phylogenetic coherence decay TSV."""
+def fn_evolutionary_persistence(batch: str | None = None, _batch: str | None = None) -> str:
+    """Output path for evolutionary persistence TSV."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "coherence" / f"{batch_id}_k{KMER_LENGTH}_{label}_coherence_decay.tsv"
+        dir_output() / "persistence" / f"{batch_id}_k{KMER_LENGTH}_{label}_evolutionary_persistence.tsv"
     )
 
 
-def fn_coherence_decay_plot(batch: str | None = None, _batch: str | None = None) -> str:
-    """Output path for coherence decay SVG plot."""
+def fn_evolutionary_persistence_plot(batch: str | None = None, _batch: str | None = None) -> str:
+    """Output path for evolutionary persistence SVG plot."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "coherence" / f"{batch_id}_k{KMER_LENGTH}_{label}_coherence_decay.svg"
+        dir_output() / "persistence" / f"{batch_id}_k{KMER_LENGTH}_{label}_evolutionary_persistence.svg"
     )
 
 
 # ---------------------------------------------------------------------------
-# Rule: Phylogenetic coherence decay
+# Rule: Evolutionary persistence
 # ---------------------------------------------------------------------------
 
-rule phylogenetic_coherence_decay:
+rule evolutionary_persistence:
     """
     Measure how rapidly phylogenetic assignment changes with graph distance.
-    Produces a decay curve: fraction of same-colored neighbours vs. hop count.
+    Produces decay curves for strict and containment coherence vs. hop count.
     """
     input:
         sqldb=fn_sqldb(_batch="{batch}"),
     output:
-        tsv=fn_coherence_decay(_batch="{batch}"),
-        plot=fn_coherence_decay_plot(_batch="{batch}"),
+        tsv=fn_evolutionary_persistence(_batch="{batch}"),
+        plot=fn_evolutionary_persistence_plot(_batch="{batch}"),
     params:
-        script=str(SCRIPTS_DIR / "phylogenetic_coherence_decay"),
+        script=str(SCRIPTS_DIR / "evolutionary_persistence"),
         max_hops=20,
         samples=10000,
     threads: MAX_THREADS

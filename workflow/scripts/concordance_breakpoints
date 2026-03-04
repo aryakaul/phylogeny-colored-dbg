@@ -22,12 +22,12 @@ Algorithm
    two primary assignments by walking up to their MRCA and summing
    edge counts.  Report the edge if distance ≥ ``--min-distance``.
 
-This is the simpler predecessor to ``concordance_breakpoints_stratified``,
-which replaces the binary call with a continuous distance metric and a
-permutation null model.  This script is faster (no permutations, no
-matrix precompute) and useful for a quick first look, but it does not
-handle multi-node cut-strings or OR-ambiguity — it always takes the
-first node from the first alternative.
+This is the simpler predecessor to ``boundary_severity``, which replaces
+the binary call with a continuous distance metric and a sampling-based
+null model.  This script is faster (no null model, no matrix precompute)
+and useful for a quick first look, but it does not handle multi-node
+cut-strings or OR-ambiguity — it always takes the first node from the
+first alternative.
 
 Inputs
 ------
