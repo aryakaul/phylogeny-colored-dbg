@@ -15,31 +15,41 @@ SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 # Output path helpers
 # ---------------------------------------------------------------------------
 
-def fn_evolutionary_persistence(batch: str | None = None, _batch: str | None = None) -> str:
+
+def fn_evolutionary_persistence(
+    batch: str | None = None, _batch: str | None = None
+) -> str:
     """Output path for evolutionary persistence TSV."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "persistence" / f"{batch_id}_k{KMER_LENGTH}_{label}_evolutionary_persistence.tsv"
+        dir_output()
+        / "persistence"
+        / f"{batch_id}_k{KMER_LENGTH}_{label}_evolutionary_persistence.tsv"
     )
 
 
-def fn_evolutionary_persistence_plot(batch: str | None = None, _batch: str | None = None) -> str:
+def fn_evolutionary_persistence_plot(
+    batch: str | None = None, _batch: str | None = None
+) -> str:
     """Output path for evolutionary persistence SVG plot."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "persistence" / f"{batch_id}_k{KMER_LENGTH}_{label}_evolutionary_persistence.svg"
+        dir_output()
+        / "persistence"
+        / f"{batch_id}_k{KMER_LENGTH}_{label}_evolutionary_persistence.svg"
     )
 
 
 # ---------------------------------------------------------------------------
 # Rule: Evolutionary persistence
 # ---------------------------------------------------------------------------
+
 
 rule evolutionary_persistence:
     """

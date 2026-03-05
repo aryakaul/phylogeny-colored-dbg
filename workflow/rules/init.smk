@@ -200,18 +200,17 @@ def fn_minimalcuts(batch: Optional[str] = None, _batch: Optional[str] = None) ->
     batch_id = _require_batch(batch, _batch)
     label = parsimony_label()
     return str(
-        _minimal_cuts_root(batch_id) /
-        f"{batch_id}_minimalcuts_{label}_k{KMER_LENGTH}")
+        _minimal_cuts_root(batch_id) / f"{batch_id}_minimalcuts_{label}_k{KMER_LENGTH}"
+    )
 
 
-def fn_minimalcuts_colors(
-    batch: Optional[str] = None, _batch: Optional[str] = None
-) -> str:
+def fn_minimalcuts_colors(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
     label = parsimony_label()
     return str(
-        _minimal_cuts_root(batch_id) /
-        f"{batch_id}_minimalcuts_colors_{label}_k{KMER_LENGTH}.tsv.gz")
+        _minimal_cuts_root(batch_id)
+        / f"{batch_id}_minimalcuts_colors_{label}_k{KMER_LENGTH}.tsv.gz"
+    )
 
 
 def fn_minimalcuts_plotdir(
@@ -219,17 +218,15 @@ def fn_minimalcuts_plotdir(
 ) -> str:
     batch_id = _require_batch(batch, _batch)
     label = parsimony_label()
-    return str(
-        _minimal_cuts_root(batch_id) /
-        f"{batch_id}_plots_{label}_k{KMER_LENGTH}")
+    return str(_minimal_cuts_root(batch_id) / f"{batch_id}_plots_{label}_k{KMER_LENGTH}")
 
 
 def fn_unitig2cuts(batch: Optional[str] = None, _batch: Optional[str] = None) -> str:
     batch_id = _require_batch(batch, _batch)
     label = parsimony_label()
     return str(
-        _minimal_cuts_root(batch_id) /
-        f"{batch_id}_unitig2cuts_{label}_k{KMER_LENGTH}")
+        _minimal_cuts_root(batch_id) / f"{batch_id}_unitig2cuts_{label}_k{KMER_LENGTH}"
+    )
 
 
 def fn_unitig_color_choices(
@@ -239,8 +236,8 @@ def fn_unitig_color_choices(
     batch_id = _require_batch(batch, _batch)
     label = parsimony_label()
     return str(
-        _minimal_cuts_root(batch_id) /
-        f"{batch_id}_unitig_colorchoices_{label}_k{KMER_LENGTH}.tsv"
+        _minimal_cuts_root(batch_id)
+        / f"{batch_id}_unitig_colorchoices_{label}_k{KMER_LENGTH}.tsv"
     )
 
 
@@ -250,9 +247,7 @@ def fn_compression_metrics(
     batch_id = _require_batch(batch, _batch)
     label = parsimony_label()
     return str(
-        INTERMEDIATE_DIR
-        / "metrics"
-        / f"{batch_id}_compression_{label}_k{KMER_LENGTH}.tsv"
+        INTERMEDIATE_DIR / "metrics" / f"{batch_id}_compression_{label}_k{KMER_LENGTH}.tsv"
     )
 
 

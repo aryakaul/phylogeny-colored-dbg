@@ -55,10 +55,10 @@ except ImportError:
     import logging
     logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # Logger
 # ---------------------------------------------------------------------------
+
 
 def _configure_logger(verbosity: int) -> None:
     """0 → WARNING, 1 → INFO, 2+ → DEBUG."""
@@ -70,15 +70,15 @@ def _configure_logger(verbosity: int) -> None:
         _lg.add(sys.stderr, level=level)
     except ImportError:
         import logging
-        level = (logging.WARNING if verbosity == 0
-                 else logging.INFO if verbosity == 1
-                 else logging.DEBUG)
+        level = (logging.WARNING if verbosity == 0 else
+                 logging.INFO if verbosity == 1 else logging.DEBUG)
         logging.basicConfig(level=level, stream=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # Cut-string parsing
 # ---------------------------------------------------------------------------
+
 
 def _parse_cutstring(cs: str) -> List[FrozenSet[str]]:
     """Parse a cut-string into a list of alternative solution sets.
@@ -102,9 +102,9 @@ def _parse_cutstring(cs: str) -> List[FrozenSet[str]]:
 # Tree: Euler tour for O(1) ancestor-descendant queries
 # ---------------------------------------------------------------------------
 
+
 def _build_euler_tour(
-    tree: Tree,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    tree: Tree, ) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     """Euler-tour entry/exit times for O(1) ancestor-descendant queries.
 
     Returns:
@@ -142,13 +142,16 @@ def _build_euler_tour(
 # Ancestor-descendant concordance check
 # ---------------------------------------------------------------------------
 
+
 def _is_anc_or_desc(
-    a: int, b: int,
-    entry: np.ndarray, exit_: np.ndarray,
+    a: int,
+    b: int,
+    entry: np.ndarray,
+    exit_: np.ndarray,
 ) -> bool:
     """O(1) ancestor-or-descendant check via Euler-tour times."""
-    return ((entry[a] <= entry[b] and exit_[b] <= exit_[a]) or
-            (entry[b] <= entry[a] and exit_[a] <= exit_[b]))
+    return ((entry[a] <= entry[b] and exit_[b] <= exit_[a])
+            or (entry[b] <= entry[a] and exit_[a] <= exit_[b]))
 
 
 def _max_bipartite_matching(adj: List[List[int]], n_right: int) -> int:
@@ -231,21 +234,36 @@ def _injective_ancdesc_match_nidx(
                 return True
         return False
 
+<<<<<<< HEAD
     # Larger sets: bipartite matching
     adj_lists: List[List[int]] = []
     for a in ta:
         adj_lists.append([j for j, b in enumerate(tb)
                           if _is_anc_or_desc(a, b, entry, exit_)])
     return _max_bipartite_matching(adj_lists, len(tb)) == len(ta)
+=======
+    # Single vs single/multi: O(1) or O(|larger|)
+    if len(idx_a) == 1:
+        a = idx_a[0]
+        return any(_is_anc_or_desc(a, b, entry, exit_) for b in idx_b)
+
+    # Multi vs multi: brute-force injective matchings (sets are tiny, 2-4 nodes)
+    for perm in permutations(idx_b, len(idx_a)):
+        if all(
+                _is_anc_or_desc(idx_a[i], perm[i], entry, exit_)
+                for i in range(len(idx_a))):
+            return True
+    return False
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
 
 # ---------------------------------------------------------------------------
 # Graph loading
 # ---------------------------------------------------------------------------
 
+
 def _load_graph_and_colors(
-    db_path: Path,
-) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+    db_path: Path, ) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
     """Load adjacency list and cut-string assignments from SQLite.
 
     Returns:
@@ -257,9 +275,8 @@ def _load_graph_and_colors(
     # Adjacency → undirected
     adj: Dict[str, List[str]] = defaultdict(list)
     for uid, _, nid, _ in conn.execute(
-        "SELECT unitig_id, unitig_direction, "
-        "neighbor_id, neighbor_direction FROM adjacency"
-    ):
+            "SELECT unitig_id, unitig_direction, "
+            "neighbor_id, neighbor_direction FROM adjacency"):
         adj[uid].append(nid)
         adj[nid].append(uid)
 
@@ -284,6 +301,7 @@ def _load_graph_and_colors(
 # ---------------------------------------------------------------------------
 # Integer-indexed CSR graph for fast BFS
 # ---------------------------------------------------------------------------
+
 
 def _build_csr_graph(
     adj: Dict[str, List[str]],
@@ -310,13 +328,11 @@ def _build_csr_graph(
         nb_list.extend(uid_to_int[nb] for nb in nbs)
         offsets[i + 1] = len(nb_list)
 
-    csr_neighbors = (
-        np.array(nb_list, dtype=np.int32)
-        if nb_list else np.empty(0, dtype=np.int32))
+    csr_neighbors = (np.array(nb_list, dtype=np.int32)
+                     if nb_list else np.empty(0, dtype=np.int32))
 
-    logger.info(
-        "CSR graph: {:,} nodes, {:,} directed entries",
-        N, len(csr_neighbors))
+    logger.info("CSR graph: {:,} nodes, {:,} directed entries", N,
+                len(csr_neighbors))
     return unitig_list, uid_to_int, offsets, csr_neighbors
 
 
@@ -324,15 +340,27 @@ def _build_csr_graph(
 # Precompute coherence lookup (top-K approach)
 # ---------------------------------------------------------------------------
 
+
 def _build_concordance_table(
     colors: Dict[str, str],
     entry: np.ndarray,
     exit_: np.ndarray,
     tree_name_to_nidx: Dict[str, int],
 ) -> Tuple[
+<<<<<<< HEAD
     List[str], Dict[str, int],
     np.ndarray | None, set | None, List[int] | None, Dict[int, int] | None,
     List[List[FrozenSet[str]]], np.ndarray, List[List[Tuple[int, ...]]],
+=======
+        List[str],
+        Dict[str, int],
+        np.ndarray | None,
+        set | None,
+        List[int] | None,
+        Dict[int, int] | None,
+        List[List[FrozenSet[str]]],
+        np.ndarray,
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 ]:
     """Build concordance table for the top-K most frequent cut-strings.
 
@@ -378,17 +406,15 @@ def _build_concordance_table(
     # Build simple_nidx: tree node index for simple (single-node) cut-strings
     simple_nidx = np.full(M, -1, dtype=np.int32)
     for i, p in enumerate(parsed_cuts):
-        if (len(p) == 1 and len(p[0]) == 1
-                and "__UNASSIGNED__" not in p[0]):
+        if (len(p) == 1 and len(p[0]) == 1 and "__UNASSIGNED__" not in p[0]):
             node_name = next(iter(p[0]))
             nidx = tree_name_to_nidx.get(node_name)
             if nidx is not None:
                 simple_nidx[i] = nidx
 
     n_simple = int((simple_nidx >= 0).sum())
-    logger.info(
-        "Simple cut-strings: {:,}/{:,} ({:.1f}%)",
-        n_simple, M, 100.0 * n_simple / max(M, 1))
+    logger.info("Simple cut-strings: {:,}/{:,} ({:.1f}%)", n_simple, M,
+                100.0 * n_simple / max(M, 1))
 
     # If M is small enough, build the full M×M table
     if M <= 50_000:
@@ -398,27 +424,40 @@ def _build_concordance_table(
             for j in range(i + 1, M):
                 # Fast path for simple vs simple
                 if simple_nidx[i] >= 0 and simple_nidx[j] >= 0:
-                    if _is_anc_or_desc(simple_nidx[i], simple_nidx[j],
-                                       entry, exit_):
+                    if _is_anc_or_desc(simple_nidx[i], simple_nidx[j], entry,
+                                       exit_):
                         concordance_table[i, j] = True
                         concordance_table[j, i] = True
+<<<<<<< HEAD
                 elif _concordance_check_nidx(parsed_nidx[i], parsed_nidx[j],
                                             entry, exit_):
+=======
+                elif _concordance_check(parsed_cuts[i], parsed_cuts[j], entry,
+                                        exit_, tree_name_to_nidx):
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
                     concordance_table[i, j] = True
                     concordance_table[j, i] = True
         elapsed = time.time() - t0
         n_concordant = int(concordance_table.sum()) - M
         logger.info(
             "Full concordance table built in {:.1f}s: {:,} coherent pairs "
+<<<<<<< HEAD
             "(of {:,} off-diagonal)",
             elapsed, n_concordant // 2, M * (M - 1) // 2)
         return (unique_cuts, cut_to_idx, concordance_table,
                 None, None, None, parsed_cuts, simple_nidx, parsed_nidx)
+=======
+            "(of {:,} off-diagonal)", elapsed, n_concordant // 2,
+            M * (M - 1) // 2)
+        return (unique_cuts, cut_to_idx, concordance_table, None, None, None,
+                parsed_cuts, simple_nidx)
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
     # Large M: build top-K table covering ~90% of unitigs
     total = sum(cut_counts.values())
-    sorted_by_freq = sorted(
-        range(M), key=lambda i: cut_counts[unique_cuts[i]], reverse=True)
+    sorted_by_freq = sorted(range(M),
+                            key=lambda i: cut_counts[unique_cuts[i]],
+                            reverse=True)
 
     cumsum = 0
     top_k_list: List[int] = []
@@ -433,9 +472,8 @@ def _build_concordance_table(
     top_k_to_local = {g: l for l, g in enumerate(top_k_list)}
     K = len(top_k_list)
 
-    logger.info(
-        "Top-K concordance: K={:,} covers {:.1f}% of {:,} unitigs",
-        K, 100.0 * cumsum / total, total)
+    logger.info("Top-K concordance: K={:,} covers {:.1f}% of {:,} unitigs", K,
+                100.0 * cumsum / total, total)
 
     concordance_table = np.eye(K, dtype=np.bool_)
     t0 = time.time()
@@ -445,12 +483,18 @@ def _build_concordance_table(
             j_global = top_k_list[j_local]
             # Fast path for simple vs simple
             if simple_nidx[i_global] >= 0 and simple_nidx[j_global] >= 0:
-                if _is_anc_or_desc(simple_nidx[i_global], simple_nidx[j_global],
-                                   entry, exit_):
+                if _is_anc_or_desc(simple_nidx[i_global],
+                                   simple_nidx[j_global], entry, exit_):
                     concordance_table[i_local, j_local] = True
                     concordance_table[j_local, i_local] = True
+<<<<<<< HEAD
             elif _concordance_check_nidx(parsed_nidx[i_global], parsed_nidx[j_global],
                                         entry, exit_):
+=======
+            elif _concordance_check(parsed_cuts[i_global],
+                                    parsed_cuts[j_global], entry, exit_,
+                                    tree_name_to_nidx):
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
                 concordance_table[i_local, j_local] = True
                 concordance_table[j_local, i_local] = True
     elapsed = time.time() - t0
@@ -459,14 +503,20 @@ def _build_concordance_table(
         "Top-K concordance table built in {:.1f}s: {:,} coherent pairs",
         elapsed, n_concordant // 2)
 
+<<<<<<< HEAD
     return (unique_cuts, cut_to_idx, concordance_table,
             top_k_set, top_k_list, top_k_to_local, parsed_cuts, simple_nidx,
             parsed_nidx)
+=======
+    return (unique_cuts, cut_to_idx, concordance_table, top_k_set, top_k_list,
+            top_k_to_local, parsed_cuts, simple_nidx)
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
 
 # ---------------------------------------------------------------------------
 # BFS coherence measurement
 # ---------------------------------------------------------------------------
+
 
 def _bfs_coherence(
     seed_int: int,
@@ -544,12 +594,18 @@ def _bfs_coherence(
                         nb_snidx = simple_nidx[nb_cidx]
                         if seed_snidx >= 0 and nb_snidx >= 0:
                             # Both simple: O(1) ancestor-descendant check
-                            if _is_anc_or_desc(seed_snidx, nb_snidx,
-                                               entry, exit_):
+                            if _is_anc_or_desc(seed_snidx, nb_snidx, entry,
+                                               exit_):
                                 n_ancdesc[h] += 1
+<<<<<<< HEAD
                         elif _concordance_check_nidx(
                                 seed_nidx, parsed_nidx[nb_cidx],
                                 entry, exit_):
+=======
+                        elif _concordance_check(seed_parsed,
+                                                parsed_cuts[nb_cidx], entry,
+                                                exit_, tree_name_to_nidx):
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
                             n_ancdesc[h] += 1
 
         frontier = next_frontier
@@ -588,19 +644,23 @@ def _worker_bfs(args_tuple):
 
     for i, s in enumerate(seed_ints):
         reached, strict, ancdesc = _bfs_coherence(
+<<<<<<< HEAD
             s, csr_offsets, csr_neighbors, cut_idx_array,
             n_unitigs, max_hops, concordance_table, parsed_nidx,
             simple_nidx, top_k_set, top_k_to_local,
             entry, exit_)
+=======
+            s, csr_offsets, csr_neighbors, cut_idx_array, n_unitigs, max_hops,
+            concordance_table, parsed_cuts, simple_nidx, top_k_set,
+            top_k_to_local, entry, exit_, tree_name_to_nidx)
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
         total_reached += reached
         total_strict += strict
         total_ancdesc += ancdesc
 
         if (i + 1) % 1000 == 0:
-            logger.info(
-                "Worker {}: BFS {}/{} seeds ({:.0f}%)",
-                worker_id, i + 1, len(seed_ints),
-                (i + 1) / len(seed_ints) * 100)
+            logger.info("Worker {}: BFS {}/{} seeds ({:.0f}%)", worker_id,
+                        i + 1, len(seed_ints), (i + 1) / len(seed_ints) * 100)
 
     return total_reached, total_strict, total_ancdesc
 
@@ -608,6 +668,7 @@ def _worker_bfs(args_tuple):
 # ---------------------------------------------------------------------------
 # Null expectations
 # ---------------------------------------------------------------------------
+
 
 def _simpson_index(colors: Dict[str, str]) -> float:
     """Probability two randomly chosen unitigs have the same cut-string.
@@ -620,7 +681,7 @@ def _simpson_index(colors: Dict[str, str]) -> float:
     counts: Dict[str, int] = defaultdict(int)
     for cs in colors.values():
         counts[cs] += 1
-    return sum((c / total) ** 2 for c in counts.values())
+    return sum((c / total)**2 for c in counts.values())
 
 
 def _concordance_null(
@@ -647,10 +708,9 @@ def _concordance_null(
 
     # Full table available: exact computation
     if concordance_table is not None and top_k_set is None:
-        return float(sum(
-            freqs[i] * freqs[concordance_table[i]].sum()
-            for i in range(len(freqs))
-        ))
+        return float(
+            sum(freqs[i] * freqs[concordance_table[i]].sum()
+                for i in range(len(freqs))))
 
     # Large M or top-K table: sample-based estimation
     if rng is None:
@@ -667,22 +727,27 @@ def _concordance_null(
         elif simple_nidx[i] >= 0 and simple_nidx[j] >= 0:
             if _is_anc_or_desc(simple_nidx[i], simple_nidx[j], entry, exit_):
                 n_coherent += 1
+<<<<<<< HEAD
         elif _concordance_check_nidx(parsed_nidx[i], parsed_nidx[j],
                                      entry, exit_):
+=======
+        elif _concordance_check(parsed_cuts[i], parsed_cuts[j], entry, exit_,
+                                tree_name_to_nidx):
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
             n_coherent += 1
 
     estimate = n_coherent / n_samples
-    se = (estimate * (1 - estimate) / n_samples) ** 0.5
+    se = (estimate * (1 - estimate) / n_samples)**0.5
     logger.info(
         "Anc/desc null estimated from {:,} samples: {:.6f} "
-        "(SE \u2248 {:.6f})",
-        n_samples, estimate, se)
+        "(SE \u2248 {:.6f})", n_samples, estimate, se)
     return estimate
 
 
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
+
 
 def _plot_decay(
     hops: np.ndarray,
@@ -702,15 +767,33 @@ def _plot_decay(
     sns.set_theme(style="white", context="notebook")
     fig, ax = plt.subplots(figsize=(7, 4.5))
 
-    ax.plot(hops, coherence_ancdesc, marker="o", linewidth=1.5,
-            markersize=4, label="Anc/desc coherence", color="tab:blue")
-    ax.plot(hops, coherence_strict, marker="s", linewidth=1.5,
-            markersize=3, linestyle="--", label="Strict coherence",
+    ax.plot(hops,
+            coherence_ancdesc,
+            marker="o",
+            linewidth=1.5,
+            markersize=4,
+            label="Anc/desc coherence",
+            color="tab:blue")
+    ax.plot(hops,
+            coherence_strict,
+            marker="s",
+            linewidth=1.5,
+            markersize=3,
+            linestyle="--",
+            label="Strict coherence",
             color="tab:orange")
-    ax.axhline(null_ancdesc, color="tab:blue", linestyle=":", linewidth=1,
-               alpha=0.7, label=f"Null anc/desc = {null_ancdesc:.4f}")
-    ax.axhline(null_strict, color="tab:orange", linestyle=":", linewidth=1,
-               alpha=0.7, label=f"Null strict = {null_strict:.4f}")
+    ax.axhline(null_ancdesc,
+               color="tab:blue",
+               linestyle=":",
+               linewidth=1,
+               alpha=0.7,
+               label=f"Null anc/desc = {null_ancdesc:.4f}")
+    ax.axhline(null_strict,
+               color="tab:orange",
+               linestyle=":",
+               linewidth=1,
+               alpha=0.7,
+               label=f"Null strict = {null_strict:.4f}")
 
     ax.set_xlabel("Hop distance")
     ax.set_ylabel("Coherence fraction")
@@ -728,35 +811,51 @@ def _plot_decay(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Evolutionary persistence — coherence decay along graph walks.")
+        description=
+        "Evolutionary persistence — coherence decay along graph walks.")
     parser.add_argument(
-        "--db", type=Path, required=True,
+        "--db",
+        type=Path,
+        required=True,
         help="SQLite database with unitigs and adjacency tables.")
     parser.add_argument(
-        "--tree", type=Path, required=True,
+        "--tree",
+        type=Path,
+        required=True,
         help="Postprocessed Newick tree with named internal nodes.")
+    parser.add_argument("--max-hops",
+                        type=int,
+                        default=20,
+                        help="Maximum BFS walk distance (default: 20).")
     parser.add_argument(
-        "--max-hops", type=int, default=20,
-        help="Maximum BFS walk distance (default: 20).")
-    parser.add_argument(
-        "--samples", type=int, default=10_000,
+        "--samples",
+        type=int,
+        default=10_000,
         help="Number of seed unitigs to sample (default: 10000).")
+    parser.add_argument("--seed",
+                        type=int,
+                        default=42,
+                        help="Random seed for reproducibility (default: 42).")
+    parser.add_argument("--output",
+                        type=Path,
+                        required=True,
+                        help="Output TSV path.")
+    parser.add_argument("--plot",
+                        type=Path,
+                        default=None,
+                        help="Optional path for an SVG decay-curve plot.")
+    parser.add_argument("--jobs",
+                        type=int,
+                        default=1,
+                        help="Number of parallel workers (default: 1).")
     parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for reproducibility (default: 42).")
-    parser.add_argument(
-        "--output", type=Path, required=True,
-        help="Output TSV path.")
-    parser.add_argument(
-        "--plot", type=Path, default=None,
-        help="Optional path for an SVG decay-curve plot.")
-    parser.add_argument(
-        "--jobs", type=int, default=1,
-        help="Number of parallel workers (default: 1).")
-    parser.add_argument(
-        "-v", "--verbose", action="count", default=0,
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
         help="Increase verbosity (-v for INFO, -vv for DEBUG).")
 
     args = parser.parse_args(argv)
@@ -770,8 +869,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         tree.name = "Root"
 
     entry_times, exit_times, tree_name_to_nidx = _build_euler_tour(tree)
-    logger.info(
-        "Euler tour built for {:,} named nodes", len(tree_name_to_nidx))
+    logger.info("Euler tour built for {:,} named nodes",
+                len(tree_name_to_nidx))
 
     # -- Load graph ----------------------------------------------------------
     adj, colors = _load_graph_and_colors(args.db)
@@ -789,8 +888,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     N_unitigs = len(unitig_list)
 
     # Cut-string index for each unitig (int array indexed by unitig integer)
-    cut_idx_array = np.array(
-        [cut_to_idx[colors[uid]] for uid in unitig_list], dtype=np.int32)
+    cut_idx_array = np.array([cut_to_idx[colors[uid]] for uid in unitig_list],
+                             dtype=np.int32)
 
     # -- Select seeds --------------------------------------------------------
     rng = np.random.default_rng(args.seed)
@@ -799,8 +898,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         seed_ints = list(range(N_unitigs))
         logger.info("Using all {:,} unitigs as seeds", n_seeds)
     else:
-        seed_ints = list(
-            rng.choice(N_unitigs, size=n_seeds, replace=False))
+        seed_ints = list(rng.choice(N_unitigs, size=n_seeds, replace=False))
         logger.info("Sampled {:,} seed unitigs", n_seeds)
 
     # -- BFS from each seed --------------------------------------------------
@@ -825,10 +923,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             (seed_ints, 0))
     else:
         chunks = np.array_split(seed_ints, n_jobs)
-        worker_args = [
-            (list(chunk), i)
-            for i, chunk in enumerate(chunks) if len(chunk) > 0
-        ]
+        worker_args = [(list(chunk), i) for i, chunk in enumerate(chunks)
+                       if len(chunk) > 0]
 
         total_reached = np.zeros(args.max_hops, dtype=np.int64)
         total_strict = np.zeros(args.max_hops, dtype=np.int64)
@@ -837,30 +933,32 @@ def main(argv: Sequence[str] | None = None) -> None:
         ctx = mp.get_context("fork")
         with ctx.Pool(n_jobs) as pool:
             for reached, strict, ancdesc in pool.imap_unordered(
-                _worker_bfs, worker_args
-            ):
+                    _worker_bfs, worker_args):
                 total_reached += reached
                 total_strict += strict
                 total_ancdesc += ancdesc
 
-    logger.info(
-        "BFS complete: {:,} seeds in {:.1f}s", n_seeds, time.time() - t0)
+    logger.info("BFS complete: {:,} seeds in {:.1f}s", n_seeds,
+                time.time() - t0)
 
     # -- Compute coherence and null ------------------------------------------
     with np.errstate(divide="ignore", invalid="ignore"):
-        coherence_strict = np.where(
-            total_reached > 0,
-            total_strict / total_reached,
-            np.nan)
-        coherence_ancdesc = np.where(
-            total_reached > 0,
-            total_ancdesc / total_reached,
-            np.nan)
+        coherence_strict = np.where(total_reached > 0,
+                                    total_strict / total_reached, np.nan)
+        coherence_ancdesc = np.where(total_reached > 0,
+                                     total_ancdesc / total_reached, np.nan)
 
     null_strict = _simpson_index(colors)
+<<<<<<< HEAD
     null_ancdesc = _concordance_null(
         colors, unique_cuts, concordance_table, parsed_nidx, top_k_set,
         entry_times, exit_times, simple_nidx, rng)
+=======
+    null_ancdesc = _concordance_null(colors, unique_cuts, concordance_table,
+                                     parsed_cuts, top_k_set, entry_times,
+                                     exit_times, tree_name_to_nidx,
+                                     simple_nidx, rng)
+>>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
     logger.info("Null strict (Simpson index): {:.6f}", null_strict)
     logger.info("Null anc/desc: {:.6f}", null_ancdesc)
@@ -870,19 +968,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     hops = np.arange(1, args.max_hops + 1)
 
     with args.output.open("w") as out:
-        out.write(
-            "hop_distance\tn_pairs\tn_strict_coherent\t"
-            "n_ancdesc_coherent\tstrict_coherence\t"
-            "ancdesc_coherence\tnull_strict\tnull_ancdesc\n")
+        out.write("hop_distance\tn_pairs\tn_strict_coherent\t"
+                  "n_ancdesc_coherent\tstrict_coherence\t"
+                  "ancdesc_coherence\tnull_strict\tnull_ancdesc\n")
         for h in range(args.max_hops):
             s_str = (f"{coherence_strict[h]:.6f}"
                      if not np.isnan(coherence_strict[h]) else "NA")
             c_str = (f"{coherence_ancdesc[h]:.6f}"
                      if not np.isnan(coherence_ancdesc[h]) else "NA")
-            out.write(
-                f"{hops[h]}\t{total_reached[h]}\t{total_strict[h]}\t"
-                f"{total_ancdesc[h]}\t{s_str}\t"
-                f"{c_str}\t{null_strict:.6f}\t{null_ancdesc:.6f}\n")
+            out.write(f"{hops[h]}\t{total_reached[h]}\t{total_strict[h]}\t"
+                      f"{total_ancdesc[h]}\t{s_str}\t"
+                      f"{c_str}\t{null_strict:.6f}\t{null_ancdesc:.6f}\n")
 
     logger.info("Output written to {}", args.output)
 
@@ -891,9 +987,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         valid = ~np.isnan(coherence_strict) & ~np.isnan(coherence_ancdesc)
         if np.any(valid):
             args.plot.parent.mkdir(parents=True, exist_ok=True)
-            _plot_decay(
-                hops[valid], coherence_strict[valid], coherence_ancdesc[valid],
-                null_strict, null_ancdesc, args.plot)
+            _plot_decay(hops[valid], coherence_strict[valid],
+                        coherence_ancdesc[valid], null_strict, null_ancdesc,
+                        args.plot)
         else:
             logger.warning("No valid coherence data to plot")
 
@@ -905,17 +1001,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"Null strict:          {null_strict:.6f}", file=sys.stderr)
     print(f"Null anc/desc:        {null_ancdesc:.6f}", file=sys.stderr)
     if not np.isnan(coherence_strict[0]):
-        print(
-            f"Strict (h=1):         {coherence_strict[0]:.6f}",
-            file=sys.stderr)
-        print(
-            f"Anc/desc (h=1):       {coherence_ancdesc[0]:.6f}",
-            file=sys.stderr)
+        print(f"Strict (h=1):         {coherence_strict[0]:.6f}",
+              file=sys.stderr)
+        print(f"Anc/desc (h=1):       {coherence_ancdesc[0]:.6f}",
+              file=sys.stderr)
     # Find hop where each curve first drops below its null
-    cross_s = np.where(
-        (coherence_strict <= null_strict) & ~np.isnan(coherence_strict))[0]
-    cross_c = np.where(
-        (coherence_ancdesc <= null_ancdesc) & ~np.isnan(coherence_ancdesc))[0]
+    cross_s = np.where((coherence_strict <= null_strict)
+                       & ~np.isnan(coherence_strict))[0]
+    cross_c = np.where((coherence_ancdesc <= null_ancdesc)
+                       & ~np.isnan(coherence_ancdesc))[0]
     print(
         f"Strict crosses null:  "
         f"{'hop ' + str(hops[cross_s[0]]) if len(cross_s) > 0 else 'never (within max-hops)'}",

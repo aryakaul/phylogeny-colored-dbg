@@ -10,16 +10,23 @@ _USE_FITCH_SCRIPT = parsimony_mode() == "fitch"
 rule minimal_cuts_percolorset:
     output:
         cuts=fn_minimalcuts(_batch="{batch}"),
-        colors=fn_minimalcuts_colors(_batch="{batch}") if PRODUCE_MINIMALCUTS_COLORS else [],
+        colors=fn_minimalcuts_colors(_batch="{batch}")
+        if PRODUCE_MINIMALCUTS_COLORS
+        else [],
     input:
         tree=fn_tree_sorted(_batch="{batch}"),
         uqcolors=fn_uqcolors(_batch="{batch}"),
     params:
-        script=str(SCRIPTS_DIR / ("minimal_cuts_fitch" if _USE_FITCH_SCRIPT else "minimal_cuts")),
+        script=str(
+            SCRIPTS_DIR
+            / ("minimal_cuts_fitch" if _USE_FITCH_SCRIPT else "minimal_cuts")
+        ),
         chunksize=5000,
         mode=parsimony_mode(),
         branch_penalty_flag=parsimony_branch_penalty_flag(),
-        colors_flag=lambda wc: f"-c {fn_minimalcuts_colors(batch=wc.batch)}" if PRODUCE_MINIMALCUTS_COLORS else "",
+        colors_flag=lambda wc: f"-c {fn_minimalcuts_colors(batch = wc.batch)}"
+        if PRODUCE_MINIMALCUTS_COLORS
+        else "",
         use_fitch=_USE_FITCH_SCRIPT,
     conda:
         "../envs/ete4.yml"
