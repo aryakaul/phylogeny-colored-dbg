@@ -3,8 +3,8 @@
 
 Characterizes the phylogenetic distance between flanking evolutionary
 histories at the boundaries of co-inherited blocks.  For every edge,
-determines concordance (via set containment) or discordance.  For
-discordant edges, computes tree distance and a sampling-based p-value.
+determines concordance (via ancestor-descendant matching) or discordance.
+For discordant edges, computes tree distance and a sampling-based p-value.
 
 The null model asks: "if phylogenetic assignments had no spatial
 structure, what distribution of tree distances would we see at
@@ -67,6 +67,48 @@ def _configure_logger(verbosity: int) -> None:
                  else logging.INFO if verbosity == 1
                  else logging.DEBUG)
         logging.basicConfig(level=level, stream=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Tree: Euler tour for O(1) ancestor-descendant queries
+# ---------------------------------------------------------------------------
+
+def _build_euler_tour(
+    tree: Tree,
+    name_to_nidx: Dict[str, int] | None = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """Euler-tour entry/exit times for O(1) ancestor-descendant queries.
+
+    Returns:
+        entry  -- int32 array indexed by node index, DFS entry time
+        exit_  -- int32 array indexed by node index, DFS exit time
+        name_to_nidx -- mapping from node name to index (built or reused)
+    """
+    if name_to_nidx is None:
+        named_nodes = sorted({n.name for n in tree.traverse() if n.name})
+        name_to_nidx = {n: i for i, n in enumerate(named_nodes)}
+    N = len(name_to_nidx)
+
+    entry = np.zeros(N, dtype=np.int32)
+    exit_ = np.zeros(N, dtype=np.int32)
+
+    clock = 0
+    stack: List[Tuple[Tree, bool]] = [(tree, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            if node.name and node.name in name_to_nidx:
+                exit_[name_to_nidx[node.name]] = clock
+            clock += 1
+        else:
+            if node.name and node.name in name_to_nidx:
+                entry[name_to_nidx[node.name]] = clock
+            clock += 1
+            stack.append((node, True))
+            for child in reversed(node.children):
+                stack.append((child, False))
+
+    return entry, exit_, name_to_nidx
 
 
 # ---------------------------------------------------------------------------
@@ -143,15 +185,64 @@ def _parse_cutstring(raw: str) -> List[FrozenSet[str]]:
     return alts
 
 
-def _containment_check(
+def _is_anc_or_desc(
+    a: int, b: int,
+    entry: np.ndarray, exit_: np.ndarray,
+) -> bool:
+    """O(1) ancestor-or-descendant check via Euler-tour times."""
+    return ((entry[a] <= entry[b] and exit_[b] <= exit_[a]) or
+            (entry[b] <= entry[a] and exit_[a] <= exit_[b]))
+
+
+def _concordance_check(
     sols_a: List[FrozenSet[str]],
     sols_b: List[FrozenSet[str]],
+    entry: np.ndarray,
+    exit_: np.ndarray,
+    name_to_nidx: Dict[str, int],
 ) -> bool:
-    """True if any pair of solutions satisfies set containment."""
+    """True if any pair of alternative solutions has a concordant matching.
+
+    A concordant matching is an injective mapping from the smaller set into
+    the larger where every mapped pair is in an ancestor-descendant-or-equal
+    relationship on the tree.
+    """
     for sa in sols_a:
         for sb in sols_b:
-            if sa <= sb or sb <= sa:
+            if _injective_ancdesc_match(sa, sb, entry, exit_, name_to_nidx):
                 return True
+    return False
+
+
+def _injective_ancdesc_match(
+    set_a: FrozenSet[str],
+    set_b: FrozenSet[str],
+    entry: np.ndarray,
+    exit_: np.ndarray,
+    name_to_nidx: Dict[str, int],
+) -> bool:
+    """Check if an injective anc/desc matching exists from smaller into larger."""
+    # Resolve to indices, skip unknown nodes
+    idx_a = [name_to_nidx[n] for n in set_a if n in name_to_nidx]
+    idx_b = [name_to_nidx[n] for n in set_b if n in name_to_nidx]
+    if not idx_a or not idx_b:
+        return False
+
+    # Ensure |small| <= |large|
+    if len(idx_a) > len(idx_b):
+        idx_a, idx_b = idx_b, idx_a
+
+    # Single vs single: O(1)
+    if len(idx_a) == 1:
+        a = idx_a[0]
+        return any(_is_anc_or_desc(a, b, entry, exit_) for b in idx_b)
+
+    # Multi vs multi: brute-force injective matchings (sets are tiny, 2-4 nodes)
+    from itertools import permutations
+    for perm in permutations(idx_b, len(idx_a)):
+        if all(_is_anc_or_desc(idx_a[i], perm[i], entry, exit_)
+               for i in range(len(idx_a))):
+            return True
     return False
 
 
@@ -264,13 +355,15 @@ def _build_pair_cache(
     simple_node_idx: np.ndarray,
     node_dist_np: np.ndarray,
     name_to_nidx: Dict[str, int],
+    entry: np.ndarray,
+    exit_: np.ndarray,
 ) -> Tuple[Dict[Tuple[int, int], Tuple[bool, float]], int, int, int]:
     """Score every unique (cs_a, cs_b) pair that appears at an edge.
 
     Returns:
         cache        -- {(min_idx, max_idx): (concordant, distance)}
         n_identical  -- count of edges with identical cut-strings
-        n_containment -- count of edges concordant by containment (not identical)
+        n_concordant_ad -- count of edges concordant by anc/desc (not identical)
         n_discordant -- count of discordant edges
     """
     E = len(all_cs_a)
@@ -291,7 +384,7 @@ def _build_pair_cache(
         "Scoring {:,} unique non-identical pairs (from {:,} edges)",
         len(unique_pairs), len(diff_indices))
 
-    n_containment_pairs = 0
+    n_concordant_ad_pairs = 0
     n_discordant_pairs = 0
 
     for a, b in unique_pairs:
@@ -300,9 +393,9 @@ def _build_pair_cache(
         if key in cache:
             continue
 
-        if _containment_check(parsed_cs[a], parsed_cs[b]):
+        if _concordance_check(parsed_cs[a], parsed_cs[b], entry, exit_, name_to_nidx):
             cache[key] = (True, 0.0)
-            n_containment_pairs += 1
+            n_concordant_ad_pairs += 1
         else:
             dist = _pair_distance(
                 a, b, is_simple, simple_node_idx,
@@ -311,24 +404,24 @@ def _build_pair_cache(
             n_discordant_pairs += 1
 
     # Map unique-pair results back to edge counts
-    n_containment_edges = 0
+    n_concordant_ad_edges = 0
     n_discordant_edges = 0
     for ei in diff_indices:
         a, b = int(all_cs_a[ei]), int(all_cs_b[ei])
         key = (min(a, b), max(a, b))
         conc, _ = cache[key]
         if conc:
-            n_containment_edges += 1
+            n_concordant_ad_edges += 1
         else:
             n_discordant_edges += 1
 
     logger.info(
-        "Edge breakdown: {:,} identical, {:,} containment-concordant, "
+        "Edge breakdown: {:,} identical, {:,} anc/desc-concordant, "
         "{:,} discordant ({:,} unique discordant pairs)",
-        n_identical, n_containment_edges, n_discordant_edges,
+        n_identical, n_concordant_ad_edges, n_discordant_edges,
         n_discordant_pairs)
 
-    return cache, n_identical, n_containment_edges, n_discordant_edges
+    return cache, n_identical, n_concordant_ad_edges, n_discordant_edges
 
 
 def _lookup_pair(
@@ -339,6 +432,8 @@ def _lookup_pair(
     simple_node_idx: np.ndarray,
     node_dist_np: np.ndarray,
     name_to_nidx: Dict[str, int],
+    entry: np.ndarray,
+    exit_: np.ndarray,
 ) -> Tuple[bool, float]:
     """Look up or compute a pair result.  Cache miss → on-the-fly."""
     if a == b:
@@ -348,7 +443,7 @@ def _lookup_pair(
     if result is not None:
         return result
     # Cache miss: compute on the fly
-    if _containment_check(parsed_cs[a], parsed_cs[b]):
+    if _concordance_check(parsed_cs[a], parsed_cs[b], entry, exit_, name_to_nidx):
         return (True, 0.0)
     dist = _pair_distance(
         a, b, is_simple, simple_node_idx,
@@ -379,6 +474,8 @@ def _null_worker(args_tuple):
     simple_node_idx = _SHARED["simple_node_idx"]
     node_dist_np = _SHARED["node_dist_np"]
     name_to_nidx = _SHARED["name_to_nidx"]
+    entry = _SHARED["entry"]
+    exit_ = _SHARED["exit_"]
 
     rng = np.random.default_rng(seed)
     idx_a = rng.choice(n_cs, size=n_samples, p=endpoint_probs)
@@ -391,7 +488,8 @@ def _null_worker(args_tuple):
         a, b = int(idx_a[k]), int(idx_b[k])
         conc, dist = _lookup_pair(
             a, b, pair_cache, parsed_cs,
-            is_simple, simple_node_idx, node_dist_np, name_to_nidx)
+            is_simple, simple_node_idx, node_dist_np, name_to_nidx,
+            entry, exit_)
         if conc:
             n_concordant += 1
         elif dist >= 0:
@@ -476,7 +574,7 @@ def _plot_boundary_severity(
     null_sorted: np.ndarray,
     n_concordant: int,
     n_identical: int,
-    n_containment: int,
+    n_concordant_ad: int,
     ks_stat: float,
     output_path: Path,
 ) -> None:
@@ -513,13 +611,13 @@ def _plot_boundary_severity(
                          label=f"Mean null = {mean_null:.2f}")
 
     pct_identical = 100.0 * n_identical / max(n_concordant, 1)
-    pct_containment = 100.0 * n_containment / max(n_concordant, 1)
+    pct_ancdesc = 100.0 * n_concordant_ad / max(n_concordant, 1)
     ax1.set_xlabel("Tree distance")
     ax1.set_ylabel("Density")
     ax1.set_title(
         f"Discordant edge distances\n"
         f"({n_concordant:,} concordant excluded: "
-        f"{pct_identical:.0f}% identical, {pct_containment:.0f}% containment)")
+        f"{pct_identical:.0f}% identical, {pct_ancdesc:.0f}% anc/desc)")
     ax1.annotate(f"KS = {ks_stat:.4f}", xy=(0.97, 0.97),
                  xycoords="axes fraction", ha="right", va="top",
                  fontsize=9, bbox=dict(boxstyle="round,pad=0.3",
@@ -615,6 +713,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     name_to_nidx = {n: i for i, n in enumerate(node_names)}
     logger.info("Node distances computed in {:.1f}s", time.time() - t0)
 
+    # Euler tour for O(1) ancestor-descendant queries
+    entry_np, exit_np, _ = _build_euler_tour(tree, name_to_nidx)
+    logger.info("Euler tour built for {:,} named nodes", len(name_to_nidx))
+
     if diameter == 0:
         logger.error("Tree diameter is 0; cannot normalize distances.")
         sys.exit(1)
@@ -691,10 +793,11 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     # -- Build pair cache: score all unique co-occurring pairs ---------------
     t0 = time.time()
-    pair_cache, n_identical, n_containment, n_discordant = _build_pair_cache(
+    pair_cache, n_identical, n_concordant_ad, n_discordant = _build_pair_cache(
         all_cs_a, all_cs_b, parsed_cs,
-        is_simple, simple_node_idx, node_dist_np, name_to_nidx)
-    n_concordant = n_identical + n_containment
+        is_simple, simple_node_idx, node_dist_np, name_to_nidx,
+        entry_np, exit_np)
+    n_concordant = n_identical + n_concordant_ad
     logger.info("Pair cache built in {:.1f}s ({:,} entries)",
                 time.time() - t0, len(pair_cache))
 
@@ -763,6 +866,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         _SHARED["simple_node_idx"] = simple_node_idx
         _SHARED["node_dist_np"] = node_dist_np
         _SHARED["name_to_nidx"] = name_to_nidx
+        _SHARED["entry"] = entry_np
+        _SHARED["exit_"] = exit_np
 
         t0 = time.time()
         logger.info(
@@ -847,8 +952,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"    Identical:                {n_identical:,} "
         f"({100.0 * n_identical / max(E_all, 1):.1f}%)", file=sys.stderr)
     print(
-        f"    Containment:              {n_containment:,} "
-        f"({100.0 * n_containment / max(E_all, 1):.1f}%)", file=sys.stderr)
+        f"    Anc/desc concordance:     {n_concordant_ad:,} "
+        f"({100.0 * n_concordant_ad / max(E_all, 1):.1f}%)", file=sys.stderr)
     print(f"  Discordant:                 {n_discordant:,} "
           f"({100.0 * n_discordant / max(E_all, 1):.1f}%)", file=sys.stderr)
 
@@ -881,7 +986,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.plot is not None and n_valid_discordant > 0:
         _plot_boundary_severity(
             observed_discordant_dists, null_sorted,
-            n_concordant, n_identical, n_containment,
+            n_concordant, n_identical, n_concordant_ad,
             ks_stat, args.plot)
 
 

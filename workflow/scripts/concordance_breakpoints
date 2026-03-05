@@ -51,6 +51,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
+import numpy as np
+
 from ete4 import Tree
 from loguru import logger
 
@@ -96,6 +98,43 @@ def build_node_depth_map(tree: Tree) -> Dict[str, int]:
 def build_node_lookup(tree: Tree) -> Dict[str, Tree]:
     """Build a mapping from node name to node object for fast lookup."""
     return {node.name: node for node in tree.traverse() if node.name}
+
+
+def _build_euler_tour(
+    tree: Tree,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """Euler-tour entry/exit times for O(1) ancestor-descendant queries.
+
+    Returns:
+        entry  -- int32 array indexed by node index, DFS entry time
+        exit_  -- int32 array indexed by node index, DFS exit time
+        name_to_nidx -- mapping from node name to index
+    """
+    named_nodes = [n.name for n in tree.traverse() if n.name]
+    name_to_nidx = {n: i for i, n in enumerate(sorted(set(named_nodes)))}
+    N = len(name_to_nidx)
+
+    entry = np.zeros(N, dtype=np.int32)
+    exit_ = np.zeros(N, dtype=np.int32)
+
+    clock = 0
+    # Iterative DFS to avoid recursion limits
+    stack: List[Tuple[Tree, bool]] = [(tree, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            if node.name and node.name in name_to_nidx:
+                exit_[name_to_nidx[node.name]] = clock
+            clock += 1
+        else:
+            if node.name and node.name in name_to_nidx:
+                entry[name_to_nidx[node.name]] = clock
+            clock += 1
+            stack.append((node, True))
+            for child in reversed(node.children):
+                stack.append((child, False))
+
+    return entry, exit_, name_to_nidx
 
 
 def compute_tree_distance(
@@ -191,6 +230,9 @@ def get_primary_assignment(raw_colors: str) -> Optional[str]:
 def detect_breakpoints(
     db_path: Path,
     tree: Tree,
+    entry: np.ndarray,
+    exit_: np.ndarray,
+    euler_nidx: Dict[str, int],
     min_tree_distance: int = 1,
 ) -> List[Dict]:
     """
@@ -199,6 +241,9 @@ def detect_breakpoints(
     Args:
         db_path: Path to SQLite database
         tree: Phylogenetic tree
+        entry: Euler-tour entry times (int32 array)
+        exit_: Euler-tour exit times (int32 array)
+        euler_nidx: node name → Euler-tour index
         min_tree_distance: Minimum tree distance to report as breakpoint
 
     Returns:
@@ -228,7 +273,8 @@ def detect_breakpoints(
 
     breakpoints = []
     total_edges = 0
-    concordant = 0
+    concordant_identical = 0
+    concordant_ancdesc = 0
     discordant = 0
     unassigned = 0
 
@@ -247,8 +293,17 @@ def detect_breakpoints(
 
         # Check if assignments are the same
         if assign_a == assign_b:
-            concordant += 1
+            concordant_identical += 1
             continue
+
+        # Check ancestor-descendant relationship (O(1) via Euler tour)
+        nidx_a = euler_nidx.get(assign_a)
+        nidx_b = euler_nidx.get(assign_b)
+        if nidx_a is not None and nidx_b is not None:
+            if ((entry[nidx_a] <= entry[nidx_b] and exit_[nidx_b] <= exit_[nidx_a]) or
+                (entry[nidx_b] <= entry[nidx_a] and exit_[nidx_a] <= exit_[nidx_b])):
+                concordant_ancdesc += 1
+                continue
 
         # Compute tree distance between assignments
         tree_dist, mrca = compute_tree_distance(assign_a, assign_b, node_lookup)
@@ -284,8 +339,10 @@ def detect_breakpoints(
     conn.close()
 
     logger.info(
-        "Scan complete: {:,} total edges, {:,} concordant, {:,} discordant, {:,} unassigned",
-        total_edges, concordant, discordant, unassigned
+        "Scan complete: {:,} total edges, {:,} concordant ({:,} identical + {:,} anc/desc), "
+        "{:,} discordant, {:,} unassigned",
+        total_edges, concordant_identical + concordant_ancdesc,
+        concordant_identical, concordant_ancdesc, discordant, unassigned
     )
 
     return breakpoints
@@ -355,10 +412,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     logger.info("Loading tree from {}", args.tree)
     tree = load_tree(args.tree)
 
+    logger.info("Building Euler tour for ancestor-descendant queries")
+    entry_times, exit_times, euler_nidx = _build_euler_tour(tree)
+
     logger.info("Detecting breakpoints from {}", args.database)
     breakpoints = detect_breakpoints(
         args.database,
         tree,
+        entry_times,
+        exit_times,
+        euler_nidx,
         min_tree_distance=args.min_distance,
     )
 

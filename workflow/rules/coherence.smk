@@ -48,6 +48,7 @@ rule evolutionary_persistence:
     """
     input:
         sqldb=fn_sqldb(_batch="{batch}"),
+        tree=fn_tree_sorted(_batch="{batch}"),
     output:
         tsv=fn_evolutionary_persistence(_batch="{batch}"),
         plot=fn_evolutionary_persistence_plot(_batch="{batch}"),
@@ -63,6 +64,7 @@ rule evolutionary_persistence:
         mkdir -p $(dirname {output.tsv})
         {params.script} \\
             --db {input.sqldb} \\
+            --tree {input.tree} \\
             --max-hops {params.max_hops} \\
             --samples {params.samples} \\
             --jobs {threads} \\
