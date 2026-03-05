@@ -234,27 +234,12 @@ def _injective_ancdesc_match_nidx(
                 return True
         return False
 
-<<<<<<< HEAD
     # Larger sets: bipartite matching
     adj_lists: List[List[int]] = []
     for a in ta:
         adj_lists.append([j for j, b in enumerate(tb)
                           if _is_anc_or_desc(a, b, entry, exit_)])
     return _max_bipartite_matching(adj_lists, len(tb)) == len(ta)
-=======
-    # Single vs single/multi: O(1) or O(|larger|)
-    if len(idx_a) == 1:
-        a = idx_a[0]
-        return any(_is_anc_or_desc(a, b, entry, exit_) for b in idx_b)
-
-    # Multi vs multi: brute-force injective matchings (sets are tiny, 2-4 nodes)
-    for perm in permutations(idx_b, len(idx_a)):
-        if all(
-                _is_anc_or_desc(idx_a[i], perm[i], entry, exit_)
-                for i in range(len(idx_a))):
-            return True
-    return False
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
 
 # ---------------------------------------------------------------------------
@@ -347,20 +332,9 @@ def _build_concordance_table(
     exit_: np.ndarray,
     tree_name_to_nidx: Dict[str, int],
 ) -> Tuple[
-<<<<<<< HEAD
     List[str], Dict[str, int],
     np.ndarray | None, set | None, List[int] | None, Dict[int, int] | None,
     List[List[FrozenSet[str]]], np.ndarray, List[List[Tuple[int, ...]]],
-=======
-        List[str],
-        Dict[str, int],
-        np.ndarray | None,
-        set | None,
-        List[int] | None,
-        Dict[int, int] | None,
-        List[List[FrozenSet[str]]],
-        np.ndarray,
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 ]:
     """Build concordance table for the top-K most frequent cut-strings.
 
@@ -428,30 +402,18 @@ def _build_concordance_table(
                                        exit_):
                         concordance_table[i, j] = True
                         concordance_table[j, i] = True
-<<<<<<< HEAD
                 elif _concordance_check_nidx(parsed_nidx[i], parsed_nidx[j],
                                             entry, exit_):
-=======
-                elif _concordance_check(parsed_cuts[i], parsed_cuts[j], entry,
-                                        exit_, tree_name_to_nidx):
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
                     concordance_table[i, j] = True
                     concordance_table[j, i] = True
         elapsed = time.time() - t0
         n_concordant = int(concordance_table.sum()) - M
         logger.info(
             "Full concordance table built in {:.1f}s: {:,} coherent pairs "
-<<<<<<< HEAD
             "(of {:,} off-diagonal)",
             elapsed, n_concordant // 2, M * (M - 1) // 2)
         return (unique_cuts, cut_to_idx, concordance_table,
                 None, None, None, parsed_cuts, simple_nidx, parsed_nidx)
-=======
-            "(of {:,} off-diagonal)", elapsed, n_concordant // 2,
-            M * (M - 1) // 2)
-        return (unique_cuts, cut_to_idx, concordance_table, None, None, None,
-                parsed_cuts, simple_nidx)
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
     # Large M: build top-K table covering ~90% of unitigs
     total = sum(cut_counts.values())
@@ -487,14 +449,8 @@ def _build_concordance_table(
                                    simple_nidx[j_global], entry, exit_):
                     concordance_table[i_local, j_local] = True
                     concordance_table[j_local, i_local] = True
-<<<<<<< HEAD
             elif _concordance_check_nidx(parsed_nidx[i_global], parsed_nidx[j_global],
                                         entry, exit_):
-=======
-            elif _concordance_check(parsed_cuts[i_global],
-                                    parsed_cuts[j_global], entry, exit_,
-                                    tree_name_to_nidx):
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
                 concordance_table[i_local, j_local] = True
                 concordance_table[j_local, i_local] = True
     elapsed = time.time() - t0
@@ -503,14 +459,9 @@ def _build_concordance_table(
         "Top-K concordance table built in {:.1f}s: {:,} coherent pairs",
         elapsed, n_concordant // 2)
 
-<<<<<<< HEAD
     return (unique_cuts, cut_to_idx, concordance_table,
             top_k_set, top_k_list, top_k_to_local, parsed_cuts, simple_nidx,
             parsed_nidx)
-=======
-    return (unique_cuts, cut_to_idx, concordance_table, top_k_set, top_k_list,
-            top_k_to_local, parsed_cuts, simple_nidx)
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
 
 # ---------------------------------------------------------------------------
@@ -597,15 +548,9 @@ def _bfs_coherence(
                             if _is_anc_or_desc(seed_snidx, nb_snidx, entry,
                                                exit_):
                                 n_ancdesc[h] += 1
-<<<<<<< HEAD
                         elif _concordance_check_nidx(
                                 seed_nidx, parsed_nidx[nb_cidx],
                                 entry, exit_):
-=======
-                        elif _concordance_check(seed_parsed,
-                                                parsed_cuts[nb_cidx], entry,
-                                                exit_, tree_name_to_nidx):
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
                             n_ancdesc[h] += 1
 
         frontier = next_frontier
@@ -644,16 +589,10 @@ def _worker_bfs(args_tuple):
 
     for i, s in enumerate(seed_ints):
         reached, strict, ancdesc = _bfs_coherence(
-<<<<<<< HEAD
             s, csr_offsets, csr_neighbors, cut_idx_array,
             n_unitigs, max_hops, concordance_table, parsed_nidx,
             simple_nidx, top_k_set, top_k_to_local,
             entry, exit_)
-=======
-            s, csr_offsets, csr_neighbors, cut_idx_array, n_unitigs, max_hops,
-            concordance_table, parsed_cuts, simple_nidx, top_k_set,
-            top_k_to_local, entry, exit_, tree_name_to_nidx)
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
         total_reached += reached
         total_strict += strict
         total_ancdesc += ancdesc
@@ -727,13 +666,8 @@ def _concordance_null(
         elif simple_nidx[i] >= 0 and simple_nidx[j] >= 0:
             if _is_anc_or_desc(simple_nidx[i], simple_nidx[j], entry, exit_):
                 n_coherent += 1
-<<<<<<< HEAD
         elif _concordance_check_nidx(parsed_nidx[i], parsed_nidx[j],
                                      entry, exit_):
-=======
-        elif _concordance_check(parsed_cuts[i], parsed_cuts[j], entry, exit_,
-                                tree_name_to_nidx):
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
             n_coherent += 1
 
     estimate = n_coherent / n_samples
@@ -949,16 +883,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                                      total_ancdesc / total_reached, np.nan)
 
     null_strict = _simpson_index(colors)
-<<<<<<< HEAD
     null_ancdesc = _concordance_null(
         colors, unique_cuts, concordance_table, parsed_nidx, top_k_set,
         entry_times, exit_times, simple_nidx, rng)
-=======
-    null_ancdesc = _concordance_null(colors, unique_cuts, concordance_table,
-                                     parsed_cuts, top_k_set, entry_times,
-                                     exit_times, tree_name_to_nidx,
-                                     simple_nidx, rng)
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
     logger.info("Null strict (Simpson index): {:.6f}", null_strict)
     logger.info("Null anc/desc: {:.6f}", null_ancdesc)

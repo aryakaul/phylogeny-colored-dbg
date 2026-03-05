@@ -276,28 +276,12 @@ def _injective_ancdesc_match_nidx(
                 return True
         return False
 
-<<<<<<< HEAD
     # Larger sets: bipartite matching
     adj: List[List[int]] = []
     for a in ta:
         adj.append([j for j, b in enumerate(tb)
                      if _is_anc_or_desc(a, b, entry, exit_)])
     return _max_bipartite_matching(adj, len(tb)) == len(ta)
-=======
-    # Single vs single: O(1)
-    if len(idx_a) == 1:
-        a = idx_a[0]
-        return any(_is_anc_or_desc(a, b, entry, exit_) for b in idx_b)
-
-    # Multi vs multi: brute-force injective matchings (sets are tiny, 2-4 nodes)
-    from itertools import permutations
-    for perm in permutations(idx_b, len(idx_a)):
-        if all(
-                _is_anc_or_desc(idx_a[i], perm[i], entry, exit_)
-                for i in range(len(idx_a))):
-            return True
-    return False
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
 
 
 def _classify_cutstrings(
@@ -461,7 +445,6 @@ def _build_pair_cache(
         if key in cache:
             continue
 
-<<<<<<< HEAD
         # Fast path: both simple → single O(1) anc/desc check
         if is_simple[a] and is_simple[b]:
             na, nb = int(simple_node_idx[a]), int(simple_node_idx[b])
@@ -469,7 +452,6 @@ def _build_pair_cache(
                 cache[key] = (True, 0.0)
                 n_concordant_ad_pairs += 1
                 continue
-            # Not concordant, fall through to distance
         elif _concordance_check_nidx(
                 parsed_nidx[a], parsed_nidx[b], entry, exit_):
             cache[key] = (True, 0.0)
@@ -477,20 +459,11 @@ def _build_pair_cache(
             continue
 
         # Discordant: compute distance
-            dist = _pair_distance(
-                a, b, is_simple, simple_node_idx,
-                node_dist_np, parsed_cs, name_to_nidx)
-=======
-        if _concordance_check(parsed_cs[a], parsed_cs[b], entry, exit_,
-                              name_to_nidx):
-            cache[key] = (True, 0.0)
-            n_concordant_ad_pairs += 1
-        else:
-            dist = _pair_distance(a, b, is_simple, simple_node_idx,
-                                  node_dist_np, parsed_cs, name_to_nidx)
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
-            cache[key] = (False, dist)
-            n_discordant_pairs += 1
+        dist = _pair_distance(
+            a, b, is_simple, simple_node_idx,
+            node_dist_np, parsed_cs, name_to_nidx)
+        cache[key] = (False, dist)
+        n_discordant_pairs += 1
 
     # Map unique-pair results back to edge counts
     n_concordant_ad_edges = 0
@@ -533,17 +506,12 @@ def _lookup_pair(
     if result is not None:
         return result
     # Cache miss: compute on the fly
-<<<<<<< HEAD
     if is_simple[a] and is_simple[b]:
         na, nb = int(simple_node_idx[a]), int(simple_node_idx[b])
         if _is_anc_or_desc(na, nb, entry, exit_):
             return (True, 0.0)
     elif _concordance_check_nidx(
             parsed_nidx[a], parsed_nidx[b], entry, exit_):
-=======
-    if _concordance_check(parsed_cs[a], parsed_cs[b], entry, exit_,
-                          name_to_nidx):
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
         return (True, 0.0)
     dist = _pair_distance(a, b, is_simple, simple_node_idx, node_dist_np,
                           parsed_cs, name_to_nidx)
@@ -586,17 +554,11 @@ def _null_worker(args_tuple):
 
     for k in range(n_samples):
         a, b = int(idx_a[k]), int(idx_b[k])
-<<<<<<< HEAD
         conc, dist = _lookup_pair(
             a, b, pair_cache, parsed_nidx,
             is_simple, simple_node_idx, node_dist_np,
             parsed_cs, name_to_nidx,
             entry, exit_)
-=======
-        conc, dist = _lookup_pair(a, b, pair_cache, parsed_cs, is_simple,
-                                  simple_node_idx, node_dist_np, name_to_nidx,
-                                  entry, exit_)
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
         if conc:
             n_concordant += 1
         elif dist >= 0:
@@ -955,14 +917,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     # -- Build pair cache: score all unique co-occurring pairs ---------------
     t0 = time.time()
     pair_cache, n_identical, n_concordant_ad, n_discordant = _build_pair_cache(
-<<<<<<< HEAD
         all_cs_a, all_cs_b, parsed_cs, parsed_nidx,
         is_simple, simple_node_idx, node_dist_np, name_to_nidx,
         entry_np, exit_np)
-=======
-        all_cs_a, all_cs_b, parsed_cs, is_simple, simple_node_idx,
-        node_dist_np, name_to_nidx, entry_np, exit_np)
->>>>>>> 9bab66ec0536a7212ff652685d8b957eac8b76e7
     n_concordant = n_identical + n_concordant_ad
     logger.info("Pair cache built in {:.1f}s ({:,} entries)",
                 time.time() - t0, len(pair_cache))
