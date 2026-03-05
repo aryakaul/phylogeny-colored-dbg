@@ -226,8 +226,8 @@ def _injective_ancdesc_match_nidx(
                 return True
         return False
 
-    # Small sets (≤5): brute-force permutations
-    if len(ta) <= 5:
+    # Small sets (≤2): brute-force permutations
+    if len(ta) <= 2:
         for perm in permutations(tb, len(ta)):
             if all(_is_anc_or_desc(ta[i], perm[i], entry, exit_)
                    for i in range(len(ta))):
@@ -391,7 +391,7 @@ def _build_concordance_table(
                 100.0 * n_simple / max(M, 1))
 
     # If M is small enough, build the full M×M table
-    if M <= 50_000:
+    if M <= 1_000:
         concordance_table = np.eye(M, dtype=np.bool_)
         t0 = time.time()
         for i in range(M):
@@ -439,7 +439,12 @@ def _build_concordance_table(
 
     concordance_table = np.eye(K, dtype=np.bool_)
     t0 = time.time()
+    total_pairs = K * (K - 1) // 2
     for i_local in range(K):
+        if i_local % 100 == 0 and i_local > 0:
+            done = i_local * K - i_local * (i_local + 1) // 2
+            logger.info("Top-K table: {:.1f}% ({:,}/{:,} pairs)",
+                        100.0 * done / max(total_pairs, 1), done, total_pairs)
         i_global = top_k_list[i_local]
         for j_local in range(i_local + 1, K):
             j_global = top_k_list[j_local]

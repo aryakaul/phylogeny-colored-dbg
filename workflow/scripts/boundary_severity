@@ -267,8 +267,8 @@ def _injective_ancdesc_match_nidx(
                 return True
         return False
 
-    # Small sets (≤5): brute-force permutations
-    if len(ta) <= 5:
+    # Small sets (≤2): brute-force permutations
+    if len(ta) <= 2:
         from itertools import permutations
         for perm in permutations(tb, len(ta)):
             if all(_is_anc_or_desc(ta[i], perm[i], entry, exit_)
