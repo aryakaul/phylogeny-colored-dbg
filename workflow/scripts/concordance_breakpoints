@@ -101,8 +101,7 @@ def build_node_lookup(tree: Tree) -> Dict[str, Tree]:
 
 
 def _build_euler_tour(
-    tree: Tree,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    tree: Tree, ) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
     """Euler-tour entry/exit times for O(1) ancestor-descendant queries.
 
     Returns:
@@ -300,20 +299,21 @@ def detect_breakpoints(
         nidx_a = euler_nidx.get(assign_a)
         nidx_b = euler_nidx.get(assign_b)
         if nidx_a is not None and nidx_b is not None:
-            if ((entry[nidx_a] <= entry[nidx_b] and exit_[nidx_b] <= exit_[nidx_a]) or
-                (entry[nidx_b] <= entry[nidx_a] and exit_[nidx_a] <= exit_[nidx_b])):
+            if ((entry[nidx_a] <= entry[nidx_b]
+                 and exit_[nidx_b] <= exit_[nidx_a])
+                    or (entry[nidx_b] <= entry[nidx_a]
+                        and exit_[nidx_a] <= exit_[nidx_b])):
                 concordant_ancdesc += 1
                 continue
 
         # Compute tree distance between assignments
-        tree_dist, mrca = compute_tree_distance(assign_a, assign_b, node_lookup)
+        tree_dist, mrca = compute_tree_distance(assign_a, assign_b,
+                                                node_lookup)
 
         if tree_dist < 0:
             # One or both nodes not found in tree
-            logger.debug(
-                "Could not compute distance for {} -> {}: {} vs {}",
-                row["unitig_a"], row["unitig_b"], assign_a, assign_b
-            )
+            logger.debug("Could not compute distance for {} -> {}: {} vs {}",
+                         row["unitig_a"], row["unitig_b"], assign_a, assign_b)
             continue
 
         if tree_dist >= min_tree_distance:
@@ -340,10 +340,9 @@ def detect_breakpoints(
 
     logger.info(
         "Scan complete: {:,} total edges, {:,} concordant ({:,} identical + {:,} anc/desc), "
-        "{:,} discordant, {:,} unassigned",
-        total_edges, concordant_identical + concordant_ancdesc,
-        concordant_identical, concordant_ancdesc, discordant, unassigned
-    )
+        "{:,} discordant, {:,} unassigned", total_edges,
+        concordant_identical + concordant_ancdesc, concordant_identical,
+        concordant_ancdesc, discordant, unassigned)
 
     return breakpoints
 
@@ -353,10 +352,9 @@ def write_breakpoints(breakpoints: List[Dict], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     columns = [
-        "unitig_a", "dir_a", "unitig_b", "dir_b",
-        "assignment_a", "assignment_b",
-        "depth_a", "depth_b", "tree_distance", "mrca",
-        "len_a", "len_b"
+        "unitig_a", "dir_a", "unitig_b", "dir_b", "assignment_a",
+        "assignment_b", "depth_a", "depth_b", "tree_distance", "mrca", "len_a",
+        "len_b"
     ]
 
     with output_path.open("w") as handle:
@@ -373,19 +371,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Detect concordance breakpoints in a phylogeny-colored DBG."
     )
     parser.add_argument(
-        "-d", "--database",
+        "-d",
+        "--database",
         type=Path,
         required=True,
         help="Path to pcDBG SQLite database.",
     )
     parser.add_argument(
-        "-t", "--tree",
+        "-t",
+        "--tree",
         type=Path,
         required=True,
         help="Path to Newick tree with named internal nodes.",
     )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         required=True,
         help="Output TSV file for breakpoints.",
@@ -397,7 +398,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Minimum tree distance to report as breakpoint (default: 1).",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="count",
         default=0,
         help="Increase verbosity (use twice for debug).",
@@ -430,10 +432,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     # Summary statistics
     if breakpoints:
         distances = [bp["tree_distance"] for bp in breakpoints]
-        logger.info(
-            "Tree distance distribution: min={}, max={}, mean={:.2f}",
-            min(distances), max(distances), sum(distances) / len(distances)
-        )
+        logger.info("Tree distance distribution: min={}, max={}, mean={:.2f}",
+                    min(distances), max(distances),
+                    sum(distances) / len(distances))
 
 
 if __name__ == "__main__":

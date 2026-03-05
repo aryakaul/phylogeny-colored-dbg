@@ -34,6 +34,7 @@ rule tree_postprocessing:
             {input.nwk} {output.nwk}
         """
 
+
 rule symlink_nwk_tree:
     """
     Symlink a phylogenetic tree if possible (nwk)

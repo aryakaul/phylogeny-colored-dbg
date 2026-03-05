@@ -32,7 +32,7 @@ produce_coherence_decay: True
 
 # (2) Threading; notes:
 #     - controls max threads for multithreaded steps
-threads:              64
+threads:              12
 
 # (3) Mashtree/attotree parameters; notes:
 #     - sketch size should be at least 10k to achieve a sufficient resolution

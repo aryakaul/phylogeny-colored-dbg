@@ -439,9 +439,8 @@ def minimal_cuts_for_all_sets(
         rate = sets_done / elapsed if elapsed > 0 else 0
         logger.info(
             "Chunk {}/{} done — {:,}/{:,} leaf sets ({:.0f}%) "
-            "[{:.1f}s elapsed, {:.0f} sets/s]",
-            chunks_done, total_chunks, sets_done, total_sets, pct,
-            elapsed, rate)
+            "[{:.1f}s elapsed, {:.0f} sets/s]", chunks_done, total_chunks,
+            sets_done, total_sets, pct, elapsed, rate)
 
     def _chunk_iter() -> Iterator[List[set[str]]]:
         for chunk in read_target_leaves(leaves_file_path, chunk_size):
@@ -456,11 +455,11 @@ def minimal_cuts_for_all_sets(
                 colors_info.extend(chunk_colors)
             _log_chunk_progress(len(chunk_data))
     else:
-        with multiprocessing.Pool(
-                num_threads,
-                initializer=_init_worker,
-                initargs=(tree, model, known_leaves,
-                          all_leaf_coloring, verbosity)) as pool:
+        with multiprocessing.Pool(num_threads,
+                                  initializer=_init_worker,
+                                  initargs=(tree, model, known_leaves,
+                                            all_leaf_coloring,
+                                            verbosity)) as pool:
             for chunk_results, chunk_colors in pool.imap_unordered(
                     _process_chunk_worker, _chunk_iter()):
                 results.extend(chunk_results)
@@ -725,17 +724,13 @@ def main() -> None:
                                 f"{global_idx}\t{node_name}\t{state}\n")
                 elif isinstance(color_payload, dict):
                     if has_ambiguous and args.all_solutions:
-                        for node_name, state in sorted(
-                                color_payload.items()):
+                        for node_name, state in sorted(color_payload.items()):
                             handle.write(
-                                f"{global_idx}\t0\t{node_name}\t{state}\n"
-                            )
+                                f"{global_idx}\t0\t{node_name}\t{state}\n")
                     else:
-                        for node_name, state in sorted(
-                                color_payload.items()):
+                        for node_name, state in sorted(color_payload.items()):
                             handle.write(
-                                f"{global_idx}\t{node_name}\t{state}\n"
-                            )
+                                f"{global_idx}\t{node_name}\t{state}\n")
 
 
 if __name__ == "__main__":

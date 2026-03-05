@@ -158,9 +158,7 @@ rule minimal_cuts_percolorset:
         tree=main_dir("trees/sample_phylogeny.nwk"),
         uniquecolors=main_dir("unitig_sample_matrix/uniquecolors.tsv"),
     output:
-        cuts=main_dir(
-            f"minimal_cuts_output/minimal_cuts_{PARSIMONY_LABEL}"
-        ),
+        cuts=main_dir(f"minimal_cuts_output/minimal_cuts_{PARSIMONY_LABEL}"),
     params:
         plotdir=main_dir(f"minimal_cuts_output/plots_{PARSIMONY_LABEL}"),
         chunksize=5000,
@@ -195,9 +193,7 @@ rule minimal_cuts_percolorset:
 # -----------------------------------------------------------------------------
 rule decompose_redundant_colors:
     input:
-        cuts=main_dir(
-            f"minimal_cuts_output/minimal_cuts_{PARSIMONY_LABEL}"
-        ),
+        cuts=main_dir(f"minimal_cuts_output/minimal_cuts_{PARSIMONY_LABEL}"),
         redundantcolors=main_dir("unitig_sample_matrix/redundantcolors.csv"),
     output:
         unitigs_to_cuts=main_dir(
@@ -221,9 +217,7 @@ rule build_sqldb:
         gfa1=main_dir(
             f"colored-debruijngraph-gfa1/colored_dbg_k{KMERSIZE}_cuttlefish.gfa1"
         ),
-        cuts=main_dir(
-            f"minimal_cuts_output/minimal_cuts_{PARSIMONY_LABEL}"
-        ),
+        cuts=main_dir(f"minimal_cuts_output/minimal_cuts_{PARSIMONY_LABEL}"),
     output:
         sql=main_dir(f"colored-debruijngraph-gfa1/sql_k{KMERSIZE}.db"),
     conda:
@@ -390,9 +384,7 @@ rule aggregate_filtered_bubbles:
 
 rule weight_phylogeny_by_cuts:
     input:
-        unitig_to_cuts=main_dir(
-            f"minimal_cuts_output/unitig_to_cuts_{PARSIMONY_LABEL}"
-        ),
+        unitig_to_cuts=main_dir(f"minimal_cuts_output/unitig_to_cuts_{PARSIMONY_LABEL}"),
         tree=main_dir("trees/sample_phylogeny.nwk"),
         gfa1=main_dir(
             f"colored-debruijngraph-gfa1/colored_dbg_k{KMERSIZE}_cuttlefish.gfa1"

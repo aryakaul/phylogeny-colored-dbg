@@ -28,8 +28,9 @@ include: "rules/stratification.smk"
 
 PRODUCE_COLORED_DELETIONS = config.get("produce_colored_deletions", True)
 PRODUCE_BREAKPOINTS = config.get("produce_breakpoints", False)
-PRODUCE_PERSISTENCE = config.get("produce_persistence",
-                                  config.get("produce_coherence_decay", False))
+PRODUCE_PERSISTENCE = config.get(
+    "produce_persistence", config.get("produce_coherence_decay", False)
+)
 PRODUCE_STRATIFICATION = config.get("produce_stratification", False)
 
 pcdbg_targets = expand(fn_pcdbg(_batch="{batch}"), batch=get_batches())
@@ -71,4 +72,9 @@ wildcard_constraints:
 
 rule all:
     input:
-        pcdbg_targets + compression_targets + deletion_targets + breakpoint_targets + persistence_targets + stratification_targets,
+        pcdbg_targets
+        + compression_targets
+        + deletion_targets
+        + breakpoint_targets
+        + persistence_targets
+        + stratification_targets,

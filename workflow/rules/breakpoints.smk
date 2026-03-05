@@ -17,6 +17,7 @@ SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 # Output path helpers
 # ---------------------------------------------------------------------------
 
+
 def fn_breakpoints(batch: str | None = None, _batch: str | None = None) -> str:
     """Output path for legacy binary breakpoints TSV."""
     batch_id = batch if batch is not None else _batch
@@ -24,7 +25,9 @@ def fn_breakpoints(batch: str | None = None, _batch: str | None = None) -> str:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "breakpoints" / f"{batch_id}_k{KMER_LENGTH}_{label}_breakpoints.tsv"
+        dir_output()
+        / "breakpoints"
+        / f"{batch_id}_k{KMER_LENGTH}_{label}_breakpoints.tsv"
     )
 
 
@@ -35,7 +38,9 @@ def fn_breakpoint_summary(batch: str | None = None, _batch: str | None = None) -
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "breakpoints" / f"{batch_id}_k{KMER_LENGTH}_{label}_breakpoint_summary.tsv"
+        dir_output()
+        / "breakpoints"
+        / f"{batch_id}_k{KMER_LENGTH}_{label}_breakpoint_summary.tsv"
     )
 
 
@@ -46,24 +51,31 @@ def fn_boundary_severity(batch: str | None = None, _batch: str | None = None) ->
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "severity" / f"{batch_id}_k{KMER_LENGTH}_{label}_boundary_severity.tsv"
+        dir_output()
+        / "severity"
+        / f"{batch_id}_k{KMER_LENGTH}_{label}_boundary_severity.tsv"
     )
 
 
-def fn_boundary_severity_plot(batch: str | None = None, _batch: str | None = None) -> str:
+def fn_boundary_severity_plot(
+    batch: str | None = None, _batch: str | None = None
+) -> str:
     """Output path for boundary severity SVG plot."""
     batch_id = batch if batch is not None else _batch
     if batch_id is None:
         raise ValueError("Batch identifier is required.")
     label = parsimony_label()
     return str(
-        dir_output() / "severity" / f"{batch_id}_k{KMER_LENGTH}_{label}_boundary_severity.svg"
+        dir_output()
+        / "severity"
+        / f"{batch_id}_k{KMER_LENGTH}_{label}_boundary_severity.svg"
     )
 
 
 # ---------------------------------------------------------------------------
 # Rule 1: Legacy binary breakpoint detection
 # ---------------------------------------------------------------------------
+
 
 rule detect_concordance_breakpoints:
     """
@@ -128,6 +140,7 @@ rule summarize_breakpoints:
 # ---------------------------------------------------------------------------
 # Rule 2: Boundary severity with sampling-based null model
 # ---------------------------------------------------------------------------
+
 
 rule boundary_severity:
     """

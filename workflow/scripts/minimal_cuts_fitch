@@ -38,12 +38,12 @@ from loguru import logger
 
 # Bitmask constants for state encoding.
 PRESENT = np.uint8(1)  # 0b01
-ABSENT = np.uint8(2)   # 0b10
-
+ABSENT = np.uint8(2)  # 0b10
 
 # ---------------------------------------------------------------------------
 # Topology precomputation
 # ---------------------------------------------------------------------------
+
 
 def _precompute_topology(tree: Tree) -> dict:
     """Flatten the ete4 tree into integer-indexed arrays for numpy.
@@ -108,6 +108,7 @@ def _precompute_topology(tree: Tree) -> dict:
 # I/O helpers
 # ---------------------------------------------------------------------------
 
+
 def _count_leaf_sets(file_path: str) -> int:
     """Count non-empty lines in the leaves file (one leaf set per line)."""
     count = 0
@@ -139,6 +140,7 @@ def _read_leaf_sets_chunk(fh, chunk_size: int) -> List[List[str]]:
 # Leaf-set encoding
 # ---------------------------------------------------------------------------
 
+
 def _encode_leaf_sets(
     leaf_sets: List[List[str]],
     leaf_name_to_idx: Dict[str, int],
@@ -152,8 +154,8 @@ def _encode_leaf_sets(
     B = len(leaf_sets)
     state = np.zeros((B, n_nodes), dtype=np.uint8)
 
-    all_leaf_indices = np.array(
-        list(leaf_name_to_idx.values()), dtype=np.int32)
+    all_leaf_indices = np.array(list(leaf_name_to_idx.values()),
+                                dtype=np.int32)
     state[:, all_leaf_indices] = ABSENT
 
     for b, leaves in enumerate(leaf_sets):
@@ -168,6 +170,7 @@ def _encode_leaf_sets(
 # ---------------------------------------------------------------------------
 # Vectorized Fitch parsimony
 # ---------------------------------------------------------------------------
+
 
 def _fitch_bottom_up(
     state: np.ndarray,
@@ -263,6 +266,7 @@ def _fitch_top_down(
 # Cut extraction and output writing
 # ---------------------------------------------------------------------------
 
+
 def _precompute_named_edges(
     parent: np.ndarray,
     node_names: List[str],
@@ -278,10 +282,10 @@ def _precompute_named_edges(
         cut_names     -- corresponding child node name strings
     """
     named_mask = np.array(
-        [bool(node_names[i])
-         and parent[i] >= 0
-         and bool(node_names[parent[i]])
-         for i in range(n_nodes)],
+        [
+            bool(node_names[i]) and parent[i] >= 0
+            and bool(node_names[parent[i]]) for i in range(n_nodes)
+        ],
         dtype=bool,
     )
     named_indices = np.where(named_mask)[0]
@@ -386,21 +390,33 @@ def _write_batch(
                 cuts_handle.write(f"{line_a} OR {line_b}\n")
 
             if write_colors:
-                _write_colors_for_row(
-                    colors_handle, assigned_a, b, global_idx,
-                    node_names, n_nodes, solution_col=0)
-                _write_colors_for_row(
-                    colors_handle, assigned_b, b, global_idx,
-                    node_names, n_nodes, solution_col=1)
+                _write_colors_for_row(colors_handle,
+                                      assigned_a,
+                                      b,
+                                      global_idx,
+                                      node_names,
+                                      n_nodes,
+                                      solution_col=0)
+                _write_colors_for_row(colors_handle,
+                                      assigned_b,
+                                      b,
+                                      global_idx,
+                                      node_names,
+                                      n_nodes,
+                                      solution_col=1)
         else:
             # Cases 1 & 2: single solution
             cuts_handle.write(line_a + "\n")
 
             if write_colors:
                 sol_col = 0 if use_solution_col else None
-                _write_colors_for_row(
-                    colors_handle, assigned_a, b, global_idx,
-                    node_names, n_nodes, solution_col=sol_col)
+                _write_colors_for_row(colors_handle,
+                                      assigned_a,
+                                      b,
+                                      global_idx,
+                                      node_names,
+                                      n_nodes,
+                                      solution_col=sol_col)
 
 
 # ---------------------------------------------------------------------------
@@ -445,11 +461,12 @@ def _autocomplete_internal_node_names(tree: Tree, newtreefile: str) -> Tree:
 # Logger
 # ---------------------------------------------------------------------------
 
+
 def _configure_logger(verbosity: int) -> None:
     """Set up loguru: 0 → WARNING, 1 → INFO, 2+ → DEBUG."""
     logger.remove()
-    level = "WARNING" if verbosity == 0 else ("INFO" if verbosity == 1
-                                               else "DEBUG")
+    level = "WARNING" if verbosity == 0 else (
+        "INFO" if verbosity == 1 else "DEBUG")
     logger.add(sys.stderr, level=level)
 
 
@@ -457,33 +474,44 @@ def _configure_logger(verbosity: int) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Numpy-vectorized Fitch parsimony for minimal cuts.")
-    parser.add_argument(
-        "tree_file", help="Newick tree file.")
+    parser.add_argument("tree_file", help="Newick tree file.")
     parser.add_argument(
         "leaves_file",
         help="File with one leaf set per line (whitespace-separated names).")
     parser.add_argument(
-        "--all", dest="all_solutions", action="store_true",
+        "--all",
+        dest="all_solutions",
+        action="store_true",
         help="Emit all optimal root-state solutions when ties occur.")
     parser.add_argument(
-        "-t", "--tree", type=str,
+        "-t",
+        "--tree",
+        type=str,
         default=(f"./minimalcuts_fullynamedtree_"
                  f"{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}.nwk"),
         help="Path to write renamed tree (only used when renaming needed).")
+    parser.add_argument("-o",
+                        "--output",
+                        default=None,
+                        help="Output file for cuts (default: stdout).")
+    parser.add_argument("-c",
+                        "--colors",
+                        default=None,
+                        help="Write per-node state assignments to this file.")
+    parser.add_argument("-cs",
+                        "--chunksize",
+                        default=5000,
+                        type=int,
+                        help="Leaf sets per batch (controls memory usage).")
     parser.add_argument(
-        "-o", "--output", default=None,
-        help="Output file for cuts (default: stdout).")
-    parser.add_argument(
-        "-c", "--colors", default=None,
-        help="Write per-node state assignments to this file.")
-    parser.add_argument(
-        "-cs", "--chunksize", default=5000, type=int,
-        help="Leaf sets per batch (controls memory usage).")
-    parser.add_argument(
-        "-v", "--verbose", action="count", default=0,
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
         help="Increase verbosity (-v for INFO, -vv for DEBUG).")
 
     args = parser.parse_args()
@@ -495,28 +523,32 @@ def main() -> None:
     if not tree.name:
         tree.name = "Root"
 
-    unnamed = [n for n in tree.traverse("postorder")
-               if not n.is_leaf and not n.name]
+    unnamed = [
+        n for n in tree.traverse("postorder") if not n.is_leaf and not n.name
+    ]
     if unnamed:
         logger.info("{} unnamed internal nodes; autocompleting.", len(unnamed))
         tree = _autocomplete_internal_node_names(tree, args.tree)
 
-    known_leaves = {n.name for n in tree.traverse("postorder")
-                    if n.is_leaf and n.name}
+    known_leaves = {
+        n.name
+        for n in tree.traverse("postorder") if n.is_leaf and n.name
+    }
     logger.info("Tree loaded: {:,} leaves", len(known_leaves))
 
     # -- Precompute topology and named-edge index ----------------------------
     topo = _precompute_topology(tree)
     logger.info("Topology indexed: {} nodes", topo["n_nodes"])
 
-    named_indices, cut_names = _precompute_named_edges(
-        topo["parent"], topo["node_names"], topo["n_nodes"])
+    named_indices, cut_names = _precompute_named_edges(topo["parent"],
+                                                       topo["node_names"],
+                                                       topo["n_nodes"])
 
     # -- Count leaf sets and plan chunking -----------------------------------
     total_sets = _count_leaf_sets(args.leaves_file)
     total_chunks = math.ceil(total_sets / args.chunksize) if total_sets else 1
-    logger.info("Processing {:,} leaf sets in {:,} chunks of {:,}",
-                total_sets, total_chunks, args.chunksize)
+    logger.info("Processing {:,} leaf sets in {:,} chunks of {:,}", total_sets,
+                total_chunks, args.chunksize)
 
     # -- Open output handles -------------------------------------------------
     cuts_handle = open(args.output, "w") if args.output else sys.stdout
@@ -546,29 +578,35 @@ def main() -> None:
                 B = len(leaf_sets)
 
                 # Encode leaf sets into bitmask matrix
-                state = _encode_leaf_sets(
-                    leaf_sets, topo["leaf_name_to_idx"], topo["n_nodes"])
+                state = _encode_leaf_sets(leaf_sets, topo["leaf_name_to_idx"],
+                                          topo["n_nodes"])
 
                 # Fitch bottom-up: compute state sets at all internal nodes
-                state = _fitch_bottom_up(
-                    state, topo["postorder"], topo["children"], topo["is_leaf"])
+                state = _fitch_bottom_up(state, topo["postorder"],
+                                         topo["children"], topo["is_leaf"])
 
                 # Identify leaf sets with ambiguous root (state_set == 0b11)
                 has_ambiguous = state[:, topo["root_idx"]] == 3
 
                 # Top-down pass 1: resolve assignments preferring PRESENT root
                 assigned_a = np.zeros_like(state)
-                _fitch_top_down(
-                    state, assigned_a, topo["preorder"], topo["parent"],
-                    topo["root_idx"], root_choice=PRESENT)
+                _fitch_top_down(state,
+                                assigned_a,
+                                topo["preorder"],
+                                topo["parent"],
+                                topo["root_idx"],
+                                root_choice=PRESENT)
 
                 # Top-down pass 2 (only when needed): prefer ABSENT root
                 assigned_b = None
                 if args.all_solutions and np.any(has_ambiguous):
                     assigned_b = np.zeros_like(state)
-                    _fitch_top_down(
-                        state, assigned_b, topo["preorder"], topo["parent"],
-                        topo["root_idx"], root_choice=ABSENT)
+                    _fitch_top_down(state,
+                                    assigned_b,
+                                    topo["preorder"],
+                                    topo["parent"],
+                                    topo["root_idx"],
+                                    root_choice=ABSENT)
 
                 # Write colors header on first chunk
                 if write_colors and not colors_header_written:
@@ -604,9 +642,8 @@ def main() -> None:
                 rate = global_offset / elapsed if elapsed > 0 else 0
                 logger.info(
                     "Chunk {}/{} — {:,}/{:,} ({:.0f}%) "
-                    "[{:.1f}s, {:.0f} sets/s]",
-                    chunks_done, total_chunks, global_offset, total_sets,
-                    pct, elapsed, rate)
+                    "[{:.1f}s, {:.0f} sets/s]", chunks_done, total_chunks,
+                    global_offset, total_sets, pct, elapsed, rate)
 
         elapsed_total = time.time() - t_start
         rate = total_sets / elapsed_total if elapsed_total > 0 else 0
