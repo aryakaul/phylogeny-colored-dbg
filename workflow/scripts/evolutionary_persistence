@@ -495,6 +495,8 @@ def _worker_bfs(args_tuple):
     total_strict = np.zeros(max_hops, dtype=np.int64)
     total_ancdesc = np.zeros(max_hops, dtype=np.int64)
 
+    log_interval = max(1, len(seed_ints) // 20)
+
     for i, s in enumerate(seed_ints):
         reached, strict, ancdesc = _bfs_coherence(
             s, csr_offsets, csr_neighbors, cut_idx_array,
@@ -504,7 +506,7 @@ def _worker_bfs(args_tuple):
         total_strict += strict
         total_ancdesc += ancdesc
 
-        if (i + 1) % 1000 == 0:
+        if (i + 1) % log_interval == 0 or (i + 1) == len(seed_ints):
             logger.info("Worker {}: BFS {}/{} seeds ({:.0f}%)", worker_id,
                         i + 1, len(seed_ints), (i + 1) / len(seed_ints) * 100)
 
