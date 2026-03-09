@@ -322,37 +322,30 @@ def _build_csr_graph(
 
 
 # ---------------------------------------------------------------------------
-# Precompute coherence lookup (top-K approach)
+# Cut-string data preparation
 # ---------------------------------------------------------------------------
 
 
-def _build_concordance_table(
+def _prepare_cutstring_data(
     colors: Dict[str, str],
-    entry: np.ndarray,
-    exit_: np.ndarray,
     tree_name_to_nidx: Dict[str, int],
 ) -> Tuple[
     List[str], Dict[str, int],
-    np.ndarray | None, set | None, List[int] | None, Dict[int, int] | None,
     List[List[FrozenSet[str]]], np.ndarray, List[List[Tuple[int, ...]]],
 ]:
-    """Build concordance table for the top-K most frequent cut-strings.
+    """Parse cut-strings and precompute node-index tuples.
 
-    Strategy:
-    - Find the K most frequent cut-string indices covering ~90% of unitigs.
-    - Precompute concordance for all K×K pairs (stored as K×K bool matrix).
-    - For pairs involving rare cut-strings, fall back to on-the-fly checks.
+    Skips the O(K²) pairwise concordance matrix entirely.  Concordance
+    is checked on-the-fly during BFS, with a per-seed cache so each
+    distinct cut-string pair is evaluated at most once per seed.
 
     Returns:
-        unique_cuts      -- list of M unique cut-strings
-        cut_to_idx       -- mapping from cut-string to index
-        concordance_table -- K×K bool array (or M×M if M is small), or None
-        top_k_set        -- set of top-K global indices (None if full table)
-        top_k_list       -- sorted list of top-K global indices (None if full)
-        top_k_to_local   -- global index → local index in concordance_table
-        parsed_cuts      -- parsed form of each unique cut-string
-        simple_nidx      -- int32 array [M], tree node index for simple
-                            cut-strings (-1 if not simple)
+        unique_cuts  -- list of M unique cut-strings
+        cut_to_idx   -- mapping from cut-string to index
+        parsed_cuts  -- parsed form of each unique cut-string
+        simple_nidx  -- int32 array [M], tree node index for simple
+                        cut-strings (-1 if not simple)
+        parsed_nidx  -- precomputed node-index tuples per cut-string
     """
     cut_counts: Dict[str, int] = defaultdict(int)
     for cs in colors.values():
@@ -390,83 +383,7 @@ def _build_concordance_table(
     logger.info("Simple cut-strings: {:,}/{:,} ({:.1f}%)", n_simple, M,
                 100.0 * n_simple / max(M, 1))
 
-    # If M is small enough, build the full M×M table
-    if M <= 1_000:
-        concordance_table = np.eye(M, dtype=np.bool_)
-        t0 = time.time()
-        for i in range(M):
-            for j in range(i + 1, M):
-                # Fast path for simple vs simple
-                if simple_nidx[i] >= 0 and simple_nidx[j] >= 0:
-                    if _is_anc_or_desc(simple_nidx[i], simple_nidx[j], entry,
-                                       exit_):
-                        concordance_table[i, j] = True
-                        concordance_table[j, i] = True
-                elif _concordance_check_nidx(parsed_nidx[i], parsed_nidx[j],
-                                            entry, exit_):
-                    concordance_table[i, j] = True
-                    concordance_table[j, i] = True
-        elapsed = time.time() - t0
-        n_concordant = int(concordance_table.sum()) - M
-        logger.info(
-            "Full concordance table built in {:.1f}s: {:,} coherent pairs "
-            "(of {:,} off-diagonal)",
-            elapsed, n_concordant // 2, M * (M - 1) // 2)
-        return (unique_cuts, cut_to_idx, concordance_table,
-                None, None, None, parsed_cuts, simple_nidx, parsed_nidx)
-
-    # Large M: build top-K table covering ~90% of unitigs
-    total = sum(cut_counts.values())
-    sorted_by_freq = sorted(range(M),
-                            key=lambda i: cut_counts[unique_cuts[i]],
-                            reverse=True)
-
-    cumsum = 0
-    top_k_list: List[int] = []
-    for idx in sorted_by_freq:
-        cumsum += cut_counts[unique_cuts[idx]]
-        top_k_list.append(idx)
-        if cumsum >= 0.9 * total:
-            break
-
-    top_k_list.sort()
-    top_k_set = set(top_k_list)
-    top_k_to_local = {g: l for l, g in enumerate(top_k_list)}
-    K = len(top_k_list)
-
-    logger.info("Top-K concordance: K={:,} covers {:.1f}% of {:,} unitigs", K,
-                100.0 * cumsum / total, total)
-
-    concordance_table = np.eye(K, dtype=np.bool_)
-    t0 = time.time()
-    total_pairs = K * (K - 1) // 2
-    for i_local in range(K):
-        if i_local % 100 == 0 and i_local > 0:
-            done = i_local * K - i_local * (i_local + 1) // 2
-            logger.info("Top-K table: {:.1f}% ({:,}/{:,} pairs)",
-                        100.0 * done / max(total_pairs, 1), done, total_pairs)
-        i_global = top_k_list[i_local]
-        for j_local in range(i_local + 1, K):
-            j_global = top_k_list[j_local]
-            # Fast path for simple vs simple
-            if simple_nidx[i_global] >= 0 and simple_nidx[j_global] >= 0:
-                if _is_anc_or_desc(simple_nidx[i_global],
-                                   simple_nidx[j_global], entry, exit_):
-                    concordance_table[i_local, j_local] = True
-                    concordance_table[j_local, i_local] = True
-            elif _concordance_check_nidx(parsed_nidx[i_global], parsed_nidx[j_global],
-                                        entry, exit_):
-                concordance_table[i_local, j_local] = True
-                concordance_table[j_local, i_local] = True
-    elapsed = time.time() - t0
-    n_concordant = int(concordance_table.sum()) - K
-    logger.info(
-        "Top-K concordance table built in {:.1f}s: {:,} coherent pairs",
-        elapsed, n_concordant // 2)
-
-    return (unique_cuts, cut_to_idx, concordance_table,
-            top_k_set, top_k_list, top_k_to_local, parsed_cuts, simple_nidx,
-            parsed_nidx)
+    return (unique_cuts, cut_to_idx, parsed_cuts, simple_nidx, parsed_nidx)
 
 
 # ---------------------------------------------------------------------------
@@ -481,15 +398,16 @@ def _bfs_coherence(
     cut_idx_array: np.ndarray,
     n_unitigs: int,
     max_hops: int,
-    concordance_table: np.ndarray | None,
     parsed_nidx: List[List[Tuple[int, ...]]],
     simple_nidx: np.ndarray,
-    top_k_set: set | None,
-    top_k_to_local: Dict[int, int] | None,
     entry: np.ndarray,
     exit_: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """BFS from *seed_int* up to *max_hops*, counting concordant neighbours.
+
+    Concordance with the seed's cut-string is checked on-the-fly and
+    cached per cut-string index, so each distinct cut-string is evaluated
+    at most once per seed.
 
     Returns three int arrays of length max_hops (index 0 = hop 1):
         n_reached           -- total unitigs reached at each hop distance
@@ -501,20 +419,13 @@ def _bfs_coherence(
     n_strict = np.zeros(max_hops, dtype=np.int64)
     n_ancdesc = np.zeros(max_hops, dtype=np.int64)
 
-    # Determine seed's concordance lookup strategy
-    use_full_table = (top_k_set is None and concordance_table is not None)
-    seed_in_topk = (top_k_set is not None and seed_cidx in top_k_set)
-
-    if use_full_table:
-        seed_concordance_row = concordance_table[seed_cidx]
-    elif seed_in_topk:
-        seed_local = top_k_to_local[seed_cidx]
-        seed_concordance_row = concordance_table[seed_local]
-    else:
-        seed_concordance_row = None
-
     seed_nidx = parsed_nidx[seed_cidx]
     seed_snidx = simple_nidx[seed_cidx]  # -1 if not simple
+
+    # Per-seed concordance cache: cut-string index → bool
+    # Avoids recomputing concordance for the same cut-string encountered
+    # via different unitigs during this BFS.
+    conc_cache: Dict[int, bool] = {}
 
     visited = np.zeros(n_unitigs, dtype=np.bool_)
     visited[seed_int] = True
@@ -536,26 +447,21 @@ def _bfs_coherence(
                     if nb_cidx == seed_cidx:
                         n_strict[h] += 1
                         n_ancdesc[h] += 1
-                    elif use_full_table:
-                        # Full M×M table available
-                        if seed_concordance_row[nb_cidx]:
-                            n_ancdesc[h] += 1
-                    elif seed_in_topk and top_k_set is not None and nb_cidx in top_k_set:
-                        # Both in top-K: use precomputed table
-                        nb_local = top_k_to_local[nb_cidx]
-                        if seed_concordance_row[nb_local]:
-                            n_ancdesc[h] += 1
                     else:
-                        # Fall back to on-the-fly check
-                        nb_snidx = simple_nidx[nb_cidx]
-                        if seed_snidx >= 0 and nb_snidx >= 0:
-                            # Both simple: O(1) ancestor-descendant check
-                            if _is_anc_or_desc(seed_snidx, nb_snidx, entry,
-                                               exit_):
-                                n_ancdesc[h] += 1
-                        elif _concordance_check_nidx(
-                                seed_nidx, parsed_nidx[nb_cidx],
-                                entry, exit_):
+                        # Check per-seed cache first
+                        cached = conc_cache.get(nb_cidx)
+                        if cached is None:
+                            # Compute on-the-fly and cache
+                            nb_snidx = simple_nidx[nb_cidx]
+                            if seed_snidx >= 0 and nb_snidx >= 0:
+                                cached = _is_anc_or_desc(
+                                    seed_snidx, nb_snidx, entry, exit_)
+                            else:
+                                cached = _concordance_check_nidx(
+                                    seed_nidx, parsed_nidx[nb_cidx],
+                                    entry, exit_)
+                            conc_cache[nb_cidx] = cached
+                        if cached:
                             n_ancdesc[h] += 1
 
         frontier = next_frontier
@@ -580,11 +486,8 @@ def _worker_bfs(args_tuple):
     cut_idx_array = _SHARED["cut_idx_array"]
     n_unitigs = _SHARED["n_unitigs"]
     max_hops = _SHARED["max_hops"]
-    concordance_table = _SHARED["concordance_table"]
     parsed_nidx = _SHARED["parsed_nidx"]
     simple_nidx = _SHARED["simple_nidx"]
-    top_k_set = _SHARED["top_k_set"]
-    top_k_to_local = _SHARED["top_k_to_local"]
     entry = _SHARED["entry"]
     exit_ = _SHARED["exit_"]
 
@@ -595,9 +498,8 @@ def _worker_bfs(args_tuple):
     for i, s in enumerate(seed_ints):
         reached, strict, ancdesc = _bfs_coherence(
             s, csr_offsets, csr_neighbors, cut_idx_array,
-            n_unitigs, max_hops, concordance_table, parsed_nidx,
-            simple_nidx, top_k_set, top_k_to_local,
-            entry, exit_)
+            n_unitigs, max_hops, parsed_nidx,
+            simple_nidx, entry, exit_)
         total_reached += reached
         total_strict += strict
         total_ancdesc += ancdesc
@@ -631,15 +533,16 @@ def _simpson_index(colors: Dict[str, str]) -> float:
 def _concordance_null(
     colors: Dict[str, str],
     unique_cuts: List[str],
-    concordance_table: np.ndarray | None,
     parsed_nidx: List[List[Tuple[int, ...]]],
-    top_k_set: set | None,
     entry: np.ndarray,
     exit_: np.ndarray,
     simple_nidx: np.ndarray,
     rng: np.random.Generator | None = None,
 ) -> float:
-    """Null expectation for anc/desc coherence: Σ_{i,j coherent} f_i * f_j."""
+    """Null expectation for anc/desc coherence: Σ_{i,j coherent} f_i * f_j.
+
+    Estimated by sampling random cut-string pairs weighted by frequency.
+    """
     total = len(colors)
     if total == 0:
         return 0.0
@@ -650,13 +553,6 @@ def _concordance_null(
 
     freqs = np.array([counts[cs] / total for cs in unique_cuts])
 
-    # Full table available: exact computation
-    if concordance_table is not None and top_k_set is None:
-        return float(
-            sum(freqs[i] * freqs[concordance_table[i]].sum()
-                for i in range(len(freqs))))
-
-    # Large M or top-K table: sample-based estimation
     if rng is None:
         rng = np.random.default_rng(42)
     n_samples = 1_000_000
@@ -814,12 +710,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     # -- Load graph ----------------------------------------------------------
     adj, colors = _load_graph_and_colors(args.db)
 
-    # -- Build concordance lookup table --------------------------------------
-    (unique_cuts, cut_to_idx, concordance_table,
-     top_k_set, top_k_list, top_k_to_local, parsed_cuts, simple_nidx,
-     parsed_nidx) = \
-        _build_concordance_table(
-            colors, entry_times, exit_times, tree_name_to_nidx)
+    # -- Parse cut-strings and precompute node-index data --------------------
+    (unique_cuts, cut_to_idx, parsed_cuts, simple_nidx, parsed_nidx) = \
+        _prepare_cutstring_data(colors, tree_name_to_nidx)
 
     # -- Build integer-indexed CSR graph -------------------------------------
     unitig_list, uid_to_int, csr_offsets, csr_neighbors = \
@@ -846,11 +739,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     _SHARED["cut_idx_array"] = cut_idx_array
     _SHARED["n_unitigs"] = N_unitigs
     _SHARED["max_hops"] = args.max_hops
-    _SHARED["concordance_table"] = concordance_table
     _SHARED["parsed_nidx"] = parsed_nidx
     _SHARED["simple_nidx"] = simple_nidx
-    _SHARED["top_k_set"] = top_k_set
-    _SHARED["top_k_to_local"] = top_k_to_local
     _SHARED["entry"] = entry_times
     _SHARED["exit_"] = exit_times
 
@@ -889,7 +779,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     null_strict = _simpson_index(colors)
     null_ancdesc = _concordance_null(
-        colors, unique_cuts, concordance_table, parsed_nidx, top_k_set,
+        colors, unique_cuts, parsed_nidx,
         entry_times, exit_times, simple_nidx, rng)
 
     logger.info("Null strict (Simpson index): {:.6f}", null_strict)
