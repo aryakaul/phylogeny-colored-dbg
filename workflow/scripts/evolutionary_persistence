@@ -242,6 +242,22 @@ def _injective_ancdesc_match_nidx(
     return _max_bipartite_matching(adj_lists, len(tb)) == len(ta)
 
 
+def _intervals_concordant(ivs_a: np.ndarray, ivs_b: np.ndarray) -> bool:
+    """Fast concordance check for OR-of-singles cut-strings.
+
+    Each argument is an (N, 2) int32 array of Euler-tour (entry, exit)
+    intervals.  Returns True if any interval from A has an
+    ancestor-descendant relationship with any interval from B.
+    """
+    for i in range(len(ivs_a)):
+        ea, xa = int(ivs_a[i, 0]), int(ivs_a[i, 1])
+        for j in range(len(ivs_b)):
+            eb, xb = int(ivs_b[j, 0]), int(ivs_b[j, 1])
+            if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Graph loading
 # ---------------------------------------------------------------------------
@@ -329,9 +345,12 @@ def _build_csr_graph(
 def _prepare_cutstring_data(
     colors: Dict[str, str],
     tree_name_to_nidx: Dict[str, int],
+    entry: np.ndarray,
+    exit_: np.ndarray,
 ) -> Tuple[
     List[str], Dict[str, int],
-    List[List[FrozenSet[str]]], np.ndarray, List[List[Tuple[int, ...]]],
+    List[List[FrozenSet[str]]], List[np.ndarray | None],
+    List[List[Tuple[int, ...]]],
 ]:
     """Parse cut-strings and precompute node-index tuples.
 
@@ -340,12 +359,14 @@ def _prepare_cutstring_data(
     distinct cut-string pair is evaluated at most once per seed.
 
     Returns:
-        unique_cuts  -- list of M unique cut-strings
-        cut_to_idx   -- mapping from cut-string to index
-        parsed_cuts  -- parsed form of each unique cut-string
-        simple_nidx  -- int32 array [M], tree node index for simple
-                        cut-strings (-1 if not simple)
-        parsed_nidx  -- precomputed node-index tuples per cut-string
+        unique_cuts          -- list of M unique cut-strings
+        cut_to_idx           -- mapping from cut-string to index
+        parsed_cuts          -- parsed form of each unique cut-string
+        or_singles_intervals -- for each cut-string, an (N,2) int32 array
+                                of Euler-tour (entry, exit) intervals if all
+                                alternatives are single-node, else None
+        parsed_nidx          -- precomputed node-index tuples per cut-string
+                                (only needed for non-OR-of-singles fallback)
     """
     cut_counts: Dict[str, int] = defaultdict(int)
     for cs in colors.values():
@@ -370,20 +391,43 @@ def _prepare_cutstring_data(
                       if n in tree_name_to_nidx))
         parsed_nidx.append(nidx_alts)
 
-    # Build simple_nidx: tree node index for simple (single-node) cut-strings
-    simple_nidx = np.full(M, -1, dtype=np.int32)
-    for i, p in enumerate(parsed_cuts):
-        if (len(p) == 1 and len(p[0]) == 1 and "__UNASSIGNED__" not in p[0]):
-            node_name = next(iter(p[0]))
-            nidx = tree_name_to_nidx.get(node_name)
-            if nidx is not None:
-                simple_nidx[i] = nidx
+    # Build OR-of-singles intervals: for cut-strings where every alternative
+    # is a single tree node, precompute Euler-tour intervals for fast
+    # concordance checks.  This covers both "simple" (1 alternative, 1 node)
+    # and "OR-of-singles" (e.g. "NodeA OR NodeB") — typically the vast
+    # majority of Fitch parsimony assignments.
+    or_singles_intervals: List[np.ndarray | None] = []
+    n_or_singles = 0
+    n_complex = 0
+    for alts in parsed_nidx:
+        # Check: every alternative must be a singleton tuple with a valid node
+        nodes = []
+        is_or_singles = True
+        for t in alts:
+            if len(t) == 1:
+                nodes.append(t[0])
+            else:
+                is_or_singles = False
+                break
+        if is_or_singles and nodes:
+            ivs = np.empty((len(nodes), 2), dtype=np.int32)
+            for k, n in enumerate(nodes):
+                ivs[k, 0] = entry[n]
+                ivs[k, 1] = exit_[n]
+            or_singles_intervals.append(ivs)
+            n_or_singles += 1
+        else:
+            or_singles_intervals.append(None)
+            n_complex += 1
 
-    n_simple = int((simple_nidx >= 0).sum())
-    logger.info("Simple cut-strings: {:,}/{:,} ({:.1f}%)", n_simple, M,
-                100.0 * n_simple / max(M, 1))
+    logger.info(
+        "OR-of-singles cut-strings: {:,}/{:,} ({:.1f}%) — "
+        "complex (multi-node alternatives): {:,} ({:.1f}%)",
+        n_or_singles, M, 100.0 * n_or_singles / max(M, 1),
+        n_complex, 100.0 * n_complex / max(M, 1))
 
-    return (unique_cuts, cut_to_idx, parsed_cuts, simple_nidx, parsed_nidx)
+    return (unique_cuts, cut_to_idx, parsed_cuts,
+            or_singles_intervals, parsed_nidx)
 
 
 # ---------------------------------------------------------------------------
@@ -398,16 +442,17 @@ def _bfs_coherence(
     cut_idx_array: np.ndarray,
     n_unitigs: int,
     max_hops: int,
+    or_singles_intervals: List[np.ndarray | None],
     parsed_nidx: List[List[Tuple[int, ...]]],
-    simple_nidx: np.ndarray,
     entry: np.ndarray,
     exit_: np.ndarray,
+    conc_cache: Dict[int, bool],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """BFS from *seed_int* up to *max_hops*, counting concordant neighbours.
 
-    Concordance with the seed's cut-string is checked on-the-fly and
-    cached per cut-string index, so each distinct cut-string is evaluated
-    at most once per seed.
+    Concordance with the seed's cut-string is checked on-the-fly.
+    *conc_cache* maps nb_cidx → bool for THIS seed's cut-string and is
+    shared across BFS calls from seeds with the same cut-string index.
 
     Returns three int arrays of length max_hops (index 0 = hop 1):
         n_reached           -- total unitigs reached at each hop distance
@@ -419,13 +464,8 @@ def _bfs_coherence(
     n_strict = np.zeros(max_hops, dtype=np.int64)
     n_ancdesc = np.zeros(max_hops, dtype=np.int64)
 
+    seed_ivs = or_singles_intervals[seed_cidx]
     seed_nidx = parsed_nidx[seed_cidx]
-    seed_snidx = simple_nidx[seed_cidx]  # -1 if not simple
-
-    # Per-seed concordance cache: cut-string index → bool
-    # Avoids recomputing concordance for the same cut-string encountered
-    # via different unitigs during this BFS.
-    conc_cache: Dict[int, bool] = {}
 
     visited = np.zeros(n_unitigs, dtype=np.bool_)
     visited[seed_int] = True
@@ -448,14 +488,12 @@ def _bfs_coherence(
                         n_strict[h] += 1
                         n_ancdesc[h] += 1
                     else:
-                        # Check per-seed cache first
                         cached = conc_cache.get(nb_cidx)
                         if cached is None:
-                            # Compute on-the-fly and cache
-                            nb_snidx = simple_nidx[nb_cidx]
-                            if seed_snidx >= 0 and nb_snidx >= 0:
-                                cached = _is_anc_or_desc(
-                                    seed_snidx, nb_snidx, entry, exit_)
+                            nb_ivs = or_singles_intervals[nb_cidx]
+                            if seed_ivs is not None and nb_ivs is not None:
+                                cached = _intervals_concordant(
+                                    seed_ivs, nb_ivs)
                             else:
                                 cached = _concordance_check_nidx(
                                     seed_nidx, parsed_nidx[nb_cidx],
@@ -486,8 +524,8 @@ def _worker_bfs(args_tuple):
     cut_idx_array = _SHARED["cut_idx_array"]
     n_unitigs = _SHARED["n_unitigs"]
     max_hops = _SHARED["max_hops"]
+    or_singles_intervals = _SHARED["or_singles_intervals"]
     parsed_nidx = _SHARED["parsed_nidx"]
-    simple_nidx = _SHARED["simple_nidx"]
     entry = _SHARED["entry"]
     exit_ = _SHARED["exit_"]
 
@@ -495,20 +533,34 @@ def _worker_bfs(args_tuple):
     total_strict = np.zeros(max_hops, dtype=np.int64)
     total_ancdesc = np.zeros(max_hops, dtype=np.int64)
 
+    # Per-seed-cutstring concordance caches: seeds that share a cut-string
+    # reuse the same cache, avoiding redundant concordance computations.
+    cidx_caches: Dict[int, Dict[int, bool]] = {}
+
     log_interval = max(1, len(seed_ints) // 20)
 
     for i, s in enumerate(seed_ints):
+        seed_cidx = int(cut_idx_array[s])
+        if seed_cidx not in cidx_caches:
+            cidx_caches[seed_cidx] = {}
+        conc_cache = cidx_caches[seed_cidx]
+
         reached, strict, ancdesc = _bfs_coherence(
             s, csr_offsets, csr_neighbors, cut_idx_array,
-            n_unitigs, max_hops, parsed_nidx,
-            simple_nidx, entry, exit_)
+            n_unitigs, max_hops, or_singles_intervals, parsed_nidx,
+            entry, exit_, conc_cache)
         total_reached += reached
         total_strict += strict
         total_ancdesc += ancdesc
 
         if (i + 1) % log_interval == 0 or (i + 1) == len(seed_ints):
-            logger.info("Worker {}: BFS {}/{} seeds ({:.0f}%)", worker_id,
-                        i + 1, len(seed_ints), (i + 1) / len(seed_ints) * 100)
+            n_cached = sum(len(c) for c in cidx_caches.values())
+            logger.info(
+                "Worker {}: BFS {}/{} seeds ({:.0f}%), "
+                "{:,} distinct seed cut-strings, {:,} cached pairs",
+                worker_id, i + 1, len(seed_ints),
+                (i + 1) / len(seed_ints) * 100,
+                len(cidx_caches), n_cached)
 
     return total_reached, total_strict, total_ancdesc
 
@@ -535,15 +587,16 @@ def _simpson_index(colors: Dict[str, str]) -> float:
 def _concordance_null(
     colors: Dict[str, str],
     unique_cuts: List[str],
+    or_singles_intervals: List[np.ndarray | None],
     parsed_nidx: List[List[Tuple[int, ...]]],
     entry: np.ndarray,
     exit_: np.ndarray,
-    simple_nidx: np.ndarray,
     rng: np.random.Generator | None = None,
 ) -> float:
     """Null expectation for anc/desc coherence: Σ_{i,j coherent} f_i * f_j.
 
     Estimated by sampling random cut-string pairs weighted by frequency.
+    Uses a pair cache to avoid recomputing concordance for repeated pairs.
     """
     total = len(colors)
     if total == 0:
@@ -561,23 +614,33 @@ def _concordance_null(
     idx_a = rng.choice(len(unique_cuts), size=n_samples, p=freqs)
     idx_b = rng.choice(len(unique_cuts), size=n_samples, p=freqs)
 
+    pair_cache: Dict[Tuple[int, int], bool] = {}
     n_coherent = 0
     for k in range(n_samples):
         i, j = int(idx_a[k]), int(idx_b[k])
         if i == j:
             n_coherent += 1
-        elif simple_nidx[i] >= 0 and simple_nidx[j] >= 0:
-            if _is_anc_or_desc(simple_nidx[i], simple_nidx[j], entry, exit_):
-                n_coherent += 1
-        elif _concordance_check_nidx(parsed_nidx[i], parsed_nidx[j],
-                                     entry, exit_):
+            continue
+        key = (i, j) if i < j else (j, i)
+        cached = pair_cache.get(key)
+        if cached is None:
+            ivs_i = or_singles_intervals[i]
+            ivs_j = or_singles_intervals[j]
+            if ivs_i is not None and ivs_j is not None:
+                cached = _intervals_concordant(ivs_i, ivs_j)
+            else:
+                cached = _concordance_check_nidx(
+                    parsed_nidx[i], parsed_nidx[j], entry, exit_)
+            pair_cache[key] = cached
+        if cached:
             n_coherent += 1
 
     estimate = n_coherent / n_samples
     se = (estimate * (1 - estimate) / n_samples)**0.5
     logger.info(
         "Anc/desc null estimated from {:,} samples: {:.6f} "
-        "(SE \u2248 {:.6f})", n_samples, estimate, se)
+        "(SE \u2248 {:.6f}, {:,} unique pairs cached)",
+        n_samples, estimate, se, len(pair_cache))
     return estimate
 
 
@@ -713,8 +776,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     adj, colors = _load_graph_and_colors(args.db)
 
     # -- Parse cut-strings and precompute node-index data --------------------
-    (unique_cuts, cut_to_idx, parsed_cuts, simple_nidx, parsed_nidx) = \
-        _prepare_cutstring_data(colors, tree_name_to_nidx)
+    (unique_cuts, cut_to_idx, parsed_cuts,
+     or_singles_intervals, parsed_nidx) = \
+        _prepare_cutstring_data(
+            colors, tree_name_to_nidx, entry_times, exit_times)
 
     # -- Build integer-indexed CSR graph -------------------------------------
     unitig_list, uid_to_int, csr_offsets, csr_neighbors = \
@@ -741,8 +806,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     _SHARED["cut_idx_array"] = cut_idx_array
     _SHARED["n_unitigs"] = N_unitigs
     _SHARED["max_hops"] = args.max_hops
+    _SHARED["or_singles_intervals"] = or_singles_intervals
     _SHARED["parsed_nidx"] = parsed_nidx
-    _SHARED["simple_nidx"] = simple_nidx
     _SHARED["entry"] = entry_times
     _SHARED["exit_"] = exit_times
 
@@ -781,8 +846,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     null_strict = _simpson_index(colors)
     null_ancdesc = _concordance_null(
-        colors, unique_cuts, parsed_nidx,
-        entry_times, exit_times, simple_nidx, rng)
+        colors, unique_cuts, or_singles_intervals, parsed_nidx,
+        entry_times, exit_times, rng)
 
     logger.info("Null strict (Simpson index): {:.6f}", null_strict)
     logger.info("Null anc/desc: {:.6f}", null_ancdesc)
