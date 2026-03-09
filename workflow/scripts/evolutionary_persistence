@@ -435,6 +435,38 @@ def _prepare_cutstring_data(
 # ---------------------------------------------------------------------------
 
 
+def _precompute_seed_concordance(
+    seed_cidx: int,
+    n_cutstrings: int,
+    or_singles_intervals: List[np.ndarray | None],
+    parsed_nidx: List[List[Tuple[int, ...]]],
+    entry: np.ndarray,
+    exit_: np.ndarray,
+) -> np.ndarray:
+    """Precompute concordance of one cut-string against all others.
+
+    Returns a bool array of length *n_cutstrings* where element j is True
+    if cut-string j is ancestor-descendant concordant with *seed_cidx*.
+    """
+    conc = np.zeros(n_cutstrings, dtype=np.bool_)
+    conc[seed_cidx] = True
+
+    seed_ivs = or_singles_intervals[seed_cidx]
+    seed_nidx = parsed_nidx[seed_cidx]
+
+    for j in range(n_cutstrings):
+        if j == seed_cidx:
+            continue
+        nb_ivs = or_singles_intervals[j]
+        if seed_ivs is not None and nb_ivs is not None:
+            if _intervals_concordant(seed_ivs, nb_ivs):
+                conc[j] = True
+        elif _concordance_check_nidx(seed_nidx, parsed_nidx[j], entry, exit_):
+            conc[j] = True
+
+    return conc
+
+
 def _bfs_coherence(
     seed_int: int,
     csr_offsets: np.ndarray,
@@ -442,30 +474,23 @@ def _bfs_coherence(
     cut_idx_array: np.ndarray,
     n_unitigs: int,
     max_hops: int,
-    or_singles_intervals: List[np.ndarray | None],
-    parsed_nidx: List[List[Tuple[int, ...]]],
-    entry: np.ndarray,
-    exit_: np.ndarray,
-    conc_cache: Dict[int, bool],
+    seed_conc: np.ndarray,
+    seed_cidx: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """BFS from *seed_int* up to *max_hops*, counting concordant neighbours.
 
-    Concordance with the seed's cut-string is checked on-the-fly.
-    *conc_cache* maps nb_cidx → bool for THIS seed's cut-string and is
-    shared across BFS calls from seeds with the same cut-string index.
+    *seed_conc* is a precomputed bool array of length M where
+    seed_conc[j] is True if cut-string j is concordant with the seed's
+    cut-string.
 
     Returns three int arrays of length max_hops (index 0 = hop 1):
         n_reached           -- total unitigs reached at each hop distance
         n_strict_concordant -- strict equality (index identity)
         n_ancdesc_concordant -- ancestor-descendant matches
     """
-    seed_cidx = cut_idx_array[seed_int]
     n_reached = np.zeros(max_hops, dtype=np.int64)
     n_strict = np.zeros(max_hops, dtype=np.int64)
     n_ancdesc = np.zeros(max_hops, dtype=np.int64)
-
-    seed_ivs = or_singles_intervals[seed_cidx]
-    seed_nidx = parsed_nidx[seed_cidx]
 
     visited = np.zeros(n_unitigs, dtype=np.bool_)
     visited[seed_int] = True
@@ -487,20 +512,8 @@ def _bfs_coherence(
                     if nb_cidx == seed_cidx:
                         n_strict[h] += 1
                         n_ancdesc[h] += 1
-                    else:
-                        cached = conc_cache.get(nb_cidx)
-                        if cached is None:
-                            nb_ivs = or_singles_intervals[nb_cidx]
-                            if seed_ivs is not None and nb_ivs is not None:
-                                cached = _intervals_concordant(
-                                    seed_ivs, nb_ivs)
-                            else:
-                                cached = _concordance_check_nidx(
-                                    seed_nidx, parsed_nidx[nb_cidx],
-                                    entry, exit_)
-                            conc_cache[nb_cidx] = cached
-                        if cached:
-                            n_ancdesc[h] += 1
+                    elif seed_conc[nb_cidx]:
+                        n_ancdesc[h] += 1
 
         frontier = next_frontier
         if not frontier:
@@ -524,6 +537,7 @@ def _worker_bfs(args_tuple):
     cut_idx_array = _SHARED["cut_idx_array"]
     n_unitigs = _SHARED["n_unitigs"]
     max_hops = _SHARED["max_hops"]
+    n_cutstrings = _SHARED["n_cutstrings"]
     or_singles_intervals = _SHARED["or_singles_intervals"]
     parsed_nidx = _SHARED["parsed_nidx"]
     entry = _SHARED["entry"]
@@ -533,34 +547,40 @@ def _worker_bfs(args_tuple):
     total_strict = np.zeros(max_hops, dtype=np.int64)
     total_ancdesc = np.zeros(max_hops, dtype=np.int64)
 
-    # Per-seed-cutstring concordance caches: seeds that share a cut-string
-    # reuse the same cache, avoiding redundant concordance computations.
-    cidx_caches: Dict[int, Dict[int, bool]] = {}
+    # Cache precomputed concordance arrays by seed cut-string index.
+    # Seeds sharing a cut-string reuse the same array (669K bools = 669KB).
+    conc_arrays: Dict[int, np.ndarray] = {}
 
     log_interval = max(1, len(seed_ints) // 20)
 
     for i, s in enumerate(seed_ints):
         seed_cidx = int(cut_idx_array[s])
-        if seed_cidx not in cidx_caches:
-            cidx_caches[seed_cidx] = {}
-        conc_cache = cidx_caches[seed_cidx]
+        if seed_cidx not in conc_arrays:
+            t_pre = time.time()
+            conc_arrays[seed_cidx] = _precompute_seed_concordance(
+                seed_cidx, n_cutstrings, or_singles_intervals,
+                parsed_nidx, entry, exit_)
+            if i == 0:
+                logger.info(
+                    "Worker {}: precomputed concordance for first seed "
+                    "({:,} cut-strings) in {:.2f}s",
+                    worker_id, n_cutstrings, time.time() - t_pre)
+        seed_conc = conc_arrays[seed_cidx]
 
         reached, strict, ancdesc = _bfs_coherence(
             s, csr_offsets, csr_neighbors, cut_idx_array,
-            n_unitigs, max_hops, or_singles_intervals, parsed_nidx,
-            entry, exit_, conc_cache)
+            n_unitigs, max_hops, seed_conc, seed_cidx)
         total_reached += reached
         total_strict += strict
         total_ancdesc += ancdesc
 
         if (i + 1) % log_interval == 0 or (i + 1) == len(seed_ints):
-            n_cached = sum(len(c) for c in cidx_caches.values())
             logger.info(
                 "Worker {}: BFS {}/{} seeds ({:.0f}%), "
-                "{:,} distinct seed cut-strings, {:,} cached pairs",
+                "{:,} distinct seed cut-strings precomputed",
                 worker_id, i + 1, len(seed_ints),
                 (i + 1) / len(seed_ints) * 100,
-                len(cidx_caches), n_cached)
+                len(conc_arrays))
 
     return total_reached, total_strict, total_ancdesc
 
@@ -806,6 +826,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     _SHARED["cut_idx_array"] = cut_idx_array
     _SHARED["n_unitigs"] = N_unitigs
     _SHARED["max_hops"] = args.max_hops
+    _SHARED["n_cutstrings"] = len(unique_cuts)
     _SHARED["or_singles_intervals"] = or_singles_intervals
     _SHARED["parsed_nidx"] = parsed_nidx
     _SHARED["entry"] = entry_times
