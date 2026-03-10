@@ -65,7 +65,7 @@ rule evolutionary_persistence:
     params:
         script=str(SCRIPTS_DIR / "evolutionary_persistence"),
         max_hops=20,
-        samples=10000,
+        samples=5000,
     threads: MAX_THREADS
     conda:
         "../envs/ete4.yml"

@@ -31,6 +31,9 @@ TSV with columns:
 """
 
 from __future__ import annotations
+import os
+os.environ["NUMBA_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1" # Good practice for NumPy + Multiprocessing too
 
 import argparse
 import multiprocessing as mp
@@ -38,11 +41,13 @@ import sqlite3
 import sys
 import time
 from collections import defaultdict
-from itertools import permutations
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
+import numba
+from numba import njit, types
+from numba.typed import List as NumbaList
 
 try:
     from ete4 import Tree
@@ -104,14 +109,9 @@ def _parse_cutstring(cs: str) -> List[FrozenSet[str]]:
 
 
 def _build_euler_tour(
-    tree: Tree, ) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
-    """Euler-tour entry/exit times for O(1) ancestor-descendant queries.
-
-    Returns:
-        entry  -- int32 array indexed by node index, DFS entry time
-        exit_  -- int32 array indexed by node index, DFS exit time
-        name_to_nidx -- mapping from node name to index
-    """
+    tree: Tree,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """Euler-tour entry/exit times for O(1) ancestor-descendant queries."""
     named_nodes = sorted({n.name for n in tree.traverse() if n.name})
     name_to_nidx = {n: i for i, n in enumerate(named_nodes)}
     N = len(name_to_nidx)
@@ -139,48 +139,229 @@ def _build_euler_tour(
 
 
 # ---------------------------------------------------------------------------
-# Ancestor-descendant concordance check
+# Build ancestor/descendant sets for each tree node
 # ---------------------------------------------------------------------------
 
 
-def _is_anc_or_desc(
-    a: int,
-    b: int,
-    entry: np.ndarray,
-    exit_: np.ndarray,
+def _build_ancdesc_sets(
+    tree: Tree,
+    name_to_nidx: Dict[str, int],
+    n_nodes: int,
+) -> List[Set[int]]:
+    """For each tree node index, build the set of all nodes that are
+    ancestors or descendants of it (including itself)."""
+    children_of: List[List[int]] = [[] for _ in range(n_nodes)]
+    parent_of: List[int] = [-1] * n_nodes
+
+    for node in tree.traverse():
+        if not node.name or node.name not in name_to_nidx:
+            continue
+        nidx = name_to_nidx[node.name]
+        for child in node.children:
+            if child.name and child.name in name_to_nidx:
+                cidx = name_to_nidx[child.name]
+                children_of[nidx].append(cidx)
+                parent_of[cidx] = nidx
+
+    ancdesc: List[Set[int]] = [set() for _ in range(n_nodes)]
+
+    for nidx in range(n_nodes):
+        ancdesc[nidx].add(nidx)
+
+        # Walk up to root (ancestors)
+        cur = parent_of[nidx]
+        while cur != -1:
+            ancdesc[nidx].add(cur)
+            cur = parent_of[cur]
+
+        # Walk down (descendants) via DFS
+        stack = list(children_of[nidx])
+        while stack:
+            c = stack.pop()
+            ancdesc[nidx].add(c)
+            stack.extend(children_of[c])
+
+    return ancdesc
+
+
+# ---------------------------------------------------------------------------
+# Inverted index: tree node → cut-string indices containing that node
+# ---------------------------------------------------------------------------
+
+
+def _build_node_to_cutstrings(
+    parsed_nidx: List[List[Tuple[int, ...]]],
+    n_tree_nodes: int,
+) -> List[np.ndarray]:
+    """Build inverted index: for each tree node, which cut-string indices
+    contain that node in at least one alternative."""
+    node_to_cs: List[List[int]] = [[] for _ in range(n_tree_nodes)]
+
+    for cs_idx, alts in enumerate(parsed_nidx):
+        seen_nodes: Set[int] = set()
+        for alt in alts:
+            for nidx in alt:
+                if nidx not in seen_nodes:
+                    seen_nodes.add(nidx)
+                    node_to_cs[nidx].append(cs_idx)
+
+    return [np.array(lst, dtype=np.int32) for lst in node_to_cs]
+
+
+# ---------------------------------------------------------------------------
+# Numba-JIT concordance helpers
+# ---------------------------------------------------------------------------
+
+
+@njit(cache=True)
+def _is_anc_or_desc_nb(
+    ea: np.int32, xa: np.int32,
+    eb: np.int32, xb: np.int32,
 ) -> bool:
-    """O(1) ancestor-or-descendant check via Euler-tour times."""
-    return ((entry[a] <= entry[b] and exit_[b] <= exit_[a])
-            or (entry[b] <= entry[a] and exit_[a] <= exit_[b]))
+    """O(1) ancestor-or-descendant check via Euler-tour intervals."""
+    return (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb)
 
 
-def _max_bipartite_matching(adj: List[List[int]], n_right: int) -> int:
-    """Maximum bipartite matching via augmenting paths.
+@njit(cache=True)
+def _injective_ancdesc_match_nb(
+    ta: np.ndarray,   # int32 array of node indices (smaller set)
+    tb: np.ndarray,   # int32 array of node indices (larger set)
+    entry: np.ndarray, # int32 array
+    exit_: np.ndarray, # int32 array
+) -> bool:
+    """Injective anc/desc matching — numba-compiled.
 
-    Args:
-        adj    -- adj[u] = list of right-side vertices that u can match to
-        n_right -- number of right-side vertices
-
-    Returns:
-        size of maximum matching
+    Assumes len(ta) <= len(tb).
     """
-    match_r = [-1] * n_right
+    n_small = len(ta)
+    n_large = len(tb)
 
-    def _aug(u: int, visited: List[bool]) -> bool:
-        for v in adj[u]:
-            if not visited[v]:
-                visited[v] = True
-                if match_r[v] == -1 or _aug(match_r[v], visited):
-                    match_r[v] = u
-                    return True
+    if n_small == 0:
         return False
 
-    matching = 0
-    for u in range(len(adj)):
-        visited = [False] * n_right
-        if _aug(u, visited):
+    # Single vs anything: O(|larger|)
+    if n_small == 1:
+        ea = entry[ta[0]]
+        xa = exit_[ta[0]]
+        for j in range(n_large):
+            eb = entry[tb[j]]
+            xb = exit_[tb[j]]
+            if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
+                return True
+        return False
+
+    # For small n_small (≤4): stack-based backtracking
+    # This avoids the need for itertools.permutations in numba
+    if n_small <= 4:
+        return _backtrack_match_v2(ta, tb, entry, exit_, n_small, n_large)
+
+    # Larger sets: bipartite matching via augmenting paths
+    return _bipartite_match_nb(ta, tb, entry, exit_, n_small, n_large)
+
+
+@njit(cache=True)
+def _backtrack_match_v2(
+    ta: np.ndarray, tb: np.ndarray,
+    entry: np.ndarray, exit_: np.ndarray,
+    n_small: int, n_large: int,
+) -> bool:
+    """Clean stack-based backtracking for injective matching."""
+    used = np.zeros(n_large, dtype=numba.boolean)
+    match_j = np.full(n_small, -1, dtype=np.int32)  # which j is matched at each depth
+    scan_from = np.zeros(n_small, dtype=np.int32)  # where to resume scanning
+    depth = np.int32(0)
+
+    while True:
+        if depth == n_small:
+            return True
+
+        ea = entry[ta[depth]]
+        xa = exit_[ta[depth]]
+        found = False
+
+        for j in range(scan_from[depth], n_large):
+            if not used[j]:
+                eb = entry[tb[j]]
+                xb = exit_[tb[j]]
+                if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
+                    used[j] = True
+                    match_j[depth] = j
+                    scan_from[depth] = j + 1
+                    depth += 1
+                    if depth < n_small:
+                        scan_from[depth] = 0
+                        match_j[depth] = -1
+                    found = True
+                    break
+
+        if not found:
+            # Backtrack
+            scan_from[depth] = 0
+            match_j[depth] = -1
+            depth -= 1
+            if depth < 0:
+                return False
+            # Undo match at current depth
+            old_j = match_j[depth]
+            used[old_j] = False
+            # scan_from[depth] is already set to old_j + 1
+            # (it was set when we made the match)
+
+
+@njit(cache=True)
+def _bipartite_match_nb(
+    ta: np.ndarray, tb: np.ndarray,
+    entry: np.ndarray, exit_: np.ndarray,
+    n_small: int, n_large: int,
+) -> bool:
+    """Bipartite matching via augmenting paths — numba-compiled.
+
+    Builds adjacency on-the-fly and uses Hungarian-style augmenting paths.
+    """
+    # Build adjacency matrix
+    adj = np.zeros((n_small, n_large), dtype=numba.boolean)
+    for i in range(n_small):
+        ea = entry[ta[i]]
+        xa = exit_[ta[i]]
+        for j in range(n_large):
+            eb = entry[tb[j]]
+            xb = exit_[tb[j]]
+            if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
+                adj[i, j] = True
+
+    # Augmenting path matching
+    match_r = np.full(n_large, -1, dtype=np.int32)
+    matching = np.int32(0)
+
+    for u in range(n_small):
+        visited = np.zeros(n_large, dtype=numba.boolean)
+        if _aug_nb(u, adj, match_r, visited, n_large):
             matching += 1
-    return matching
+
+    return matching == n_small
+
+
+@njit(cache=True)
+def _aug_nb(
+    u: int,
+    adj: np.ndarray,    # (n_small, n_large) bool
+    match_r: np.ndarray, # int32[n_large]
+    visited: np.ndarray, # bool[n_large]
+    n_large: int,
+) -> bool:
+    """Augmenting path for bipartite matching — numba-compiled."""
+    for v in range(n_large):
+        if adj[u, v] and not visited[v]:
+            visited[v] = True
+            if match_r[v] == -1 or _aug_nb(match_r[v], adj, match_r, visited, n_large):
+                match_r[v] = u
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Python-level concordance wrappers (call into numba)
+# ---------------------------------------------------------------------------
 
 
 def _concordance_check_nidx(
@@ -189,10 +370,10 @@ def _concordance_check_nidx(
     entry: np.ndarray,
     exit_: np.ndarray,
 ) -> bool:
-    """Concordance check using precomputed node-index tuples.
+    """Full concordance check using precomputed node-index tuples.
 
-    Each argument is a list of alternatives, where each alternative is
-    a tuple of tree-node indices (precomputed from name_to_nidx).
+    Returns True if any alternative from A can be injectively matched
+    (anc/desc) to any alternative from B.
     """
     for ta in nidx_a:
         if not ta:
@@ -200,60 +381,12 @@ def _concordance_check_nidx(
         for tb in nidx_b:
             if not tb:
                 continue
-            if _injective_ancdesc_match_nidx(ta, tb, entry, exit_):
-                return True
-    return False
-
-
-def _injective_ancdesc_match_nidx(
-    ta: Tuple[int, ...],
-    tb: Tuple[int, ...],
-    entry: np.ndarray,
-    exit_: np.ndarray,
-) -> bool:
-    """Injective anc/desc matching on precomputed node-index tuples."""
-    # Ensure |small| <= |large|
-    if len(ta) > len(tb):
-        ta, tb = tb, ta
-
-    # Single vs anything: O(|larger|)
-    if len(ta) == 1:
-        a = ta[0]
-        ea, xa = int(entry[a]), int(exit_[a])
-        for b in tb:
-            eb, xb = int(entry[b]), int(exit_[b])
-            if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
-                return True
-        return False
-
-    # Small sets (≤2): brute-force permutations
-    if len(ta) <= 2:
-        for perm in permutations(tb, len(ta)):
-            if all(_is_anc_or_desc(ta[i], perm[i], entry, exit_)
-                   for i in range(len(ta))):
-                return True
-        return False
-
-    # Larger sets: bipartite matching
-    adj_lists: List[List[int]] = []
-    for a in ta:
-        adj_lists.append([j for j, b in enumerate(tb)
-                          if _is_anc_or_desc(a, b, entry, exit_)])
-    return _max_bipartite_matching(adj_lists, len(tb)) == len(ta)
-
-
-def _intervals_concordant(ivs_a: np.ndarray, ivs_b: np.ndarray) -> bool:
-    """Fast concordance check for OR-of-singles cut-strings.
-
-    Each argument is an (N, 2) int32 array of Euler-tour (entry, exit)
-    intervals.  Returns True if any interval from A has an
-    ancestor-descendant relationship with any interval from B.
-    """
-    for i in range(len(ivs_a)):
-        ea, xa = int(ivs_a[i, 0]), int(ivs_a[i, 1])
-        for j in range(len(ivs_b)):
-            eb, xb = int(ivs_b[j, 0]), int(ivs_b[j, 1])
-            if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
+            # Ensure |small| <= |large|
+            if len(ta) > len(tb):
+                small, large = np.array(tb, dtype=np.int32), np.array(ta, dtype=np.int32)
+            else:
+                small, large = np.array(ta, dtype=np.int32), np.array(tb, dtype=np.int32)
+            if _injective_ancdesc_match_nb(small, large, entry, exit_):
                 return True
     return False
 
@@ -264,16 +397,11 @@ def _intervals_concordant(ivs_a: np.ndarray, ivs_b: np.ndarray) -> bool:
 
 
 def _load_graph_and_colors(
-    db_path: Path, ) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
-    """Load adjacency list and cut-string assignments from SQLite.
-
-    Returns:
-        adj    -- adj[uid] = list of neighbor uids (undirected)
-        colors -- colors[uid] = raw cut-string (or "None")
-    """
+    db_path: Path,
+) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+    """Load adjacency list and cut-string assignments from SQLite."""
     conn = sqlite3.connect(db_path)
 
-    # Adjacency → undirected
     adj: Dict[str, List[str]] = defaultdict(list)
     for uid, _, nid, _ in conn.execute(
             "SELECT unitig_id, unitig_direction, "
@@ -281,14 +409,12 @@ def _load_graph_and_colors(
         adj[uid].append(nid)
         adj[nid].append(uid)
 
-    # Cut-strings
     colors: Dict[str, str] = {}
     for uid, cs in conn.execute("SELECT unitig_id, colors FROM unitigs"):
         colors[uid] = cs if cs else "None"
 
     conn.close()
 
-    # Ensure every unitig in colors has an adjacency entry (isolated nodes)
     for uid in colors:
         if uid not in adj:
             adj[uid] = []
@@ -308,16 +434,7 @@ def _build_csr_graph(
     adj: Dict[str, List[str]],
     colors: Dict[str, str],
 ) -> Tuple[List[str], Dict[str, int], np.ndarray, np.ndarray]:
-    """Convert string-keyed graph to integer-indexed CSR arrays.
-
-    Eliminates hash lookups in the BFS hot loop.
-
-    Returns:
-        unitig_list   -- sorted list of unitig IDs
-        uid_to_int    -- mapping from unitig ID to integer index
-        csr_offsets   -- int64 array [N+1], row pointers into csr_neighbors
-        csr_neighbors -- int32 array, concatenated neighbor indices
-    """
+    """Convert string-keyed graph to integer-indexed CSR arrays."""
     unitig_list = sorted(colors.keys())
     uid_to_int = {uid: i for i, uid in enumerate(unitig_list)}
     N = len(unitig_list)
@@ -345,29 +462,12 @@ def _build_csr_graph(
 def _prepare_cutstring_data(
     colors: Dict[str, str],
     tree_name_to_nidx: Dict[str, int],
-    entry: np.ndarray,
-    exit_: np.ndarray,
 ) -> Tuple[
-    List[str], Dict[str, int],
-    List[List[FrozenSet[str]]], List[np.ndarray | None],
-    List[List[Tuple[int, ...]]],
+    List[str],                       # unique_cuts
+    Dict[str, int],                  # cut_to_idx
+    List[List[Tuple[int, ...]]],     # parsed_nidx
 ]:
-    """Parse cut-strings and precompute node-index tuples.
-
-    Skips the O(K²) pairwise concordance matrix entirely.  Concordance
-    is checked on-the-fly during BFS, with a per-seed cache so each
-    distinct cut-string pair is evaluated at most once per seed.
-
-    Returns:
-        unique_cuts          -- list of M unique cut-strings
-        cut_to_idx           -- mapping from cut-string to index
-        parsed_cuts          -- parsed form of each unique cut-string
-        or_singles_intervals -- for each cut-string, an (N,2) int32 array
-                                of Euler-tour (entry, exit) intervals if all
-                                alternatives are single-node, else None
-        parsed_nidx          -- precomputed node-index tuples per cut-string
-                                (only needed for non-OR-of-singles fallback)
-    """
+    """Parse cut-strings and precompute node-index tuples."""
     cut_counts: Dict[str, int] = defaultdict(int)
     for cs in colors.values():
         cut_counts[cs] += 1
@@ -375,13 +475,10 @@ def _prepare_cutstring_data(
     unique_cuts = list(cut_counts.keys())
     cut_to_idx = {cs: i for i, cs in enumerate(unique_cuts)}
     M = len(unique_cuts)
-
     logger.info("Unique cut-strings: {:,}", M)
 
     parsed_cuts = [_parse_cutstring(cs) for cs in unique_cuts]
 
-    # Precompute node-index tuples for each alternative (avoids repeated
-    # name→index resolution in the hot loops)
     parsed_nidx: List[List[Tuple[int, ...]]] = []
     for p in parsed_cuts:
         nidx_alts: List[Tuple[int, ...]] = []
@@ -391,121 +488,71 @@ def _prepare_cutstring_data(
                       if n in tree_name_to_nidx))
         parsed_nidx.append(nidx_alts)
 
-    # Build OR-of-singles intervals: for cut-strings where every alternative
-    # is a single tree node, precompute Euler-tour intervals for fast
-    # concordance checks.  This covers both "simple" (1 alternative, 1 node)
-    # and "OR-of-singles" (e.g. "NodeA OR NodeB") — typically the vast
-    # majority of Fitch parsimony assignments.
-    or_singles_intervals: List[np.ndarray | None] = []
-    n_or_singles = 0
-    n_complex = 0
-    for alts in parsed_nidx:
-        # Check: every alternative must be a singleton tuple with a valid node
-        nodes = []
-        is_or_singles = True
-        for t in alts:
-            if len(t) == 1:
-                nodes.append(t[0])
-            else:
-                is_or_singles = False
-                break
-        if is_or_singles and nodes:
-            ivs = np.empty((len(nodes), 2), dtype=np.int32)
-            for k, n in enumerate(nodes):
-                ivs[k, 0] = entry[n]
-                ivs[k, 1] = exit_[n]
-            or_singles_intervals.append(ivs)
-            n_or_singles += 1
-        else:
-            or_singles_intervals.append(None)
-            n_complex += 1
-
+    # Log some statistics
+    n_single_alt = sum(1 for alts in parsed_nidx if len(alts) == 1)
+    n_multi_alt = M - n_single_alt
+    sizes = [len(alts[0]) for alts in parsed_nidx if len(alts) == 1]
+    if sizes:
+        avg_size = sum(sizes) / len(sizes)
+        max_size = max(sizes)
+    else:
+        avg_size = max_size = 0
     logger.info(
-        "OR-of-singles cut-strings: {:,}/{:,} ({:.1f}%) — "
-        "complex (multi-node alternatives): {:,} ({:.1f}%)",
-        n_or_singles, M, 100.0 * n_or_singles / max(M, 1),
-        n_complex, 100.0 * n_complex / max(M, 1))
+        "Single-alt: {:,} ({:.1f}%), multi-alt: {:,} ({:.1f}%), "
+        "avg nodes/alt: {:.1f}, max: {}",
+        n_single_alt, 100.0 * n_single_alt / max(M, 1),
+        n_multi_alt, 100.0 * n_multi_alt / max(M, 1),
+        avg_size, max_size)
 
-    return (unique_cuts, cut_to_idx, parsed_cuts,
-            or_singles_intervals, parsed_nidx)
+    return unique_cuts, cut_to_idx, parsed_nidx
 
 
 # ---------------------------------------------------------------------------
-# BFS coherence measurement
+# Numba-JIT BFS
 # ---------------------------------------------------------------------------
 
 
-def _precompute_seed_concordance(
-    seed_cidx: int,
-    n_cutstrings: int,
-    or_singles_intervals: List[np.ndarray | None],
-    parsed_nidx: List[List[Tuple[int, ...]]],
-    entry: np.ndarray,
-    exit_: np.ndarray,
-) -> np.ndarray:
-    """Precompute concordance of one cut-string against all others.
-
-    Returns a bool array of length *n_cutstrings* where element j is True
-    if cut-string j is ancestor-descendant concordant with *seed_cidx*.
-    """
-    conc = np.zeros(n_cutstrings, dtype=np.bool_)
-    conc[seed_cidx] = True
-
-    seed_ivs = or_singles_intervals[seed_cidx]
-    seed_nidx = parsed_nidx[seed_cidx]
-
-    for j in range(n_cutstrings):
-        if j == seed_cidx:
-            continue
-        nb_ivs = or_singles_intervals[j]
-        if seed_ivs is not None and nb_ivs is not None:
-            if _intervals_concordant(seed_ivs, nb_ivs):
-                conc[j] = True
-        elif _concordance_check_nidx(seed_nidx, parsed_nidx[j], entry, exit_):
-            conc[j] = True
-
-    return conc
-
-
+@njit(cache=True)
 def _bfs_coherence(
-    seed_int: int,
-    csr_offsets: np.ndarray,
-    csr_neighbors: np.ndarray,
-    cut_idx_array: np.ndarray,
+    seed_int: np.int32,
+    csr_offsets: np.ndarray,   # int64
+    csr_neighbors: np.ndarray, # int32
+    cut_idx_array: np.ndarray, # int32
     n_unitigs: int,
     max_hops: int,
-    seed_conc: np.ndarray,
-    seed_cidx: int,
+    seed_conc: np.ndarray,     # bool
+    seed_cidx: np.int32,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """BFS from *seed_int* up to *max_hops*, counting concordant neighbours.
 
-    *seed_conc* is a precomputed bool array of length M where
-    seed_conc[j] is True if cut-string j is concordant with the seed's
-    cut-string.
-
-    Returns three int arrays of length max_hops (index 0 = hop 1):
-        n_reached           -- total unitigs reached at each hop distance
-        n_strict_concordant -- strict equality (index identity)
-        n_ancdesc_concordant -- ancestor-descendant matches
+    Numba-compiled for C-level performance on the hot inner loop.
+    Uses pre-allocated arrays instead of Python lists for the frontier.
     """
     n_reached = np.zeros(max_hops, dtype=np.int64)
     n_strict = np.zeros(max_hops, dtype=np.int64)
     n_ancdesc = np.zeros(max_hops, dtype=np.int64)
 
-    visited = np.zeros(n_unitigs, dtype=np.bool_)
+    visited = np.zeros(n_unitigs, dtype=numba.boolean)
     visited[seed_int] = True
-    frontier = [seed_int]
+
+    # Pre-allocate frontier arrays (worst case: all nodes)
+    frontier = np.empty(n_unitigs, dtype=np.int32)
+    next_frontier = np.empty(n_unitigs, dtype=np.int32)
+    frontier[0] = seed_int
+    frontier_size = np.int32(1)
 
     for h in range(max_hops):
-        next_frontier: List[int] = []
-        for uid_int in frontier:
+        next_size = np.int32(0)
+        for fi in range(frontier_size):
+            uid_int = frontier[fi]
             start = csr_offsets[uid_int]
             end = csr_offsets[uid_int + 1]
             for j in range(start, end):
                 nb_int = csr_neighbors[j]
                 if not visited[nb_int]:
                     visited[nb_int] = True
-                    next_frontier.append(nb_int)
+                    next_frontier[next_size] = nb_int
+                    next_size += 1
                     n_reached[h] += 1
                     nb_cidx = cut_idx_array[nb_int]
 
@@ -515,11 +562,68 @@ def _bfs_coherence(
                     elif seed_conc[nb_cidx]:
                         n_ancdesc[h] += 1
 
-        frontier = next_frontier
-        if not frontier:
+        if next_size == 0:
             break
 
+        # Swap frontiers
+        frontier_size = next_size
+        tmp = frontier
+        frontier = next_frontier
+        next_frontier = tmp
+
     return n_reached, n_strict, n_ancdesc
+
+
+# ---------------------------------------------------------------------------
+# Concordance precomputation via tree-indexed lookup
+# ---------------------------------------------------------------------------
+
+
+def _precompute_seed_concordance(
+    seed_cidx: int,
+    n_cutstrings: int,
+    parsed_nidx: List[List[Tuple[int, ...]]],
+    entry: np.ndarray,
+    exit_: np.ndarray,
+    ancdesc_sets: List[Set[int]],
+    node_to_cutstrings: List[np.ndarray],
+) -> np.ndarray:
+    """Precompute concordance of one cut-string against all others.
+
+    Uses the inverted index approach: only checks candidates that share
+    an ancestor/descendant tree node with the seed.
+    """
+    conc = np.zeros(n_cutstrings, dtype=np.bool_)
+    conc[seed_cidx] = True
+
+    seed_alts = parsed_nidx[seed_cidx]
+
+    # Collect all tree nodes in seed's alternatives
+    seed_nodes: Set[int] = set()
+    for alt in seed_alts:
+        seed_nodes.update(alt)
+
+    if not seed_nodes:
+        return conc
+
+    # Gather candidate cut-strings via inverted index
+    candidate_set: Set[int] = set()
+    for sn in seed_nodes:
+        ad_nodes = ancdesc_sets[sn]
+        for ad_node in ad_nodes:
+            cs_array = node_to_cutstrings[ad_node]
+            if len(cs_array) > 0:
+                candidate_set.update(cs_array.tolist())
+
+    candidate_set.discard(seed_cidx)
+
+    # Full concordance check on candidates only
+    for cidx in candidate_set:
+        if _concordance_check_nidx(seed_alts, parsed_nidx[cidx],
+                                   entry, exit_):
+            conc[cidx] = True
+
+    return conc
 
 
 # ---------------------------------------------------------------------------
@@ -538,19 +642,17 @@ def _worker_bfs(args_tuple):
     n_unitigs = _SHARED["n_unitigs"]
     max_hops = _SHARED["max_hops"]
     n_cutstrings = _SHARED["n_cutstrings"]
-    or_singles_intervals = _SHARED["or_singles_intervals"]
     parsed_nidx = _SHARED["parsed_nidx"]
     entry = _SHARED["entry"]
     exit_ = _SHARED["exit_"]
+    ancdesc_sets = _SHARED["ancdesc_sets"]
+    node_to_cutstrings = _SHARED["node_to_cutstrings"]
 
     total_reached = np.zeros(max_hops, dtype=np.int64)
     total_strict = np.zeros(max_hops, dtype=np.int64)
     total_ancdesc = np.zeros(max_hops, dtype=np.int64)
 
-    # Cache precomputed concordance arrays by seed cut-string index.
-    # Seeds sharing a cut-string reuse the same array (669K bools = 669KB).
     conc_arrays: Dict[int, np.ndarray] = {}
-
     log_interval = max(1, len(seed_ints) // 20)
 
     for i, s in enumerate(seed_ints):
@@ -558,18 +660,26 @@ def _worker_bfs(args_tuple):
         if seed_cidx not in conc_arrays:
             t_pre = time.time()
             conc_arrays[seed_cidx] = _precompute_seed_concordance(
-                seed_cidx, n_cutstrings, or_singles_intervals,
-                parsed_nidx, entry, exit_)
+                seed_cidx, n_cutstrings, parsed_nidx,
+                entry, exit_, ancdesc_sets, node_to_cutstrings)
+            elapsed = time.time() - t_pre
+            n_conc = int(conc_arrays[seed_cidx].sum())
             if i == 0:
                 logger.info(
                     "Worker {}: precomputed concordance for first seed "
-                    "({:,} cut-strings) in {:.2f}s",
-                    worker_id, n_cutstrings, time.time() - t_pre)
+                    "({:,} cut-strings, {:,} concordant) in {:.2f}s",
+                    worker_id, n_cutstrings, n_conc, elapsed)
+            elif elapsed > 5.0:
+                logger.debug(
+                    "Worker {}: slow concordance precompute for seed {} "
+                    "({:,} concordant) in {:.2f}s",
+                    worker_id, s, n_conc, elapsed)
+
         seed_conc = conc_arrays[seed_cidx]
 
         reached, strict, ancdesc = _bfs_coherence(
-            s, csr_offsets, csr_neighbors, cut_idx_array,
-            n_unitigs, max_hops, seed_conc, seed_cidx)
+            np.int32(s), csr_offsets, csr_neighbors, cut_idx_array,
+            n_unitigs, max_hops, seed_conc, np.int32(seed_cidx))
         total_reached += reached
         total_strict += strict
         total_ancdesc += ancdesc
@@ -591,32 +701,31 @@ def _worker_bfs(args_tuple):
 
 
 def _simpson_index(colors: Dict[str, str]) -> float:
-    """Probability two randomly chosen unitigs have the same cut-string.
-
-    This is Σ fᵢ² (Simpson's index / Herfindahl index).
-    """
+    """Probability two randomly chosen unitigs have the same cut-string."""
     total = len(colors)
     if total == 0:
         return 0.0
     counts: Dict[str, int] = defaultdict(int)
     for cs in colors.values():
         counts[cs] += 1
-    return sum((c / total)**2 for c in counts.values())
+    return sum((c / total) ** 2 for c in counts.values())
 
 
 def _concordance_null(
     colors: Dict[str, str],
     unique_cuts: List[str],
-    or_singles_intervals: List[np.ndarray | None],
     parsed_nidx: List[List[Tuple[int, ...]]],
     entry: np.ndarray,
     exit_: np.ndarray,
-    rng: np.random.Generator | None = None,
+    ancdesc_sets: List[Set[int]],
+    node_to_cutstrings: List[np.ndarray],
+    rng: Optional[np.random.Generator] = None,
 ) -> float:
     """Null expectation for anc/desc coherence: Σ_{i,j coherent} f_i * f_j.
 
-    Estimated by sampling random cut-string pairs weighted by frequency.
-    Uses a pair cache to avoid recomputing concordance for repeated pairs.
+    Vectorized approach: draw 1M sample pairs, deduplicate to unique
+    (i,j) pairs, run concordance check once per unique pair, then
+    weight by frequency of occurrence.
     """
     total = len(colors)
     if total == 0:
@@ -631,36 +740,54 @@ def _concordance_null(
     if rng is None:
         rng = np.random.default_rng(42)
     n_samples = 1_000_000
+
     idx_a = rng.choice(len(unique_cuts), size=n_samples, p=freqs)
     idx_b = rng.choice(len(unique_cuts), size=n_samples, p=freqs)
 
-    pair_cache: Dict[Tuple[int, int], bool] = {}
-    n_coherent = 0
-    for k in range(n_samples):
-        i, j = int(idx_a[k]), int(idx_b[k])
-        if i == j:
-            n_coherent += 1
-            continue
-        key = (i, j) if i < j else (j, i)
-        cached = pair_cache.get(key)
-        if cached is None:
-            ivs_i = or_singles_intervals[i]
-            ivs_j = or_singles_intervals[j]
-            if ivs_i is not None and ivs_j is not None:
-                cached = _intervals_concordant(ivs_i, ivs_j)
-            else:
-                cached = _concordance_check_nidx(
-                    parsed_nidx[i], parsed_nidx[j], entry, exit_)
-            pair_cache[key] = cached
-        if cached:
-            n_coherent += 1
+    # Count how many samples are same-index (automatically concordant)
+    same_mask = idx_a == idx_b
+    n_same = int(same_mask.sum())
 
+    # For different pairs, canonicalize (min, max) and count unique pairs
+    diff_mask = ~same_mask
+    a_diff = idx_a[diff_mask]
+    b_diff = idx_b[diff_mask]
+
+    # Canonicalize: ensure a <= b
+    swap_mask = a_diff > b_diff
+    a_diff[swap_mask], b_diff[swap_mask] = b_diff[swap_mask].copy(), a_diff[swap_mask].copy()
+
+    # Pack into single int64 for fast unique counting
+    # (each index fits in int32, so pack two into int64)
+    pair_keys = a_diff.astype(np.int64) * len(unique_cuts) + b_diff.astype(np.int64)
+    unique_keys, pair_counts = np.unique(pair_keys, return_counts=True)
+
+    # Unpack unique pairs
+    M = len(unique_cuts)
+    unique_a = (unique_keys // M).astype(np.int32)
+    unique_b = (unique_keys % M).astype(np.int32)
+
+    logger.info(
+        "Null estimation: {:,} samples → {:,} same-index + "
+        "{:,} unique different pairs to check",
+        n_samples, n_same, len(unique_keys))
+
+    # Check concordance for each unique pair
+    t0 = time.time()
+    n_coherent_diff = 0
+    for k in range(len(unique_keys)):
+        i, j = int(unique_a[k]), int(unique_b[k])
+        if _concordance_check_nidx(
+                parsed_nidx[i], parsed_nidx[j], entry, exit_):
+            n_coherent_diff += int(pair_counts[k])
+
+    n_coherent = n_same + n_coherent_diff
     estimate = n_coherent / n_samples
-    se = (estimate * (1 - estimate) / n_samples)**0.5
+    se = (estimate * (1 - estimate) / n_samples) ** 0.5
     logger.info(
         "Anc/desc null estimated from {:,} samples: {:.6f} "
-        "(SE \u2248 {:.6f}, {:,} unique pairs cached)",
-        n_samples, estimate, se, len(pair_cache))
+        "(SE ≈ {:.6f}, {:,} unique pairs checked in {:.1f}s)",
+        n_samples, estimate, se, len(unique_keys), time.time() - t0)
     return estimate
 
 
@@ -687,32 +814,16 @@ def _plot_decay(
     sns.set_theme(style="white", context="notebook")
     fig, ax = plt.subplots(figsize=(7, 4.5))
 
-    ax.plot(hops,
-            coherence_ancdesc,
-            marker="o",
-            linewidth=1.5,
-            markersize=4,
-            label="Anc/desc coherence",
-            color="tab:blue")
-    ax.plot(hops,
-            coherence_strict,
-            marker="s",
-            linewidth=1.5,
-            markersize=3,
-            linestyle="--",
-            label="Strict coherence",
+    ax.plot(hops, coherence_ancdesc, marker="o", linewidth=1.5,
+            markersize=4, label="Anc/desc coherence", color="tab:blue")
+    ax.plot(hops, coherence_strict, marker="s", linewidth=1.5,
+            markersize=3, linestyle="--", label="Strict coherence",
             color="tab:orange")
-    ax.axhline(null_ancdesc,
-               color="tab:blue",
-               linestyle=":",
-               linewidth=1,
-               alpha=0.7,
+    ax.axhline(null_ancdesc, color="tab:blue", linestyle=":",
+               linewidth=1, alpha=0.7,
                label=f"Null anc/desc = {null_ancdesc:.4f}")
-    ax.axhline(null_strict,
-               color="tab:orange",
-               linestyle=":",
-               linewidth=1,
-               alpha=0.7,
+    ax.axhline(null_strict, color="tab:orange", linestyle=":",
+               linewidth=1, alpha=0.7,
                label=f"Null strict = {null_strict:.4f}")
 
     ax.set_xlabel("Hop distance")
@@ -728,6 +839,31 @@ def _plot_decay(
 
 
 # ---------------------------------------------------------------------------
+# Numba warmup
+# ---------------------------------------------------------------------------
+
+
+def _warmup_numba(entry: np.ndarray, exit_: np.ndarray) -> None:
+    """Pre-compile numba functions with small dummy data."""
+    t0 = time.time()
+
+    # Warm up _injective_ancdesc_match_nb and its callees
+    dummy_a = np.array([0], dtype=np.int32)
+    dummy_b = np.array([0, 1], dtype=np.int32)
+    _injective_ancdesc_match_nb(dummy_a, dummy_b, entry, exit_)
+
+    # Warm up _bfs_coherence
+    dummy_offsets = np.array([0, 1, 2], dtype=np.int64)
+    dummy_neighbors = np.array([1, 0], dtype=np.int32)
+    dummy_cut = np.array([0, 0], dtype=np.int32)
+    dummy_conc = np.array([True, True], dtype=np.bool_)
+    _bfs_coherence(np.int32(0), dummy_offsets, dummy_neighbors,
+                   dummy_cut, 2, 1, dummy_conc, np.int32(0))
+
+    logger.info("Numba warmup complete in {:.1f}s", time.time() - t0)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -737,45 +873,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         description=
         "Evolutionary persistence — coherence decay along graph walks.")
     parser.add_argument(
-        "--db",
-        type=Path,
-        required=True,
+        "--db", type=Path, required=True,
         help="SQLite database with unitigs and adjacency tables.")
     parser.add_argument(
-        "--tree",
-        type=Path,
-        required=True,
+        "--tree", type=Path, required=True,
         help="Postprocessed Newick tree with named internal nodes.")
-    parser.add_argument("--max-hops",
-                        type=int,
-                        default=20,
+    parser.add_argument("--max-hops", type=int, default=20,
                         help="Maximum BFS walk distance (default: 20).")
     parser.add_argument(
-        "--samples",
-        type=int,
-        default=10_000,
+        "--samples", type=int, default=10_000,
         help="Number of seed unitigs to sample (default: 10000).")
-    parser.add_argument("--seed",
-                        type=int,
-                        default=42,
+    parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility (default: 42).")
-    parser.add_argument("--output",
-                        type=Path,
-                        required=True,
+    parser.add_argument("--output", type=Path, required=True,
                         help="Output TSV path.")
-    parser.add_argument("--plot",
-                        type=Path,
-                        default=None,
+    parser.add_argument("--plot", type=Path, default=None,
                         help="Optional path for an SVG decay-curve plot.")
-    parser.add_argument("--jobs",
-                        type=int,
-                        default=1,
+    parser.add_argument("--jobs", type=int, default=1,
                         help="Number of parallel workers (default: 1).")
     parser.add_argument(
-        "-v",
-        "--verbose",
-        action="count",
-        default=0,
+        "-v", "--verbose", action="count", default=0,
         help="Increase verbosity (-v for INFO, -vv for DEBUG).")
 
     args = parser.parse_args(argv)
@@ -789,24 +906,42 @@ def main(argv: Sequence[str] | None = None) -> None:
         tree.name = "Root"
 
     entry_times, exit_times, tree_name_to_nidx = _build_euler_tour(tree)
-    logger.info("Euler tour built for {:,} named nodes",
-                len(tree_name_to_nidx))
+    n_tree_nodes = len(tree_name_to_nidx)
+    logger.info("Euler tour built for {:,} named nodes", n_tree_nodes)
+
+    # -- Build ancestor/descendant sets for each tree node -------------------
+    t0_ad = time.time()
+    ancdesc_sets = _build_ancdesc_sets(tree, tree_name_to_nidx, n_tree_nodes)
+    avg_ad = sum(len(s) for s in ancdesc_sets) / max(n_tree_nodes, 1)
+    logger.info(
+        "Ancestor/descendant sets built in {:.1f}s, "
+        "avg set size: {:.1f} nodes",
+        time.time() - t0_ad, avg_ad)
+
+    # -- Warm up numba -------------------------------------------------------
+    _warmup_numba(entry_times, exit_times)
 
     # -- Load graph ----------------------------------------------------------
     adj, colors = _load_graph_and_colors(args.db)
 
-    # -- Parse cut-strings and precompute node-index data --------------------
-    (unique_cuts, cut_to_idx, parsed_cuts,
-     or_singles_intervals, parsed_nidx) = \
-        _prepare_cutstring_data(
-            colors, tree_name_to_nidx, entry_times, exit_times)
+    # -- Parse cut-strings ---------------------------------------------------
+    unique_cuts, cut_to_idx, parsed_nidx = \
+        _prepare_cutstring_data(colors, tree_name_to_nidx)
+
+    # -- Build inverted index ------------------------------------------------
+    t0_inv = time.time()
+    node_to_cutstrings = _build_node_to_cutstrings(parsed_nidx, n_tree_nodes)
+    total_entries = sum(len(a) for a in node_to_cutstrings)
+    logger.info(
+        "Inverted index built in {:.1f}s, "
+        "{:,} total entries across {:,} tree nodes",
+        time.time() - t0_inv, total_entries, n_tree_nodes)
 
     # -- Build integer-indexed CSR graph -------------------------------------
     unitig_list, uid_to_int, csr_offsets, csr_neighbors = \
         _build_csr_graph(adj, colors)
     N_unitigs = len(unitig_list)
 
-    # Cut-string index for each unitig (int array indexed by unitig integer)
     cut_idx_array = np.array([cut_to_idx[colors[uid]] for uid in unitig_list],
                              dtype=np.int32)
 
@@ -827,10 +962,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     _SHARED["n_unitigs"] = N_unitigs
     _SHARED["max_hops"] = args.max_hops
     _SHARED["n_cutstrings"] = len(unique_cuts)
-    _SHARED["or_singles_intervals"] = or_singles_intervals
     _SHARED["parsed_nidx"] = parsed_nidx
     _SHARED["entry"] = entry_times
     _SHARED["exit_"] = exit_times
+    _SHARED["ancdesc_sets"] = ancdesc_sets
+    _SHARED["node_to_cutstrings"] = node_to_cutstrings
 
     t0 = time.time()
     n_jobs = max(1, args.jobs)
@@ -867,8 +1003,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     null_strict = _simpson_index(colors)
     null_ancdesc = _concordance_null(
-        colors, unique_cuts, or_singles_intervals, parsed_nidx,
-        entry_times, exit_times, rng)
+        colors, unique_cuts, parsed_nidx,
+        entry_times, exit_times,
+        ancdesc_sets, node_to_cutstrings, rng)
 
     logger.info("Null strict (Simpson index): {:.6f}", null_strict)
     logger.info("Null anc/desc: {:.6f}", null_ancdesc)
@@ -915,7 +1052,6 @@ def main(argv: Sequence[str] | None = None) -> None:
               file=sys.stderr)
         print(f"Anc/desc (h=1):       {coherence_ancdesc[0]:.6f}",
               file=sys.stderr)
-    # Find hop where each curve first drops below its null
     cross_s = np.where((coherence_strict <= null_strict)
                        & ~np.isnan(coherence_strict))[0]
     cross_c = np.where((coherence_ancdesc <= null_ancdesc)
