@@ -647,10 +647,14 @@ def _worker_bfs(args_tuple):
     exit_ = _SHARED["exit_"]
     ancdesc_sets = _SHARED["ancdesc_sets"]
     node_to_cutstrings = _SHARED["node_to_cutstrings"]
+    collect_per_seed = _SHARED.get("collect_per_seed", False)
 
     total_reached = np.zeros(max_hops, dtype=np.int64)
     total_strict = np.zeros(max_hops, dtype=np.int64)
     total_ancdesc = np.zeros(max_hops, dtype=np.int64)
+
+    # Per-seed data: list of (seed_int, reached_array, ancdesc_array)
+    per_seed_data = [] if collect_per_seed else None
 
     conc_arrays: Dict[int, np.ndarray] = {}
     log_interval = max(1, len(seed_ints) // 20)
@@ -684,6 +688,9 @@ def _worker_bfs(args_tuple):
         total_strict += strict
         total_ancdesc += ancdesc
 
+        if collect_per_seed:
+            per_seed_data.append((s, reached.copy(), strict.copy(), ancdesc.copy()))
+
         if (i + 1) % log_interval == 0 or (i + 1) == len(seed_ints):
             logger.info(
                 "Worker {}: BFS {}/{} seeds ({:.0f}%), "
@@ -692,7 +699,7 @@ def _worker_bfs(args_tuple):
                 (i + 1) / len(seed_ints) * 100,
                 len(conc_arrays))
 
-    return total_reached, total_strict, total_ancdesc
+    return total_reached, total_strict, total_ancdesc, per_seed_data
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +896,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         help="Output TSV path.")
     parser.add_argument("--plot", type=Path, default=None,
                         help="Optional path for an SVG decay-curve plot.")
+    parser.add_argument("--per-seed-output", type=Path, default=None,
+                        help="Optional path for per-seed persistence TSV "
+                             "(unitig ID + persistence length in hops).")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Number of parallel workers (default: 1).")
     parser.add_argument(
@@ -967,13 +977,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     _SHARED["exit_"] = exit_times
     _SHARED["ancdesc_sets"] = ancdesc_sets
     _SHARED["node_to_cutstrings"] = node_to_cutstrings
+    _SHARED["collect_per_seed"] = args.per_seed_output is not None
 
     t0 = time.time()
     n_jobs = max(1, args.jobs)
+    all_per_seed_data = []
 
     if n_jobs == 1:
-        total_reached, total_strict, total_ancdesc = _worker_bfs(
+        total_reached, total_strict, total_ancdesc, per_seed = _worker_bfs(
             (seed_ints, 0))
+        if per_seed:
+            all_per_seed_data.extend(per_seed)
     else:
         chunks = np.array_split(seed_ints, n_jobs)
         worker_args = [(list(chunk), i) for i, chunk in enumerate(chunks)
@@ -985,11 +999,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         ctx = mp.get_context("fork")
         with ctx.Pool(n_jobs) as pool:
-            for reached, strict, ancdesc in pool.imap_unordered(
+            for reached, strict, ancdesc, per_seed in pool.imap_unordered(
                     _worker_bfs, worker_args):
                 total_reached += reached
                 total_strict += strict
                 total_ancdesc += ancdesc
+                if per_seed:
+                    all_per_seed_data.extend(per_seed)
 
     logger.info("BFS complete: {:,} seeds in {:.1f}s", n_seeds,
                 time.time() - t0)
@@ -1028,6 +1044,48 @@ def main(argv: Sequence[str] | None = None) -> None:
                       f"{c_str}\t{null_strict:.6f}\t{null_ancdesc:.6f}\n")
 
     logger.info("Output written to {}", args.output)
+
+    # -- Per-seed persistence output -------------------------------------------
+    if args.per_seed_output is not None and all_per_seed_data:
+        args.per_seed_output.parent.mkdir(parents=True, exist_ok=True)
+        n_written = 0
+        with args.per_seed_output.open("w") as out:
+            out.write("seed_unitig_id\tpersistence_ancdesc\t"
+                      "persistence_strict\tcoherence_ancdesc_h1\t"
+                      "coherence_strict_h1\n")
+            for seed_int, reached, strict, ancdesc in all_per_seed_data:
+                uid = unitig_list[seed_int]
+
+                # Per-seed coherence at each hop
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    per_hop_ancdesc = np.where(
+                        reached > 0, ancdesc / reached, np.nan)
+                    per_hop_strict = np.where(
+                        reached > 0, strict / reached, np.nan)
+
+                # Persistence = first hop where coherence drops below null
+                cross_ad = np.where(
+                    (per_hop_ancdesc <= null_ancdesc)
+                    & ~np.isnan(per_hop_ancdesc))[0]
+                persist_ad = int(cross_ad[0] + 1) if len(cross_ad) > 0 else args.max_hops
+
+                cross_st = np.where(
+                    (per_hop_strict <= null_strict)
+                    & ~np.isnan(per_hop_strict))[0]
+                persist_st = int(cross_st[0] + 1) if len(cross_st) > 0 else args.max_hops
+
+                # Coherence at hop 1
+                h1_ad = (f"{per_hop_ancdesc[0]:.6f}"
+                         if not np.isnan(per_hop_ancdesc[0]) else "NA")
+                h1_st = (f"{per_hop_strict[0]:.6f}"
+                         if not np.isnan(per_hop_strict[0]) else "NA")
+
+                out.write(f"{uid}\t{persist_ad}\t{persist_st}\t"
+                          f"{h1_ad}\t{h1_st}\n")
+                n_written += 1
+
+        logger.info("Per-seed persistence written to {} ({:,} seeds)",
+                    args.per_seed_output, n_written)
 
     # -- Plot ----------------------------------------------------------------
     if args.plot is not None:

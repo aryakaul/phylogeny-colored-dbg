@@ -46,6 +46,21 @@ def fn_evolutionary_persistence_plot(
     )
 
 
+def fn_evolutionary_persistence_per_seed(
+    batch: str | None = None, _batch: str | None = None
+) -> str:
+    """Output path for per-seed persistence TSV."""
+    batch_id = batch if batch is not None else _batch
+    if batch_id is None:
+        raise ValueError("Batch identifier is required.")
+    label = parsimony_label()
+    return str(
+        dir_output()
+        / "persistence"
+        / f"{batch_id}_k{KMER_LENGTH}_{label}_per_seed_persistence.tsv"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rule: Evolutionary persistence
 # ---------------------------------------------------------------------------
@@ -62,6 +77,7 @@ rule evolutionary_persistence:
     output:
         tsv=fn_evolutionary_persistence(_batch="{batch}"),
         plot=fn_evolutionary_persistence_plot(_batch="{batch}"),
+        per_seed=fn_evolutionary_persistence_per_seed(_batch="{batch}"),
     params:
         script=str(SCRIPTS_DIR / "evolutionary_persistence"),
         max_hops=20,
@@ -80,5 +96,6 @@ rule evolutionary_persistence:
             --jobs {threads} \\
             --output {output.tsv} \\
             --plot {output.plot} \\
+            --per-seed-output {output.per_seed} \\
             -v
         """
