@@ -5,6 +5,17 @@ The pipeline couples classical colored DBG construction (via Cuttlefish) with
 parsimony analysis on a provided phylogeny to recolor the DBG based on the 
 parsimonious presence/absence of individual unitigs.
 
+<p align="center">
+  <img src="assets/schematic.png" alt="Classical colored de Bruijn graph versus a phylogeny-colored de Bruijn graph" width="720"/>
+</p>
+
+<p align="center">
+  <sub><b>A.</b> In a classical compacted colored de Bruijn graph, each unitig carries one
+  color per sample it occurs in. <b>B.</b> In a phylogeny-colored de Bruijn graph, each unitig
+  instead carries the internal node of the phylogeny that most parsimoniously explains its
+  presence/absence pattern.</sub>
+</p>
+
 ## Contents
 
 - [Overview](#overview)
@@ -173,6 +184,17 @@ For each batch `{batch}` and parsimony label `{mode_label}` (e.g., `fitch`,
 - Analysis outputs under `output/breakpoints/`, `output/severity/`,
   `output/persistence/`, and `output/stratification/` — see
   [Phylogenetic Analyses](#phylogenetic-analyses).
+
+<p align="center">
+  <img src="assets/pcdbg_example.png" alt="Phylogeny-colored de Bruijn graph rendered in Bandage" width="600"/>
+</p>
+
+<p align="center">
+  <sub>The bundled test dataset rendered in <a href="https://rrwick.github.io/Bandage/">Bandage</a>,
+  with unitigs colored by their assigned internal node. Labels such as
+  <code>sample1-up2 OR sample6</code> mark unitigs whose presence/absence pattern has more than
+  one equally parsimonious explanation.</sub>
+</p>
 
 The compression metrics TSV contains four numeric rows:
 

@@ -31,5 +31,8 @@ AGENT*
 *.png
 *.gfa
 
+# ...except figures the README uses
+!assets/*.png
+
 # manuscript (tracked files predate this rule)
 manuscript/
