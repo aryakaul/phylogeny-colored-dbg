@@ -1,0 +1,1129 @@
+#!/usr/bin/env python3
+"""Evolutionary persistence — coherence decay along graph walks.
+
+Measures the spatial extent over which evolutionary history is conserved
+as you walk outward from a unitig in the compacted colored de Bruijn graph.
+
+Reports two coherence metrics at each hop distance:
+
+- **Strict coherence**: fraction of reached unitigs with the same
+  cut-string as the seed (integer index equality).
+- **Ancestor-descendant coherence**: fraction where one cut-string's
+  assignment is in an ancestor-descendant-or-equal relationship with the
+  other's on the phylogenetic tree.  This captures unitigs that share a
+  primary evolutionary event but differ in secondary refinements.
+
+Each metric has its own null expectation (constant across hops):
+
+- Strict null = Simpson index: Σ fᵢ².
+- Anc/desc null = Σ_{(i,j) coherent} fᵢ·fⱼ, estimated by sampling
+  when the number of unique cut-strings is large.
+
+The gap between the two curves quantifies how much of the pangenome
+has been secondarily modified after initial acquisition.
+
+Output
+------
+TSV with columns:
+
+    hop_distance  n_pairs  n_strict_coherent  n_ancdesc_coherent
+    strict_coherence  ancdesc_coherence  null_strict  null_ancdesc
+"""
+
+from __future__ import annotations
+import os
+os.environ["NUMBA_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1" # Good practice for NumPy + Multiprocessing too
+
+import argparse
+import multiprocessing as mp
+import sqlite3
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+import numba
+from numba import njit, types
+from numba.typed import List as NumbaList
+
+try:
+    from ete4 import Tree
+except ImportError:
+    from ete3 import Tree
+
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+
+def _configure_logger(verbosity: int) -> None:
+    """0 → WARNING, 1 → INFO, 2+ → DEBUG."""
+    try:
+        from loguru import logger as _lg
+        _lg.remove()
+        level = "WARNING" if verbosity == 0 else (
+            "INFO" if verbosity == 1 else "DEBUG")
+        _lg.add(sys.stderr, level=level)
+    except ImportError:
+        import logging
+        level = (logging.WARNING if verbosity == 0 else
+                 logging.INFO if verbosity == 1 else logging.DEBUG)
+        logging.basicConfig(level=level, stream=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Cut-string parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_cutstring(cs: str) -> List[FrozenSet[str]]:
+    """Parse a cut-string into a list of alternative solution sets.
+
+    Rules:
+        "NodeA"             → [{NodeA}]
+        "NodeA,NodeB"       → [{NodeA, NodeB}]
+        "NodeA OR NodeB,NodeC" → [{NodeA}, {NodeB, NodeC}]
+    """
+    if not cs or cs == "None":
+        return [frozenset({"__UNASSIGNED__"})]
+    alternatives = cs.split(" OR ")
+    solutions = []
+    for alt in alternatives:
+        nodes = frozenset(n.strip() for n in alt.split(",") if n.strip())
+        solutions.append(nodes)
+    return solutions
+
+
+# ---------------------------------------------------------------------------
+# Tree: Euler tour for O(1) ancestor-descendant queries
+# ---------------------------------------------------------------------------
+
+
+def _build_euler_tour(
+    tree: Tree,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """Euler-tour entry/exit times for O(1) ancestor-descendant queries."""
+    named_nodes = sorted({n.name for n in tree.traverse() if n.name})
+    name_to_nidx = {n: i for i, n in enumerate(named_nodes)}
+    N = len(name_to_nidx)
+
+    entry = np.zeros(N, dtype=np.int32)
+    exit_ = np.zeros(N, dtype=np.int32)
+
+    clock = 0
+    stack: List[Tuple[Tree, bool]] = [(tree, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            if node.name and node.name in name_to_nidx:
+                exit_[name_to_nidx[node.name]] = clock
+            clock += 1
+        else:
+            if node.name and node.name in name_to_nidx:
+                entry[name_to_nidx[node.name]] = clock
+            clock += 1
+            stack.append((node, True))
+            for child in reversed(node.children):
+                stack.append((child, False))
+
+    return entry, exit_, name_to_nidx
+
+
+# ---------------------------------------------------------------------------
+# Build ancestor/descendant sets for each tree node
+# ---------------------------------------------------------------------------
+
+
+def _build_ancdesc_sets(
+    tree: Tree,
+    name_to_nidx: Dict[str, int],
+    n_nodes: int,
+) -> List[Set[int]]:
+    """For each tree node index, build the set of all nodes that are
+    ancestors or descendants of it (including itself)."""
+    children_of: List[List[int]] = [[] for _ in range(n_nodes)]
+    parent_of: List[int] = [-1] * n_nodes
+
+    for node in tree.traverse():
+        if not node.name or node.name not in name_to_nidx:
+            continue
+        nidx = name_to_nidx[node.name]
+        for child in node.children:
+            if child.name and child.name in name_to_nidx:
+                cidx = name_to_nidx[child.name]
+                children_of[nidx].append(cidx)
+                parent_of[cidx] = nidx
+
+    ancdesc: List[Set[int]] = [set() for _ in range(n_nodes)]
+
+    for nidx in range(n_nodes):
+        ancdesc[nidx].add(nidx)
+
+        # Walk up to root (ancestors)
+        cur = parent_of[nidx]
+        while cur != -1:
+            ancdesc[nidx].add(cur)
+            cur = parent_of[cur]
+
+        # Walk down (descendants) via DFS
+        stack = list(children_of[nidx])
+        while stack:
+            c = stack.pop()
+            ancdesc[nidx].add(c)
+            stack.extend(children_of[c])
+
+    return ancdesc
+
+
+# ---------------------------------------------------------------------------
+# Inverted index: tree node → cut-string indices containing that node
+# ---------------------------------------------------------------------------
+
+
+def _build_node_to_cutstrings(
+    parsed_nidx: List[List[Tuple[int, ...]]],
+    n_tree_nodes: int,
+) -> List[np.ndarray]:
+    """Build inverted index: for each tree node, which cut-string indices
+    contain that node in at least one alternative."""
+    node_to_cs: List[List[int]] = [[] for _ in range(n_tree_nodes)]
+
+    for cs_idx, alts in enumerate(parsed_nidx):
+        seen_nodes: Set[int] = set()
+        for alt in alts:
+            for nidx in alt:
+                if nidx not in seen_nodes:
+                    seen_nodes.add(nidx)
+                    node_to_cs[nidx].append(cs_idx)
+
+    return [np.array(lst, dtype=np.int32) for lst in node_to_cs]
+
+
+# ---------------------------------------------------------------------------
+# Numba-JIT concordance helpers
+# ---------------------------------------------------------------------------
+
+
+@njit(cache=True)
+def _is_anc_or_desc_nb(
+    ea: np.int32, xa: np.int32,
+    eb: np.int32, xb: np.int32,
+) -> bool:
+    """O(1) ancestor-or-descendant check via Euler-tour intervals."""
+    return (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb)
+
+
+@njit(cache=True)
+def _injective_ancdesc_match_nb(
+    ta: np.ndarray,   # int32 array of node indices (smaller set)
+    tb: np.ndarray,   # int32 array of node indices (larger set)
+    entry: np.ndarray, # int32 array
+    exit_: np.ndarray, # int32 array
+) -> bool:
+    """Injective anc/desc matching — numba-compiled.
+
+    Assumes len(ta) <= len(tb).
+    """
+    n_small = len(ta)
+    n_large = len(tb)
+
+    if n_small == 0:
+        return False
+
+    # Single vs anything: O(|larger|)
+    if n_small == 1:
+        ea = entry[ta[0]]
+        xa = exit_[ta[0]]
+        for j in range(n_large):
+            eb = entry[tb[j]]
+            xb = exit_[tb[j]]
+            if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
+                return True
+        return False
+
+    # For small n_small (≤4): stack-based backtracking
+    # This avoids the need for itertools.permutations in numba
+    if n_small <= 4:
+        return _backtrack_match_v2(ta, tb, entry, exit_, n_small, n_large)
+
+    # Larger sets: bipartite matching via augmenting paths
+    return _bipartite_match_nb(ta, tb, entry, exit_, n_small, n_large)
+
+
+@njit(cache=True)
+def _backtrack_match_v2(
+    ta: np.ndarray, tb: np.ndarray,
+    entry: np.ndarray, exit_: np.ndarray,
+    n_small: int, n_large: int,
+) -> bool:
+    """Clean stack-based backtracking for injective matching."""
+    used = np.zeros(n_large, dtype=numba.boolean)
+    match_j = np.full(n_small, -1, dtype=np.int32)  # which j is matched at each depth
+    scan_from = np.zeros(n_small, dtype=np.int32)  # where to resume scanning
+    depth = np.int32(0)
+
+    while True:
+        if depth == n_small:
+            return True
+
+        ea = entry[ta[depth]]
+        xa = exit_[ta[depth]]
+        found = False
+
+        for j in range(scan_from[depth], n_large):
+            if not used[j]:
+                eb = entry[tb[j]]
+                xb = exit_[tb[j]]
+                if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
+                    used[j] = True
+                    match_j[depth] = j
+                    scan_from[depth] = j + 1
+                    depth += 1
+                    if depth < n_small:
+                        scan_from[depth] = 0
+                        match_j[depth] = -1
+                    found = True
+                    break
+
+        if not found:
+            # Backtrack
+            scan_from[depth] = 0
+            match_j[depth] = -1
+            depth -= 1
+            if depth < 0:
+                return False
+            # Undo match at current depth
+            old_j = match_j[depth]
+            used[old_j] = False
+            # scan_from[depth] is already set to old_j + 1
+            # (it was set when we made the match)
+
+
+@njit(cache=True)
+def _bipartite_match_nb(
+    ta: np.ndarray, tb: np.ndarray,
+    entry: np.ndarray, exit_: np.ndarray,
+    n_small: int, n_large: int,
+) -> bool:
+    """Bipartite matching via augmenting paths — numba-compiled.
+
+    Builds adjacency on-the-fly and uses Hungarian-style augmenting paths.
+    """
+    # Build adjacency matrix
+    adj = np.zeros((n_small, n_large), dtype=numba.boolean)
+    for i in range(n_small):
+        ea = entry[ta[i]]
+        xa = exit_[ta[i]]
+        for j in range(n_large):
+            eb = entry[tb[j]]
+            xb = exit_[tb[j]]
+            if (ea <= eb and xb <= xa) or (eb <= ea and xa <= xb):
+                adj[i, j] = True
+
+    # Augmenting path matching
+    match_r = np.full(n_large, -1, dtype=np.int32)
+    matching = np.int32(0)
+
+    for u in range(n_small):
+        visited = np.zeros(n_large, dtype=numba.boolean)
+        if _aug_nb(u, adj, match_r, visited, n_large):
+            matching += 1
+
+    return matching == n_small
+
+
+@njit(cache=True)
+def _aug_nb(
+    u: int,
+    adj: np.ndarray,    # (n_small, n_large) bool
+    match_r: np.ndarray, # int32[n_large]
+    visited: np.ndarray, # bool[n_large]
+    n_large: int,
+) -> bool:
+    """Augmenting path for bipartite matching — numba-compiled."""
+    for v in range(n_large):
+        if adj[u, v] and not visited[v]:
+            visited[v] = True
+            if match_r[v] == -1 or _aug_nb(match_r[v], adj, match_r, visited, n_large):
+                match_r[v] = u
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Python-level concordance wrappers (call into numba)
+# ---------------------------------------------------------------------------
+
+
+def _concordance_check_nidx(
+    nidx_a: List[Tuple[int, ...]],
+    nidx_b: List[Tuple[int, ...]],
+    entry: np.ndarray,
+    exit_: np.ndarray,
+) -> bool:
+    """Full concordance check using precomputed node-index tuples.
+
+    Returns True if any alternative from A can be injectively matched
+    (anc/desc) to any alternative from B.
+    """
+    for ta in nidx_a:
+        if not ta:
+            continue
+        for tb in nidx_b:
+            if not tb:
+                continue
+            # Ensure |small| <= |large|
+            if len(ta) > len(tb):
+                small, large = np.array(tb, dtype=np.int32), np.array(ta, dtype=np.int32)
+            else:
+                small, large = np.array(ta, dtype=np.int32), np.array(tb, dtype=np.int32)
+            if _injective_ancdesc_match_nb(small, large, entry, exit_):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Graph loading
+# ---------------------------------------------------------------------------
+
+
+def _load_graph_and_colors(
+    db_path: Path,
+) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+    """Load adjacency list and cut-string assignments from SQLite."""
+    conn = sqlite3.connect(db_path)
+
+    adj: Dict[str, List[str]] = defaultdict(list)
+    for uid, _, nid, _ in conn.execute(
+            "SELECT unitig_id, unitig_direction, "
+            "neighbor_id, neighbor_direction FROM adjacency"):
+        adj[uid].append(nid)
+        adj[nid].append(uid)
+
+    colors: Dict[str, str] = {}
+    for uid, cs in conn.execute("SELECT unitig_id, colors FROM unitigs"):
+        colors[uid] = cs if cs else "None"
+
+    conn.close()
+
+    for uid in colors:
+        if uid not in adj:
+            adj[uid] = []
+
+    logger.info(
+        "Graph loaded: {:,} unitigs, {:,} undirected adjacency entries",
+        len(colors), sum(len(v) for v in adj.values()))
+    return dict(adj), colors
+
+
+# ---------------------------------------------------------------------------
+# Integer-indexed CSR graph for fast BFS
+# ---------------------------------------------------------------------------
+
+
+def _build_csr_graph(
+    adj: Dict[str, List[str]],
+    colors: Dict[str, str],
+) -> Tuple[List[str], Dict[str, int], np.ndarray, np.ndarray]:
+    """Convert string-keyed graph to integer-indexed CSR arrays."""
+    unitig_list = sorted(colors.keys())
+    uid_to_int = {uid: i for i, uid in enumerate(unitig_list)}
+    N = len(unitig_list)
+
+    offsets = np.zeros(N + 1, dtype=np.int64)
+    nb_list: List[int] = []
+    for i, uid in enumerate(unitig_list):
+        nbs = adj.get(uid, [])
+        nb_list.extend(uid_to_int[nb] for nb in nbs)
+        offsets[i + 1] = len(nb_list)
+
+    csr_neighbors = (np.array(nb_list, dtype=np.int32)
+                     if nb_list else np.empty(0, dtype=np.int32))
+
+    logger.info("CSR graph: {:,} nodes, {:,} directed entries", N,
+                len(csr_neighbors))
+    return unitig_list, uid_to_int, offsets, csr_neighbors
+
+
+# ---------------------------------------------------------------------------
+# Cut-string data preparation
+# ---------------------------------------------------------------------------
+
+
+def _prepare_cutstring_data(
+    colors: Dict[str, str],
+    tree_name_to_nidx: Dict[str, int],
+) -> Tuple[
+    List[str],                       # unique_cuts
+    Dict[str, int],                  # cut_to_idx
+    List[List[Tuple[int, ...]]],     # parsed_nidx
+]:
+    """Parse cut-strings and precompute node-index tuples."""
+    cut_counts: Dict[str, int] = defaultdict(int)
+    for cs in colors.values():
+        cut_counts[cs] += 1
+
+    unique_cuts = list(cut_counts.keys())
+    cut_to_idx = {cs: i for i, cs in enumerate(unique_cuts)}
+    M = len(unique_cuts)
+    logger.info("Unique cut-strings: {:,}", M)
+
+    parsed_cuts = [_parse_cutstring(cs) for cs in unique_cuts]
+
+    parsed_nidx: List[List[Tuple[int, ...]]] = []
+    for p in parsed_cuts:
+        nidx_alts: List[Tuple[int, ...]] = []
+        for fs in p:
+            nidx_alts.append(
+                tuple(tree_name_to_nidx[n] for n in fs
+                      if n in tree_name_to_nidx))
+        parsed_nidx.append(nidx_alts)
+
+    # Log some statistics
+    n_single_alt = sum(1 for alts in parsed_nidx if len(alts) == 1)
+    n_multi_alt = M - n_single_alt
+    sizes = [len(alts[0]) for alts in parsed_nidx if len(alts) == 1]
+    if sizes:
+        avg_size = sum(sizes) / len(sizes)
+        max_size = max(sizes)
+    else:
+        avg_size = max_size = 0
+    logger.info(
+        "Single-alt: {:,} ({:.1f}%), multi-alt: {:,} ({:.1f}%), "
+        "avg nodes/alt: {:.1f}, max: {}",
+        n_single_alt, 100.0 * n_single_alt / max(M, 1),
+        n_multi_alt, 100.0 * n_multi_alt / max(M, 1),
+        avg_size, max_size)
+
+    return unique_cuts, cut_to_idx, parsed_nidx
+
+
+# ---------------------------------------------------------------------------
+# Numba-JIT BFS
+# ---------------------------------------------------------------------------
+
+
+@njit(cache=True)
+def _bfs_coherence(
+    seed_int: np.int32,
+    csr_offsets: np.ndarray,   # int64
+    csr_neighbors: np.ndarray, # int32
+    cut_idx_array: np.ndarray, # int32
+    n_unitigs: int,
+    max_hops: int,
+    seed_conc: np.ndarray,     # bool
+    seed_cidx: np.int32,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """BFS from *seed_int* up to *max_hops*, counting concordant neighbours.
+
+    Numba-compiled for C-level performance on the hot inner loop.
+    Uses pre-allocated arrays instead of Python lists for the frontier.
+    """
+    n_reached = np.zeros(max_hops, dtype=np.int64)
+    n_strict = np.zeros(max_hops, dtype=np.int64)
+    n_ancdesc = np.zeros(max_hops, dtype=np.int64)
+
+    visited = np.zeros(n_unitigs, dtype=numba.boolean)
+    visited[seed_int] = True
+
+    # Pre-allocate frontier arrays (worst case: all nodes)
+    frontier = np.empty(n_unitigs, dtype=np.int32)
+    next_frontier = np.empty(n_unitigs, dtype=np.int32)
+    frontier[0] = seed_int
+    frontier_size = np.int32(1)
+
+    for h in range(max_hops):
+        next_size = np.int32(0)
+        for fi in range(frontier_size):
+            uid_int = frontier[fi]
+            start = csr_offsets[uid_int]
+            end = csr_offsets[uid_int + 1]
+            for j in range(start, end):
+                nb_int = csr_neighbors[j]
+                if not visited[nb_int]:
+                    visited[nb_int] = True
+                    next_frontier[next_size] = nb_int
+                    next_size += 1
+                    n_reached[h] += 1
+                    nb_cidx = cut_idx_array[nb_int]
+
+                    if nb_cidx == seed_cidx:
+                        n_strict[h] += 1
+                        n_ancdesc[h] += 1
+                    elif seed_conc[nb_cidx]:
+                        n_ancdesc[h] += 1
+
+        if next_size == 0:
+            break
+
+        # Swap frontiers
+        frontier_size = next_size
+        tmp = frontier
+        frontier = next_frontier
+        next_frontier = tmp
+
+    return n_reached, n_strict, n_ancdesc
+
+
+# ---------------------------------------------------------------------------
+# Concordance precomputation via tree-indexed lookup
+# ---------------------------------------------------------------------------
+
+
+def _precompute_seed_concordance(
+    seed_cidx: int,
+    n_cutstrings: int,
+    parsed_nidx: List[List[Tuple[int, ...]]],
+    entry: np.ndarray,
+    exit_: np.ndarray,
+    ancdesc_sets: List[Set[int]],
+    node_to_cutstrings: List[np.ndarray],
+) -> np.ndarray:
+    """Precompute concordance of one cut-string against all others.
+
+    Uses the inverted index approach: only checks candidates that share
+    an ancestor/descendant tree node with the seed.
+    """
+    conc = np.zeros(n_cutstrings, dtype=np.bool_)
+    conc[seed_cidx] = True
+
+    seed_alts = parsed_nidx[seed_cidx]
+
+    # Collect all tree nodes in seed's alternatives
+    seed_nodes: Set[int] = set()
+    for alt in seed_alts:
+        seed_nodes.update(alt)
+
+    if not seed_nodes:
+        return conc
+
+    # Gather candidate cut-strings via inverted index
+    candidate_set: Set[int] = set()
+    for sn in seed_nodes:
+        ad_nodes = ancdesc_sets[sn]
+        for ad_node in ad_nodes:
+            cs_array = node_to_cutstrings[ad_node]
+            if len(cs_array) > 0:
+                candidate_set.update(cs_array.tolist())
+
+    candidate_set.discard(seed_cidx)
+
+    # Full concordance check on candidates only
+    for cidx in candidate_set:
+        if _concordance_check_nidx(seed_alts, parsed_nidx[cidx],
+                                   entry, exit_):
+            conc[cidx] = True
+
+    return conc
+
+
+# ---------------------------------------------------------------------------
+# Shared state for fork-based multiprocessing
+# ---------------------------------------------------------------------------
+
+_SHARED: Dict = {}
+
+
+def _worker_bfs(args_tuple):
+    """Process a batch of seeds.  Reads shared data from _SHARED."""
+    seed_ints, worker_id = args_tuple
+    csr_offsets = _SHARED["csr_offsets"]
+    csr_neighbors = _SHARED["csr_neighbors"]
+    cut_idx_array = _SHARED["cut_idx_array"]
+    n_unitigs = _SHARED["n_unitigs"]
+    max_hops = _SHARED["max_hops"]
+    n_cutstrings = _SHARED["n_cutstrings"]
+    parsed_nidx = _SHARED["parsed_nidx"]
+    entry = _SHARED["entry"]
+    exit_ = _SHARED["exit_"]
+    ancdesc_sets = _SHARED["ancdesc_sets"]
+    node_to_cutstrings = _SHARED["node_to_cutstrings"]
+    collect_per_seed = _SHARED.get("collect_per_seed", False)
+
+    total_reached = np.zeros(max_hops, dtype=np.int64)
+    total_strict = np.zeros(max_hops, dtype=np.int64)
+    total_ancdesc = np.zeros(max_hops, dtype=np.int64)
+
+    # Per-seed data: list of (seed_int, reached_array, ancdesc_array)
+    per_seed_data = [] if collect_per_seed else None
+
+    conc_arrays: Dict[int, np.ndarray] = {}
+    log_interval = max(1, len(seed_ints) // 20)
+
+    for i, s in enumerate(seed_ints):
+        seed_cidx = int(cut_idx_array[s])
+        if seed_cidx not in conc_arrays:
+            t_pre = time.time()
+            conc_arrays[seed_cidx] = _precompute_seed_concordance(
+                seed_cidx, n_cutstrings, parsed_nidx,
+                entry, exit_, ancdesc_sets, node_to_cutstrings)
+            elapsed = time.time() - t_pre
+            n_conc = int(conc_arrays[seed_cidx].sum())
+            if i == 0:
+                logger.info(
+                    "Worker {}: precomputed concordance for first seed "
+                    "({:,} cut-strings, {:,} concordant) in {:.2f}s",
+                    worker_id, n_cutstrings, n_conc, elapsed)
+            elif elapsed > 5.0:
+                logger.debug(
+                    "Worker {}: slow concordance precompute for seed {} "
+                    "({:,} concordant) in {:.2f}s",
+                    worker_id, s, n_conc, elapsed)
+
+        seed_conc = conc_arrays[seed_cidx]
+
+        reached, strict, ancdesc = _bfs_coherence(
+            np.int32(s), csr_offsets, csr_neighbors, cut_idx_array,
+            n_unitigs, max_hops, seed_conc, np.int32(seed_cidx))
+        total_reached += reached
+        total_strict += strict
+        total_ancdesc += ancdesc
+
+        if collect_per_seed:
+            per_seed_data.append((s, reached.copy(), strict.copy(), ancdesc.copy()))
+
+        if (i + 1) % log_interval == 0 or (i + 1) == len(seed_ints):
+            logger.info(
+                "Worker {}: BFS {}/{} seeds ({:.0f}%), "
+                "{:,} distinct seed cut-strings precomputed",
+                worker_id, i + 1, len(seed_ints),
+                (i + 1) / len(seed_ints) * 100,
+                len(conc_arrays))
+
+    return total_reached, total_strict, total_ancdesc, per_seed_data
+
+
+# ---------------------------------------------------------------------------
+# Null expectations
+# ---------------------------------------------------------------------------
+
+
+def _simpson_index(colors: Dict[str, str]) -> float:
+    """Probability two randomly chosen unitigs have the same cut-string."""
+    total = len(colors)
+    if total == 0:
+        return 0.0
+    counts: Dict[str, int] = defaultdict(int)
+    for cs in colors.values():
+        counts[cs] += 1
+    return sum((c / total) ** 2 for c in counts.values())
+
+
+def _concordance_null(
+    colors: Dict[str, str],
+    unique_cuts: List[str],
+    parsed_nidx: List[List[Tuple[int, ...]]],
+    entry: np.ndarray,
+    exit_: np.ndarray,
+    ancdesc_sets: List[Set[int]],
+    node_to_cutstrings: List[np.ndarray],
+    rng: Optional[np.random.Generator] = None,
+) -> float:
+    """Null expectation for anc/desc coherence: Σ_{i,j coherent} f_i * f_j.
+
+    Vectorized approach: draw 1M sample pairs, deduplicate to unique
+    (i,j) pairs, run concordance check once per unique pair, then
+    weight by frequency of occurrence.
+    """
+    total = len(colors)
+    if total == 0:
+        return 0.0
+
+    counts: Dict[str, int] = defaultdict(int)
+    for cs in colors.values():
+        counts[cs] += 1
+
+    freqs = np.array([counts[cs] / total for cs in unique_cuts])
+
+    if rng is None:
+        rng = np.random.default_rng(42)
+    n_samples = 1_000_000
+
+    idx_a = rng.choice(len(unique_cuts), size=n_samples, p=freqs)
+    idx_b = rng.choice(len(unique_cuts), size=n_samples, p=freqs)
+
+    # Count how many samples are same-index (automatically concordant)
+    same_mask = idx_a == idx_b
+    n_same = int(same_mask.sum())
+
+    # For different pairs, canonicalize (min, max) and count unique pairs
+    diff_mask = ~same_mask
+    a_diff = idx_a[diff_mask]
+    b_diff = idx_b[diff_mask]
+
+    # Canonicalize: ensure a <= b
+    swap_mask = a_diff > b_diff
+    a_diff[swap_mask], b_diff[swap_mask] = b_diff[swap_mask].copy(), a_diff[swap_mask].copy()
+
+    # Pack into single int64 for fast unique counting
+    # (each index fits in int32, so pack two into int64)
+    pair_keys = a_diff.astype(np.int64) * len(unique_cuts) + b_diff.astype(np.int64)
+    unique_keys, pair_counts = np.unique(pair_keys, return_counts=True)
+
+    # Unpack unique pairs
+    M = len(unique_cuts)
+    unique_a = (unique_keys // M).astype(np.int32)
+    unique_b = (unique_keys % M).astype(np.int32)
+
+    logger.info(
+        "Null estimation: {:,} samples → {:,} same-index + "
+        "{:,} unique different pairs to check",
+        n_samples, n_same, len(unique_keys))
+
+    # Check concordance for each unique pair
+    t0 = time.time()
+    n_coherent_diff = 0
+    for k in range(len(unique_keys)):
+        i, j = int(unique_a[k]), int(unique_b[k])
+        if _concordance_check_nidx(
+                parsed_nidx[i], parsed_nidx[j], entry, exit_):
+            n_coherent_diff += int(pair_counts[k])
+
+    n_coherent = n_same + n_coherent_diff
+    estimate = n_coherent / n_samples
+    se = (estimate * (1 - estimate) / n_samples) ** 0.5
+    logger.info(
+        "Anc/desc null estimated from {:,} samples: {:.6f} "
+        "(SE ≈ {:.6f}, {:,} unique pairs checked in {:.1f}s)",
+        n_samples, estimate, se, len(unique_keys), time.time() - t0)
+    return estimate
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+
+def _plot_decay(
+    hops: np.ndarray,
+    coherence_strict: np.ndarray,
+    coherence_ancdesc: np.ndarray,
+    null_strict: float,
+    null_ancdesc: float,
+    output_path: Path,
+) -> None:
+    """Save a coherence-decay plot (SVG)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    matplotlib.rcParams["svg.fonttype"] = "none"
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_theme(style="white", context="notebook")
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+
+    ax.plot(hops, coherence_ancdesc, marker="o", linewidth=1.5,
+            markersize=4, label="Anc/desc coherence", color="tab:blue")
+    ax.plot(hops, coherence_strict, marker="s", linewidth=1.5,
+            markersize=3, linestyle="--", label="Strict coherence",
+            color="tab:orange")
+    ax.axhline(null_ancdesc, color="tab:blue", linestyle=":",
+               linewidth=1, alpha=0.7,
+               label=f"Null anc/desc = {null_ancdesc:.4f}")
+    ax.axhline(null_strict, color="tab:orange", linestyle=":",
+               linewidth=1, alpha=0.7,
+               label=f"Null strict = {null_strict:.4f}")
+
+    ax.set_xlabel("Hop distance")
+    ax.set_ylabel("Coherence fraction")
+    ax.set_title("Evolutionary persistence")
+    ax.set_ylim(bottom=0)
+    ax.legend()
+    sns.despine(ax=ax, top=True, right=True)
+    fig.tight_layout()
+    fig.savefig(output_path, format="svg")
+    plt.close(fig)
+    logger.info("Plot saved to {}", output_path)
+
+
+# ---------------------------------------------------------------------------
+# Numba warmup
+# ---------------------------------------------------------------------------
+
+
+def _warmup_numba(entry: np.ndarray, exit_: np.ndarray) -> None:
+    """Pre-compile numba functions with small dummy data."""
+    t0 = time.time()
+
+    # Warm up _injective_ancdesc_match_nb and its callees
+    dummy_a = np.array([0], dtype=np.int32)
+    dummy_b = np.array([0, 1], dtype=np.int32)
+    _injective_ancdesc_match_nb(dummy_a, dummy_b, entry, exit_)
+
+    # Warm up _bfs_coherence
+    dummy_offsets = np.array([0, 1, 2], dtype=np.int64)
+    dummy_neighbors = np.array([1, 0], dtype=np.int32)
+    dummy_cut = np.array([0, 0], dtype=np.int32)
+    dummy_conc = np.array([True, True], dtype=np.bool_)
+    _bfs_coherence(np.int32(0), dummy_offsets, dummy_neighbors,
+                   dummy_cut, 2, 1, dummy_conc, np.int32(0))
+
+    logger.info("Numba warmup complete in {:.1f}s", time.time() - t0)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description=
+        "Evolutionary persistence — coherence decay along graph walks.")
+    parser.add_argument(
+        "--db", type=Path, required=True,
+        help="SQLite database with unitigs and adjacency tables.")
+    parser.add_argument(
+        "--tree", type=Path, required=True,
+        help="Postprocessed Newick tree with named internal nodes.")
+    parser.add_argument("--max-hops", type=int, default=20,
+                        help="Maximum BFS walk distance (default: 20).")
+    parser.add_argument(
+        "--samples", type=int, default=10_000,
+        help="Number of seed unitigs to sample (default: 10000).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42).")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="Output TSV path.")
+    parser.add_argument("--plot", type=Path, default=None,
+                        help="Optional path for an SVG decay-curve plot.")
+    parser.add_argument("--per-seed-output", type=Path, default=None,
+                        help="Optional path for per-seed persistence TSV "
+                             "(unitig ID + persistence length in hops).")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="Number of parallel workers (default: 1).")
+    parser.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="Increase verbosity (-v for INFO, -vv for DEBUG).")
+
+    args = parser.parse_args(argv)
+    _configure_logger(args.verbose)
+
+    # -- Load tree and build Euler tour --------------------------------------
+    logger.info("Loading tree from {}", args.tree)
+    with args.tree.open() as fh:
+        tree = Tree(fh.read(), parser=1)
+    if not tree.name:
+        tree.name = "Root"
+
+    entry_times, exit_times, tree_name_to_nidx = _build_euler_tour(tree)
+    n_tree_nodes = len(tree_name_to_nidx)
+    logger.info("Euler tour built for {:,} named nodes", n_tree_nodes)
+
+    # -- Build ancestor/descendant sets for each tree node -------------------
+    t0_ad = time.time()
+    ancdesc_sets = _build_ancdesc_sets(tree, tree_name_to_nidx, n_tree_nodes)
+    avg_ad = sum(len(s) for s in ancdesc_sets) / max(n_tree_nodes, 1)
+    logger.info(
+        "Ancestor/descendant sets built in {:.1f}s, "
+        "avg set size: {:.1f} nodes",
+        time.time() - t0_ad, avg_ad)
+
+    # -- Warm up numba -------------------------------------------------------
+    _warmup_numba(entry_times, exit_times)
+
+    # -- Load graph ----------------------------------------------------------
+    adj, colors = _load_graph_and_colors(args.db)
+
+    # -- Parse cut-strings ---------------------------------------------------
+    unique_cuts, cut_to_idx, parsed_nidx = \
+        _prepare_cutstring_data(colors, tree_name_to_nidx)
+
+    # -- Build inverted index ------------------------------------------------
+    t0_inv = time.time()
+    node_to_cutstrings = _build_node_to_cutstrings(parsed_nidx, n_tree_nodes)
+    total_entries = sum(len(a) for a in node_to_cutstrings)
+    logger.info(
+        "Inverted index built in {:.1f}s, "
+        "{:,} total entries across {:,} tree nodes",
+        time.time() - t0_inv, total_entries, n_tree_nodes)
+
+    # -- Build integer-indexed CSR graph -------------------------------------
+    unitig_list, uid_to_int, csr_offsets, csr_neighbors = \
+        _build_csr_graph(adj, colors)
+    N_unitigs = len(unitig_list)
+
+    cut_idx_array = np.array([cut_to_idx[colors[uid]] for uid in unitig_list],
+                             dtype=np.int32)
+
+    # -- Select seeds --------------------------------------------------------
+    rng = np.random.default_rng(args.seed)
+    n_seeds = min(args.samples, N_unitigs)
+    if n_seeds == N_unitigs:
+        seed_ints = list(range(N_unitigs))
+        logger.info("Using all {:,} unitigs as seeds", n_seeds)
+    else:
+        seed_ints = list(rng.choice(N_unitigs, size=n_seeds, replace=False))
+        logger.info("Sampled {:,} seed unitigs", n_seeds)
+
+    # -- BFS from each seed --------------------------------------------------
+    _SHARED["csr_offsets"] = csr_offsets
+    _SHARED["csr_neighbors"] = csr_neighbors
+    _SHARED["cut_idx_array"] = cut_idx_array
+    _SHARED["n_unitigs"] = N_unitigs
+    _SHARED["max_hops"] = args.max_hops
+    _SHARED["n_cutstrings"] = len(unique_cuts)
+    _SHARED["parsed_nidx"] = parsed_nidx
+    _SHARED["entry"] = entry_times
+    _SHARED["exit_"] = exit_times
+    _SHARED["ancdesc_sets"] = ancdesc_sets
+    _SHARED["node_to_cutstrings"] = node_to_cutstrings
+    _SHARED["collect_per_seed"] = args.per_seed_output is not None
+
+    t0 = time.time()
+    n_jobs = max(1, args.jobs)
+    all_per_seed_data = []
+
+    if n_jobs == 1:
+        total_reached, total_strict, total_ancdesc, per_seed = _worker_bfs(
+            (seed_ints, 0))
+        if per_seed:
+            all_per_seed_data.extend(per_seed)
+    else:
+        chunks = np.array_split(seed_ints, n_jobs)
+        worker_args = [(list(chunk), i) for i, chunk in enumerate(chunks)
+                       if len(chunk) > 0]
+
+        total_reached = np.zeros(args.max_hops, dtype=np.int64)
+        total_strict = np.zeros(args.max_hops, dtype=np.int64)
+        total_ancdesc = np.zeros(args.max_hops, dtype=np.int64)
+
+        ctx = mp.get_context("fork")
+        with ctx.Pool(n_jobs) as pool:
+            for reached, strict, ancdesc, per_seed in pool.imap_unordered(
+                    _worker_bfs, worker_args):
+                total_reached += reached
+                total_strict += strict
+                total_ancdesc += ancdesc
+                if per_seed:
+                    all_per_seed_data.extend(per_seed)
+
+    logger.info("BFS complete: {:,} seeds in {:.1f}s", n_seeds,
+                time.time() - t0)
+
+    # -- Compute coherence and null ------------------------------------------
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coherence_strict = np.where(total_reached > 0,
+                                    total_strict / total_reached, np.nan)
+        coherence_ancdesc = np.where(total_reached > 0,
+                                     total_ancdesc / total_reached, np.nan)
+
+    null_strict = _simpson_index(colors)
+    null_ancdesc = _concordance_null(
+        colors, unique_cuts, parsed_nidx,
+        entry_times, exit_times,
+        ancdesc_sets, node_to_cutstrings, rng)
+
+    logger.info("Null strict (Simpson index): {:.6f}", null_strict)
+    logger.info("Null anc/desc: {:.6f}", null_ancdesc)
+
+    # -- Write output --------------------------------------------------------
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    hops = np.arange(1, args.max_hops + 1)
+
+    with args.output.open("w") as out:
+        out.write("hop_distance\tn_pairs\tn_strict_coherent\t"
+                  "n_ancdesc_coherent\tstrict_coherence\t"
+                  "ancdesc_coherence\tnull_strict\tnull_ancdesc\n")
+        for h in range(args.max_hops):
+            s_str = (f"{coherence_strict[h]:.6f}"
+                     if not np.isnan(coherence_strict[h]) else "NA")
+            c_str = (f"{coherence_ancdesc[h]:.6f}"
+                     if not np.isnan(coherence_ancdesc[h]) else "NA")
+            out.write(f"{hops[h]}\t{total_reached[h]}\t{total_strict[h]}\t"
+                      f"{total_ancdesc[h]}\t{s_str}\t"
+                      f"{c_str}\t{null_strict:.6f}\t{null_ancdesc:.6f}\n")
+
+    logger.info("Output written to {}", args.output)
+
+    # -- Per-seed persistence output -------------------------------------------
+    if args.per_seed_output is not None and all_per_seed_data:
+        args.per_seed_output.parent.mkdir(parents=True, exist_ok=True)
+        n_written = 0
+        with args.per_seed_output.open("w") as out:
+            out.write("seed_unitig_id\tpersistence_ancdesc\t"
+                      "persistence_strict\tcoherence_ancdesc_h1\t"
+                      "coherence_strict_h1\n")
+            for seed_int, reached, strict, ancdesc in all_per_seed_data:
+                uid = unitig_list[seed_int]
+
+                # Per-seed coherence at each hop
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    per_hop_ancdesc = np.where(
+                        reached > 0, ancdesc / reached, np.nan)
+                    per_hop_strict = np.where(
+                        reached > 0, strict / reached, np.nan)
+
+                # Persistence = first hop where coherence drops below null
+                cross_ad = np.where(
+                    (per_hop_ancdesc <= null_ancdesc)
+                    & ~np.isnan(per_hop_ancdesc))[0]
+                persist_ad = int(cross_ad[0] + 1) if len(cross_ad) > 0 else args.max_hops
+
+                cross_st = np.where(
+                    (per_hop_strict <= null_strict)
+                    & ~np.isnan(per_hop_strict))[0]
+                persist_st = int(cross_st[0] + 1) if len(cross_st) > 0 else args.max_hops
+
+                # Coherence at hop 1
+                h1_ad = (f"{per_hop_ancdesc[0]:.6f}"
+                         if not np.isnan(per_hop_ancdesc[0]) else "NA")
+                h1_st = (f"{per_hop_strict[0]:.6f}"
+                         if not np.isnan(per_hop_strict[0]) else "NA")
+
+                out.write(f"{uid}\t{persist_ad}\t{persist_st}\t"
+                          f"{h1_ad}\t{h1_st}\n")
+                n_written += 1
+
+        logger.info("Per-seed persistence written to {} ({:,} seeds)",
+                    args.per_seed_output, n_written)
+
+    # -- Plot ----------------------------------------------------------------
+    if args.plot is not None:
+        valid = ~np.isnan(coherence_strict) & ~np.isnan(coherence_ancdesc)
+        if np.any(valid):
+            args.plot.parent.mkdir(parents=True, exist_ok=True)
+            _plot_decay(hops[valid], coherence_strict[valid],
+                        coherence_ancdesc[valid], null_strict, null_ancdesc,
+                        args.plot)
+        else:
+            logger.warning("No valid coherence data to plot")
+
+    # -- Summary to stderr ---------------------------------------------------
+    print("\n--- Evolutionary Persistence ---", file=sys.stderr)
+    print(f"Seeds:                {n_seeds:,}", file=sys.stderr)
+    print(f"Max hops:             {args.max_hops}", file=sys.stderr)
+    print(f"Unique cut-strings:   {len(unique_cuts):,}", file=sys.stderr)
+    print(f"Null strict:          {null_strict:.6f}", file=sys.stderr)
+    print(f"Null anc/desc:        {null_ancdesc:.6f}", file=sys.stderr)
+    if not np.isnan(coherence_strict[0]):
+        print(f"Strict (h=1):         {coherence_strict[0]:.6f}",
+              file=sys.stderr)
+        print(f"Anc/desc (h=1):       {coherence_ancdesc[0]:.6f}",
+              file=sys.stderr)
+    cross_s = np.where((coherence_strict <= null_strict)
+                       & ~np.isnan(coherence_strict))[0]
+    cross_c = np.where((coherence_ancdesc <= null_ancdesc)
+                       & ~np.isnan(coherence_ancdesc))[0]
+    print(
+        f"Strict crosses null:  "
+        f"{'hop ' + str(hops[cross_s[0]]) if len(cross_s) > 0 else 'never (within max-hops)'}",
+        file=sys.stderr)
+    print(
+        f"Ancdesc crosses null: "
+        f"{'hop ' + str(hops[cross_c[0]]) if len(cross_c) > 0 else 'never (within max-hops)'}",
+        file=sys.stderr)
+    print("------------------------------------", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

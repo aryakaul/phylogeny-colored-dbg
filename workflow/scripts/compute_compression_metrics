@@ -11,17 +11,15 @@ from typing import Set
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compare unique color counts between the cuttlefish-colored DBG "
-            "and the phylogeny-colored pcDBG output."
-        )
-    )
+    parser = argparse.ArgumentParser(description=(
+        "Compare unique color counts between the cuttlefish-colored DBG "
+        "and the phylogeny-colored pcDBG output."))
     parser.add_argument(
         "--cuttlefish",
         required=True,
         type=Path,
-        help="Path to the unique color vectors generated from cuttlefish (TSV).",
+        help=
+        "Path to the unique color vectors generated from cuttlefish (TSV).",
     )
     parser.add_argument(
         "--pcdbg",
@@ -74,48 +72,35 @@ def count_pcdbg_unique(path: Path) -> int:
     return len(unique)
 
 
-def write_metrics(output: Path, cuttlefish_count: int, pcdbg_count: int) -> None:
+def write_metrics(output: Path, cuttlefish_count: int,
+                  pcdbg_count: int) -> None:
     difference = cuttlefish_count - pcdbg_count
-    ratio = (
-        pcdbg_count / cuttlefish_count
-        if cuttlefish_count
-        else nan
-    )
+    ratio = (pcdbg_count / cuttlefish_count if cuttlefish_count else nan)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(
-            ("metric", "value", "description")
-        )
-        writer.writerow(
-            (
-                "cuttlefish_unique_colors",
-                cuttlefish_count,
-                "Distinct unitig presence/absence vectors from cuttlefish.",
-            )
-        )
-        writer.writerow(
-            (
-                "pcdbg_unique_colors",
-                pcdbg_count,
-                "Distinct internal-node color labels after pcDBG compression (first minimal solution).",
-            )
-        )
-        writer.writerow(
-            (
-                "absolute_difference",
-                difference,
-                "cuttlefish_unique_colors minus pcdbg_unique_colors; positive indicates lossy compression.",
-            )
-        )
-        writer.writerow(
-            (
-                "pcdbg_to_cuttlefish_ratio",
-                f"{ratio:.6f}" if cuttlefish_count else "NaN",
-                "Fraction of cuttlefish color sets preserved after pcDBG compression.",
-            )
-        )
+        writer.writerow(("metric", "value", "description"))
+        writer.writerow((
+            "cuttlefish_unique_colors",
+            cuttlefish_count,
+            "Distinct unitig presence/absence vectors from cuttlefish.",
+        ))
+        writer.writerow((
+            "pcdbg_unique_colors",
+            pcdbg_count,
+            "Distinct internal-node color labels after pcDBG compression (first minimal solution).",
+        ))
+        writer.writerow((
+            "absolute_difference",
+            difference,
+            "cuttlefish_unique_colors minus pcdbg_unique_colors; positive indicates lossy compression.",
+        ))
+        writer.writerow((
+            "pcdbg_to_cuttlefish_ratio",
+            f"{ratio:.6f}" if cuttlefish_count else "NaN",
+            "Fraction of cuttlefish color sets preserved after pcDBG compression.",
+        ))
 
 
 def main() -> None:

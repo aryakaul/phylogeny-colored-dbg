@@ -22,7 +22,7 @@ endif
 CONFIG_FILE    := config.yaml
 CONDA_DIR      := $(shell awk '/^conda_dir:/ {print $$2}' $(CONFIG_FILE))
 USE_CONDA      := $(shell awk '/^use_conda:/ {print $$2}' $(CONFIG_FILE))
-SNAKEMAKE_JOBS ?= 8
+SNAKEMAKE_JOBS ?= 64
 
 ifeq ($(strip $(CONDA_DIR)),)
   $(error 'conda_dir' not found in $(CONFIG_FILE))

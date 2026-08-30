@@ -15,6 +15,7 @@ parsimonious presence/absence of individual unitigs.
 - [Configuration](#configuration)
 - [Running the Workflow](#running-the-workflow)
 - [Outputs](#outputs)
+- [Phylogenetic Analyses](#phylogenetic-analyses)
 - [Parsimony Modes](#parsimony-modes)
 - [Application Roadmap](#application-roadmap)
 - [Troubleshooting](#troubleshooting)
@@ -120,6 +121,12 @@ All configuration lives in [`config.yaml`](config.yaml). Important fields:
 - `parsimony.sankoff_branch_penalty` — optional numeric multiplier for Sankoff
   transitions; omit to auto-scale from mean branch lengths.
 - `produce_colored_deletions` — toggle BubbleGun and deletion-finding rules.
+- `produce_breakpoints` — toggle concordance-breakpoint and boundary-severity
+  analyses.
+- `produce_coherence_decay` — toggle the evolutionary-persistence analysis
+  (also accepted as `produce_persistence`).
+- `produce_stratification` — toggle the evolutionary-stratification analysis.
+- `produce_minimalcuts_colors` — emit per-unitig minimal-cut colour assignments.
 - `use_conda` — if `False`, Snakemake assumes all tool dependencies are already
   available.
 
@@ -163,6 +170,9 @@ For each batch `{batch}` and parsimony label `{mode_label}` (e.g., `fitch`,
 - `intermediate/metrics/{batch}_compression_{mode_label}_k{k}.tsv` — compression
   metrics comparing Cuttlefish unique colour counts with the pcDBG labels.
 - Optional BubbleGun outputs under `intermediate/bubblegun/` when enabled.
+- Analysis outputs under `output/breakpoints/`, `output/severity/`,
+  `output/persistence/`, and `output/stratification/` — see
+  [Phylogenetic Analyses](#phylogenetic-analyses).
 
 The compression metrics TSV contains four numeric rows:
 
@@ -173,6 +183,34 @@ The compression metrics TSV contains four numeric rows:
 | `absolute_difference`      | `cuttlefish_unique_colors - pcdbg_unique_colors`.               |
 | `pcdbg_to_cuttlefish_ratio` | Fraction of colours retained (ratio in `[0,1]`).              |
 
+
+## Phylogenetic Analyses
+
+Beyond the coloured graph itself, the workflow computes four analyses over the
+parsimony-assigned colours. Each is toggled in [`config.yaml`](config.yaml) and
+writes into its own directory under `output/`. Paths below use the batch name,
+k-mer length, and parsimony label (e.g. `fitch`).
+
+- **Concordance breakpoints** (`produce_breakpoints`) — binary concordance
+  breakpoint detection: locates edges where adjacent unitigs disagree about
+  their inferred phylogenetic origin.
+  `output/breakpoints/{batch}_k{k}_{mode_label}_breakpoints.tsv`, with summary
+  statistics in `..._breakpoint_summary.tsv`.
+- **Boundary severity** (`produce_breakpoints`) — phylogenetic discordance at
+  graph edges, scoring how severe each boundary is rather than treating every
+  breakpoint as equivalent.
+  `output/severity/{batch}_k{k}_{mode_label}_boundary_severity.tsv`, with an
+  accompanying `.svg`.
+- **Evolutionary persistence** (`produce_coherence_decay`) — coherence decay
+  along graph walks: how far a colour assignment persists before a walk crosses
+  into a different inferred origin.
+  `output/persistence/{batch}_k{k}_{mode_label}_evolutionary_persistence.tsv`,
+  a per-seed breakdown in `..._per_seed_persistence.tsv`, and an `.svg`.
+- **Evolutionary stratification** (`produce_stratification`) — depth filtration
+  of pangenome structure, partitioning unitigs by the depth of the internal node
+  they are assigned to.
+  `output/stratification/{batch}_k{k}_{mode_label}_evolutionary_stratification.tsv`,
+  with an accompanying `.svg`.
 
 ## Parsimony Modes
 
@@ -206,7 +244,7 @@ Report problems or feature requests via
 
 ## Changelog
 
-See [Releases](https://github.com/aryakaul/phylogeny-colored-dbg/releases).
+See the [commit history](https://github.com/aryakaul/phylogeny-colored-dbg/commits/main).
 
 ## License
 

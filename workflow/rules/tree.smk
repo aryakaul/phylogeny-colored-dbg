@@ -34,6 +34,7 @@ rule tree_postprocessing:
             {input.nwk} {output.nwk}
         """
 
+
 rule symlink_nwk_tree:
     """
     Symlink a phylogenetic tree if possible (nwk)
@@ -67,12 +68,14 @@ if not config["trees_required"]:
             manifest=dir_input() / "{batch}.txt",
         conda:
             "../envs/attotree.yml"
+        threads: MAX_THREADS
         shell:
             """
             mkdir -p $(dirname {output.nwk})
             mkdir -p $(dirname {output.distance})
             attotree \\
                 -L {input.manifest} \\
+                -t {threads} \\
                 -o {output.nwk} \\
                 -D \\
             > {output.distance}

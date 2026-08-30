@@ -18,6 +18,7 @@ rule find_colored_deletions:
         timeout=600,
     conda:
         "../envs/pandas.yml"
+    threads: MAX_THREADS
     shell:
         """
         {params.script} \\
@@ -28,7 +29,8 @@ rule find_colored_deletions:
             --maxpaths {params.maxpaths} \\
             -to {params.timeout} \\
             --predeletionsize {params.predeletionsize} \\
-            --postdeletionsize {params.postdeletionsize}
+            --postdeletionsize {params.postdeletionsize} \\
+            -j {threads}
         """
 
 

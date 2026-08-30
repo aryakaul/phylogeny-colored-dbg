@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""Evolutionary stratification — depth filtration of pangenome structure.
+
+Decomposes pangenome graph complexity by phylogenetic depth, revealing
+when in evolutionary history different layers of variation were generated.
+
+Defines a nested sequence of subgraphs by sweeping a depth threshold
+from root to tips.  At each depth d, the d-subgraph contains all unitigs
+with depth ≤ d and all edges where both endpoints qualify.  Structural
+properties (component count, branching, sequence content) are measured
+at each level, and per-depth increments identify evolutionary epochs
+where disproportionate complexity was added.
+
+Output
+------
+TSV with columns:
+
+    depth  n_unitigs  total_sequence_bp  n_edges  n_branching_nodes
+    n_connected_components  largest_component  mean_degree
+    delta_unitigs  delta_edges  delta_branching  delta_components
+"""
+
+from __future__ import annotations
+
+import argparse
+import sqlite3
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import numpy as np
+
+try:
+    from ete4 import Tree
+except ImportError:
+    from ete3 import Tree
+
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+
+def _configure_logger(verbosity: int) -> None:
+    """0 → WARNING, 1 → INFO, 2+ → DEBUG."""
+    try:
+        from loguru import logger as _lg
+        _lg.remove()
+        level = "WARNING" if verbosity == 0 else (
+            "INFO" if verbosity == 1 else "DEBUG")
+        _lg.add(sys.stderr, level=level)
+    except ImportError:
+        import logging as _logging
+        level = (_logging.WARNING if verbosity == 0 else
+                 _logging.INFO if verbosity == 1 else _logging.DEBUG)
+        _logging.basicConfig(level=level, stream=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Tree: node depths via iterative DFS
+# ---------------------------------------------------------------------------
+
+
+def _build_node_depths(tree: Tree) -> Dict[str, int]:
+    """Compute topological depth (edge count from root) for every named node.
+
+    Uses iterative DFS to avoid recursion limits on deep trees.
+
+    Returns:
+        node_depth -- {node_name: depth} for every named node
+    """
+    node_depth: Dict[str, int] = {}
+
+    # Iterative DFS: stack of (node, depth, child_index)
+    stack: List[Tuple] = [(tree, 0, 0)]
+
+    while stack:
+        node, depth, ci = stack[-1]
+
+        if ci == 0 and node.name:
+            node_depth[node.name] = depth
+
+        children = node.children
+        if ci < len(children):
+            stack[-1] = (node, depth, ci + 1)
+            stack.append((children[ci], depth + 1, 0))
+        else:
+            stack.pop()
+
+    logger.info("Node depths: {} named nodes, max depth = {}", len(node_depth),
+                max(node_depth.values()) if node_depth else 0)
+    return node_depth
+
+
+# ---------------------------------------------------------------------------
+# Cut-string → unitig depth
+# ---------------------------------------------------------------------------
+
+
+def _parse_cutstring_nodes(raw: str) -> List[str]:
+    """Extract all node names referenced in a cut-string.
+
+    Returns a flat list of all node names across all alternatives.
+    Returns empty list for unassigned unitigs.
+    """
+    if not raw or raw.strip().lower() == "none":
+        return []
+    nodes = []
+    for option in raw.split(" OR "):
+        for n in option.split(","):
+            n = n.strip()
+            if n:
+                nodes.append(n)
+    return nodes
+
+
+def _unitig_depth(raw_cutstring: str, node_depth: Dict[str, int]) -> int:
+    """Compute the depth of a unitig from its cut-string.
+
+    Depth = max depth of any node referenced in the cut-string.
+    For "Root" (depth 0) or unassigned, returns 0.
+    """
+    nodes = _parse_cutstring_nodes(raw_cutstring)
+    if not nodes:
+        return 0
+    depths = []
+    for n in nodes:
+        d = node_depth.get(n)
+        if d is None:
+            logger.warning("Node '{}' not found in tree; treating as depth 0",
+                           n)
+            d = 0
+        depths.append(d)
+    return max(depths)
+
+
+# ---------------------------------------------------------------------------
+# Union-Find
+# ---------------------------------------------------------------------------
+
+
+class UnionFind:
+    """Disjoint-set / union-find with path compression and union by rank."""
+
+    __slots__ = ("parent", "rank", "size")
+
+    def __init__(self, n: int):
+        self.parent = np.arange(n, dtype=np.int32)
+        self.rank = np.zeros(n, dtype=np.int32)
+        self.size = np.ones(n, dtype=np.int32)
+
+    def find(self, x: int) -> int:
+        root = x
+        while self.parent[root] != root:
+            root = self.parent[root]
+        # Path compression
+        while self.parent[x] != root:
+            self.parent[x], x = root, self.parent[x]
+        return root
+
+    def union(self, x: int, y: int) -> bool:
+        """Union two elements. Returns True if they were in different sets."""
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return False
+        # Union by rank
+        if self.rank[rx] < self.rank[ry]:
+            rx, ry = ry, rx
+        self.parent[ry] = rx
+        self.size[rx] += self.size[ry]
+        if self.rank[rx] == self.rank[ry]:
+            self.rank[rx] += 1
+        return True
+
+    def component_size(self, x: int) -> int:
+        return int(self.size[self.find(x)])
+
+
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
+
+def _plot_stratification(
+    df,  # pandas DataFrame with the output columns
+    output_path: Path,
+) -> None:
+    """Four-panel (2×2) stratification plot."""
+    import matplotlib
+    matplotlib.use("Agg")
+    matplotlib.rcParams["svg.fonttype"] = "none"
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_theme(style="white", context="notebook")
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), sharex=True)
+
+    depth = df["depth"].values
+    color_main = "tab:blue"
+    color_secondary = "tab:orange"
+
+    # -- Top left: cumulative unitigs + total sequence bp --
+    ax = axes[0, 0]
+    ax.plot(depth,
+            df["n_unitigs"],
+            color=color_main,
+            linewidth=1.5,
+            label="Unitigs")
+    ax.set_ylabel("Cumulative unitigs", color=color_main)
+    ax.tick_params(axis="y", labelcolor=color_main)
+
+    ax2 = ax.twinx()
+    ax2.plot(depth,
+             df["total_sequence_bp"],
+             color=color_secondary,
+             linewidth=1.5,
+             linestyle="--",
+             label="Sequence (bp)")
+    ax2.set_ylabel("Cumulative sequence (bp)", color=color_secondary)
+    ax2.tick_params(axis="y", labelcolor=color_secondary)
+
+    # Combined legend
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="lower right")
+    ax.set_title("Unitigs and sequence by depth")
+    sns.despine(ax=ax, top=True, right=False)
+    sns.despine(ax=ax2, top=True, left=True)
+
+    # -- Top right: cumulative edges + mean degree --
+    ax = axes[0, 1]
+    ax.plot(depth,
+            df["n_edges"],
+            color=color_main,
+            linewidth=1.5,
+            label="Edges")
+    ax.set_ylabel("Cumulative edges", color=color_main)
+    ax.tick_params(axis="y", labelcolor=color_main)
+
+    ax2 = ax.twinx()
+    ax2.plot(depth,
+             df["mean_degree"],
+             color=color_secondary,
+             linewidth=1.5,
+             linestyle="--",
+             label="Mean degree")
+    ax2.set_ylabel("Mean degree", color=color_secondary)
+    ax2.tick_params(axis="y", labelcolor=color_secondary)
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="right")
+    ax.set_title("Edges and connectivity by depth")
+    sns.despine(ax=ax, top=True, right=False)
+    sns.despine(ax=ax2, top=True, left=True)
+
+    # -- Bottom left: connected components --
+    ax = axes[1, 0]
+    ax.plot(depth,
+            df["n_connected_components"],
+            color=color_main,
+            linewidth=1.5)
+    ax.set_xlabel("Phylogenetic depth")
+    ax.set_ylabel("Connected components")
+    ax.set_title("Component count by depth")
+    sns.despine(ax=ax, top=True, right=True)
+
+    # -- Bottom right: branching nodes + delta overlay --
+    ax = axes[1, 1]
+    ax.plot(depth,
+            df["n_branching_nodes"],
+            color=color_main,
+            linewidth=1.5,
+            label="Branching nodes")
+    ax.set_ylabel("Cumulative branching nodes", color=color_main)
+    ax.set_xlabel("Phylogenetic depth")
+
+    ax2 = ax.twinx()
+    ax2.bar(depth,
+            df["delta_branching"],
+            color=color_secondary,
+            alpha=0.3,
+            width=0.8,
+            label="Δ branching")
+    ax2.set_ylabel("Δ branching nodes per depth", color=color_secondary)
+    ax2.tick_params(axis="y", labelcolor=color_secondary)
+
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+    ax.set_title("Branching complexity by depth")
+    sns.despine(ax=ax, top=True, right=False)
+    sns.despine(ax=ax2, top=True, left=True)
+
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, format="svg")
+    plt.close(fig)
+    logger.info("Plot saved to {}", output_path)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=(
+        "Evolutionary stratification — depth filtration of pangenome "
+        "graph structure."))
+    parser.add_argument(
+        "--db",
+        type=Path,
+        required=True,
+        help="SQLite database with unitigs and adjacency tables.")
+    parser.add_argument(
+        "--tree",
+        type=Path,
+        required=True,
+        help="Postprocessed Newick tree with named internal nodes.")
+    parser.add_argument("--output",
+                        type=Path,
+                        required=True,
+                        help="Output TSV path.")
+    parser.add_argument("--plot",
+                        type=Path,
+                        default=None,
+                        help="Optional SVG plot path (2×2 panel figure).")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v for INFO, -vv for DEBUG).")
+
+    args = parser.parse_args(argv)
+    _configure_logger(args.verbose)
+
+    # -- Load tree and compute node depths -----------------------------------
+    logger.info("Loading tree from {}", args.tree)
+    with args.tree.open() as fh:
+        tree = Tree(fh.read(), parser=1)
+    if not tree.name:
+        tree.name = "Root"
+
+    node_depth = _build_node_depths(tree)
+    max_tree_depth = max(node_depth.values()) if node_depth else 0
+
+    # -- Load data from SQLite -----------------------------------------------
+    logger.info("Loading data from {}", args.db)
+    conn = sqlite3.connect(args.db)
+
+    # Unitigs: id, length, cut-string
+    unitig_ids: List[str] = []
+    unitig_lengths: List[int] = []
+    unitig_cutstrings: List[str] = []
+    for uid, length, colors in conn.execute(
+            "SELECT unitig_id, length, colors FROM unitigs"):
+        unitig_ids.append(uid)
+        unitig_lengths.append(length if length else 0)
+        unitig_cutstrings.append(colors if colors else "None")
+
+    uid_to_int = {uid: i for i, uid in enumerate(unitig_ids)}
+    N = len(unitig_ids)
+
+    # Edges: deduplicate (each undirected edge appears twice)
+    edges_seen: set = set()
+    edge_list: List[Tuple[int, int]] = []  # (int_a, int_b)
+    for uid_a, _, uid_b, _ in conn.execute(
+            "SELECT unitig_id, unitig_direction, neighbor_id, "
+            "neighbor_direction FROM adjacency"):
+        if uid_a not in uid_to_int or uid_b not in uid_to_int:
+            continue
+        key = (uid_a, uid_b) if uid_a <= uid_b else (uid_b, uid_a)
+        if key not in edges_seen:
+            edges_seen.add(key)
+            edge_list.append((uid_to_int[uid_a], uid_to_int[uid_b]))
+    conn.close()
+    del edges_seen
+
+    E = len(edge_list)
+    logger.info("Loaded {:,} unitigs, {:,} undirected edges", N, E)
+
+    # -- Assign depth to every unitig ----------------------------------------
+    t0 = time.time()
+    unitig_depths = np.array(
+        [_unitig_depth(cs, node_depth) for cs in unitig_cutstrings],
+        dtype=np.int32)
+    unitig_lens = np.array(unitig_lengths, dtype=np.int64)
+    logger.info("Unitig depths assigned in {:.1f}s, max unitig depth = {}",
+                time.time() - t0,
+                int(unitig_depths.max()) if N > 0 else 0)
+
+    # -- Assign depth to every edge ------------------------------------------
+    edge_a = np.array([e[0] for e in edge_list], dtype=np.int32)
+    edge_b = np.array([e[1] for e in edge_list], dtype=np.int32)
+    edge_depths = np.maximum(unitig_depths[edge_a], unitig_depths[edge_b])
+
+    # -- Sort unitigs and edges by depth for incremental sweep ---------------
+    unitig_order = np.argsort(unitig_depths, kind="stable")
+    edge_order = np.argsort(edge_depths, kind="stable")
+
+    max_depth = max(
+        int(unitig_depths.max()) if N > 0 else 0,
+        int(edge_depths.max()) if E > 0 else 0)
+
+    # -- Incremental sweep ---------------------------------------------------
+    t0 = time.time()
+
+    uf = UnionFind(N)
+    degree = np.zeros(N, dtype=np.int32)
+    in_subgraph = np.zeros(N,
+                           dtype=np.bool_)  # tracks which unitigs are active
+
+    # Cursors into sorted arrays
+    u_cursor = 0  # into unitig_order
+    e_cursor = 0  # into edge_order
+
+    # Running counters
+    cum_unitigs = 0
+    cum_sequence = 0
+    cum_edges = 0
+    cum_branching = 0
+    n_components = 0
+    largest_component = 0
+
+    # Results storage
+    results: List[Dict] = []
+
+    for d in range(max_depth + 1):
+        # Add unitigs at this depth
+        while u_cursor < N and unitig_depths[unitig_order[u_cursor]] <= d:
+            uid_int = unitig_order[u_cursor]
+            if not in_subgraph[uid_int]:
+                in_subgraph[uid_int] = True
+                cum_unitigs += 1
+                cum_sequence += int(unitig_lens[uid_int])
+                n_components += 1  # new isolated node
+                # Track largest component
+                if uf.component_size(uid_int) > largest_component:
+                    largest_component = uf.component_size(uid_int)
+            u_cursor += 1
+
+        # Add edges at this depth
+        while e_cursor < E and edge_depths[edge_order[e_cursor]] <= d:
+            eidx = edge_order[e_cursor]
+            a, b = int(edge_a[eidx]), int(edge_b[eidx])
+            cum_edges += 1
+
+            # Update degrees
+            was_branching_a = degree[a] > 2
+            was_branching_b = degree[b] > 2
+            degree[a] += 1
+            degree[b] += 1
+            if not was_branching_a and degree[a] > 2:
+                cum_branching += 1
+            if not was_branching_b and degree[b] > 2:
+                cum_branching += 1
+
+            # Union
+            if uf.union(a, b):
+                n_components -= 1
+
+            # Track largest component
+            sz = uf.component_size(a)
+            if sz > largest_component:
+                largest_component = sz
+
+            e_cursor += 1
+
+        mean_deg = (2.0 * cum_edges / cum_unitigs) if cum_unitigs > 0 else 0.0
+
+        results.append({
+            "depth": d,
+            "n_unitigs": cum_unitigs,
+            "total_sequence_bp": cum_sequence,
+            "n_edges": cum_edges,
+            "n_branching_nodes": cum_branching,
+            "n_connected_components": n_components,
+            "largest_component": largest_component,
+            "mean_degree": mean_deg,
+        })
+
+    logger.info("Depth sweep complete in {:.1f}s", time.time() - t0)
+
+    # -- Compute derivatives -------------------------------------------------
+    for i, row in enumerate(results):
+        if i == 0:
+            row["delta_unitigs"] = row["n_unitigs"]
+            row["delta_edges"] = row["n_edges"]
+            row["delta_branching"] = row["n_branching_nodes"]
+            row["delta_components"] = row["n_connected_components"]
+        else:
+            prev = results[i - 1]
+            row["delta_unitigs"] = row["n_unitigs"] - prev["n_unitigs"]
+            row["delta_edges"] = row["n_edges"] - prev["n_edges"]
+            row["delta_branching"] = (row["n_branching_nodes"] -
+                                      prev["n_branching_nodes"])
+            row["delta_components"] = (row["n_connected_components"] -
+                                       prev["n_connected_components"])
+
+    # -- Write output --------------------------------------------------------
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    columns = [
+        "depth",
+        "n_unitigs",
+        "total_sequence_bp",
+        "n_edges",
+        "n_branching_nodes",
+        "n_connected_components",
+        "largest_component",
+        "mean_degree",
+        "delta_unitigs",
+        "delta_edges",
+        "delta_branching",
+        "delta_components",
+    ]
+
+    with args.output.open("w") as out:
+        out.write("\t".join(columns) + "\n")
+        for row in results:
+            vals = []
+            for col in columns:
+                v = row[col]
+                if isinstance(v, float):
+                    vals.append(f"{v:.4f}")
+                else:
+                    vals.append(str(v))
+            out.write("\t".join(vals) + "\n")
+
+    logger.info("Wrote {:,} depth levels to {}", len(results), args.output)
+
+    # -- Summary to stderr ---------------------------------------------------
+    total_unitigs = results[-1]["n_unitigs"] if results else 0
+    total_edges = results[-1]["n_edges"] if results else 0
+    total_branching = results[-1]["n_branching_nodes"] if results else 0
+
+    def _percentile_depth(values, key, threshold):
+        """Find depth at which cumulative key reaches threshold fraction."""
+        target = results[-1][key] * threshold if results else 0
+        for row in values:
+            if row[key] >= target:
+                return row["depth"]
+        return max_depth
+
+    print("\n--- Evolutionary Stratification ---", file=sys.stderr)
+    print(f"Max depth:                    {max_depth}", file=sys.stderr)
+    print(f"Total unitigs:                {total_unitigs:,}", file=sys.stderr)
+    print(f"Total edges:                  {total_edges:,}", file=sys.stderr)
+    print(f"Total branching nodes:        {total_branching:,}",
+          file=sys.stderr)
+
+    if results and total_unitigs > 0:
+        for pct in (0.50, 0.90, 0.99):
+            d_u = _percentile_depth(results, "n_unitigs", pct)
+            print(f"  {int(pct*100)}% unitigs at depth:       {d_u}",
+                  file=sys.stderr)
+
+    if results and total_branching > 0:
+        for pct in (0.50, 0.90, 0.99):
+            d_b = _percentile_depth(results, "n_branching_nodes", pct)
+            print(f"  {int(pct*100)}% branching at depth:     {d_b}",
+                  file=sys.stderr)
+
+        # Depth of largest single-depth increment in branching
+        max_delta_br = max(results, key=lambda r: r["delta_branching"])
+        print(
+            f"  Peak branching increment:   depth {max_delta_br['depth']} "
+            f"(+{max_delta_br['delta_branching']:,})",
+            file=sys.stderr)
+
+    print("-----------------------------------", file=sys.stderr)
+
+    # -- Plot (if --plot) ----------------------------------------------------
+    if args.plot is not None and results:
+        import pandas as pd
+        df = pd.DataFrame(results)
+        _plot_stratification(df, args.plot)
+
+
+if __name__ == "__main__":
+    main()
