@@ -2,4 +2,6 @@ channels:
   - bioconda
   - conda-forge
 dependencies:
-  - cuttlefish
+  # pinned to 2.x: the workflow uses the Cuttlefish 2 CLI (e.g. --unrestrict-memory),
+  # which changed in 3.x. Unpinning silently breaks `cuttlefish build`.
+  - cuttlefish=2.2.0
