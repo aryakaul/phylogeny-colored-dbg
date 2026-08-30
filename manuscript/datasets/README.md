@@ -7,9 +7,6 @@ write to the local filesystem; no data is committed to the repository.
 
 ## Workflows
 
-- `download_genomes.py` — downloads high-quality genome cohorts (≥500 assemblies
-  per genus by default) into a user-specified output directory and prepares
-  matching manifest and tree placeholders.
 - `get_sets.py` — samples three matched cohorts (SetL/SetM/SetH) at increasing
   diversity levels for compression metrics, caching assembly metadata, FASTA
   downloads, and Mash sketches.
@@ -17,15 +14,14 @@ write to the local filesystem; no data is committed to the repository.
 ## Usage
 
 ```bash
-pip install ncbi-genome-download
-python download_genomes.py --output /path/to/datasets
+python get_sets.py --n 50 --threads 8
 ```
 
-The script fetches genomes under `/path/to/datasets/{cohort}/assemblies/`,
-selecting the most curated RefSeq assemblies (complete/chromosome level,
-reference or representative genomes) until at least 500 sequences are gathered.
-It then produces a Snakemake-ready manifest (`{cohort}.txt`) plus stub tree
-files that you should replace with real phylogenies.
+`get_sets.py` builds three genome sets of increasing diversity (SetL/SetM/SetH),
+caching NCBI assembly metadata, FASTA downloads and Mash sketches between runs.
+See `python get_sets.py --help` for the full set of options, including plasmid
+handling, Mash sketch parameters, and the distance thresholds used to define
+SetH.
 
 > Note: `ncbi-genome-download` can retrieve large archives. Use the script's
 > `--min-genomes` or `--cohort` flags to scope a run when working on limited

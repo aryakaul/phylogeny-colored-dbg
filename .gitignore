@@ -1,10 +1,35 @@
+# environments / editors
 .snakemake/
 .idea
+__pycache__/
+*.pyc
+
+# cluster
 slurm-*
+
+# agent scaffolding
 AGENT*
+
+# pipeline run directories (top level)
+/input/
+/intermediate/
+/output/
+
+# test scaffolding
 .test/.conda
 .test/.snakemake/
+.test/.tmp/
 .test/intermediate/
 .test/output/
-.ipynb*
+
+# notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# generated figures and pipeline artifacts
+*.svg
+*.png
+*.gfa
+
+# manuscript (tracked files predate this rule)
 manuscript/
